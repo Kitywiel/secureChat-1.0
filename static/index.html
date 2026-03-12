@@ -118,7 +118,7 @@
       </div>
 
       <form id="message-form" class="message-bar">
-        <input type="file" id="chat-file-input" multiple style="display:none" aria-hidden="true" />
+        <input type="file" id="chat-file-input" multiple class="hidden" aria-hidden="true" />
         <textarea
           id="message-input"
           placeholder="Type a message… (Enter to send, Shift+Enter for new line)"
@@ -222,7 +222,7 @@
             <code id="create-invite-link" class="share-link"></code>
             <button type="button" id="create-copy-btn" class="btn-copy">Copy</button>
           </div>
-          <p class="share-result-label" style="margin-top:1rem">
+          <p class="share-result-label share-result-label--mt">
             🔑 Passphrase — <strong>share this separately</strong> (NOT in the link):
           </p>
           <div class="share-link-row">
@@ -310,7 +310,7 @@
             <button type="button" id="share-copy-btn" class="btn-copy">Copy</button>
           </div>
           <div id="share-passcode-result" class="hidden">
-            <p class="share-result-label" style="margin-top:1rem">
+            <p class="share-result-label share-result-label--mt">
               🔒 Passcode — <strong>share this with the recipient:</strong>
             </p>
             <div class="share-link-row">

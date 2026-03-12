@@ -1150,12 +1150,12 @@ document.getElementById('create-qr-btn').addEventListener('click', () => {
   const inviteUrl = document.getElementById('create-invite-link').textContent;
   if (!inviteUrl) return;
   // Include the passphrase in the QR code so a single scan gives full access.
+  // The invite URL is always built with a '#' fragment (e.g., "…/#room=…"), so
+  // we safely append the passphrase as an additional fragment parameter.
   const passphrase = document.getElementById('create-passphrase-display').textContent;
-  let qrData = inviteUrl;
-  if (passphrase) {
-    // Append pass= to the fragment so the join form is pre-filled on scan.
-    qrData = inviteUrl + (inviteUrl.includes('#') ? '&' : '#') + 'pass=' + encodeURIComponent(passphrase);
-  }
+  const qrData = passphrase
+    ? inviteUrl + '&pass=' + encodeURIComponent(passphrase)
+    : inviteUrl;
   toggleQr('create-qr-btn', 'create-qr-img', 'create-qr-container', qrData);
 });
 

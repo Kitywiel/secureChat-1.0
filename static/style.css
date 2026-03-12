@@ -40,6 +40,11 @@ body {
   flex-direction: column;
 }
 
+/* ── General hidden utility ────────────────────────────────────────────────── */
+.hidden {
+  display: none !important;
+}
+
 /* ── Screens ───────────────────────────────────────────────────────────────── */
 .screen {
   flex: 1;
@@ -499,6 +504,10 @@ select:focus {
   margin-bottom: 0.5rem;
 }
 
+.share-result-label--mt {
+  margin-top: 1rem;
+}
+
 .share-link-row {
   display: flex;
   align-items: center;
@@ -668,10 +677,10 @@ select:focus {
   align-self: flex-end;
   width: 2.4rem;
   height: 2.4rem;
-  background: var(--surface-2);
-  border: 1px solid var(--border);
+  background: var(--surface-2) !important;
+  border: 1px solid var(--border) !important;
   border-radius: 50%;
-  color: var(--text-dim);
+  color: var(--text-dim) !important;
   font-size: 1.1rem;
   font-family: var(--font);
   cursor: pointer;
@@ -684,8 +693,8 @@ select:focus {
 }
 
 .btn-attach:hover:not(:disabled) {
-  border-color: var(--accent);
-  color: var(--accent);
+  border-color: var(--accent) !important;
+  color: var(--accent) !important;
 }
 
 .btn-attach:disabled {
