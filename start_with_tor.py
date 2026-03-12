@@ -29,6 +29,7 @@ import hashlib
 import os
 import platform
 import shutil
+import socket
 import sys
 import tarfile
 import time
@@ -195,6 +196,41 @@ def _download_tor() -> Optional[Path]:
 # Launch Tor with a hidden service
 # ---------------------------------------------------------------------------
 
+def _find_geoip_files(tor_exe: Path) -> dict[str, str]:
+    """Return GeoIPFile / GeoIPv6File config entries for the files bundled
+    alongside *tor_exe*.  Returns an empty dict when the files are absent
+    (e.g. system Tor that ships geoip data elsewhere).
+
+    Return value: ``{"GeoIPFile": "/path/geoip", "GeoIPv6File": "/path/geoip6"}``
+    — either key may be absent if the corresponding file is not found.
+    """
+    tor_dir = tor_exe.parent
+    entries: dict[str, str] = {}
+    geoip = tor_dir / "geoip"
+    geoip6 = tor_dir / "geoip6"
+    if geoip.is_file():
+        entries["GeoIPFile"] = str(geoip)
+    if geoip6.is_file():
+        entries["GeoIPv6File"] = str(geoip6)
+    return entries
+
+
+def _free_port() -> int:
+    """Return an available TCP port on 127.0.0.1.
+
+    Binding to port 0 asks the OS to assign a free ephemeral port; we read it
+    back and then immediately close the socket so Tor can bind to it.
+
+    There is a small TOCTOU window between closing this socket and Tor opening
+    its own listener.  This is unavoidable without OS-level socket hand-off.
+    Callers that care about reliability should retry on bind failure (see
+    ``_start_tor_hidden_service`` for an example).
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
 def _tor_log(line: str) -> None:
     """Print Tor bootstrap / error lines to help the user follow progress."""
     if "Bootstrapped" in line or "[err]" in line.lower() or "[warn]" in line.lower():
@@ -218,24 +254,42 @@ def _start_tor_hidden_service(tor_exe: Path) -> Optional[tuple]:
 
     print("\n  Starting Tor …  (this may take up to 90 seconds on first run)")
 
-    try:
-        tor_process = stem.process.launch_tor_with_config(
-            tor_cmd=str(tor_exe),
-            config={
-                "SocksPort": "0",
-                "ControlPort": "9151",
-                "DataDirectory": str(_TOR_DATA_DIR),
-                "HiddenServiceDir": str(_HS_DIR),
-                "HiddenServicePort": f"80 127.0.0.1:{SERVER_PORT}",
-            },
-            timeout=90,
-            init_msg_handler=_tor_log,
-        )
-    except OSError as exc:
-        print(f"\n  Tor failed to start: {exc}")
-        return None
-    except Exception as exc:  # noqa: BLE001
-        print(f"\n  Tor failed to start: {exc}")
+    control_port = _free_port()
+
+    config: dict = {
+        "SocksPort": "0",
+        "ControlPort": str(control_port),
+        "DataDirectory": str(_TOR_DATA_DIR),
+        "HiddenServiceDir": str(_HS_DIR),
+        "HiddenServicePort": f"80 127.0.0.1:{SERVER_PORT}",
+    }
+    # Provide GeoIP files from the bundle so Tor doesn't warn about a missing
+    # GeoIPFile path.  These files sit next to tor.exe in the Expert Bundle.
+    config.update(_find_geoip_files(tor_exe))
+
+    # Retry up to 3 times with a freshly chosen port in case another process
+    # races us to bind the control port between _free_port() and Tor startup.
+    tor_process = None
+    last_exc: Exception | None = None
+    for attempt in range(3):
+        if attempt > 0:
+            config["ControlPort"] = str(_free_port())
+        try:
+            tor_process = stem.process.launch_tor_with_config(
+                tor_cmd=str(tor_exe),
+                config=config,
+                timeout=90,
+                init_msg_handler=_tor_log,
+            )
+            break
+        except OSError as exc:
+            last_exc = exc
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            break  # non-OS errors are not port-conflict related; stop retrying
+
+    if tor_process is None:
+        print(f"\n  Tor failed to start: {last_exc}")
         return None
 
     # Wait for Tor to write the hostname file (created after bootstrap)
