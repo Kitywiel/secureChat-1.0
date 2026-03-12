@@ -1099,9 +1099,16 @@ section h2{font-size:1rem;font-weight:700;margin-bottom:.75rem;padding-bottom:.4
 </style>
 </head>
 <body>
-<div id="app"></div>
+<div id="app">
+<div id="login-wrap"><div id="login-card">
+  <h1>🔒 Admin Login</h1>
+  <form id="lf">
+    <input type="password" id="pc" placeholder="Admin passcode" autocomplete="off" autofocus/>
+    <button type="submit">Login →</button>
+  </form>
+</div></div>
+</div>
 <script>
-const _csrfToken = document.cookie.split(';').find(c=>c.trim().startsWith('admin_session='));
 
 async function fetchStats(){
   const r=await fetch('/admin/api/stats');
@@ -1131,7 +1138,7 @@ function renderLogin(errMsg=''){
     const pc=document.getElementById('pc').value;
     const r=await fetch('/admin/login',{method:'POST',headers:{'Content-Type':'application/json'},
                                         body:JSON.stringify({passcode:pc})});
-    if(r.ok){renderDashboard();}
+    if(r.ok){await renderDashboard().catch(()=>renderLogin('Load error. Please refresh.'));}
     else{renderLogin('Wrong passcode.');}
   });
 }
@@ -1263,11 +1270,19 @@ function startLogStream(){
   es.onerror=()=>{es.close();setTimeout(startLogStream,3000);};
 }
 
-// Bootstrap
-fetch('/admin/api/stats').then(r=>{
-  if(r.ok)renderDashboard();
-  else renderLogin();
-}).catch(()=>renderLogin());
+// Bootstrap — attach submit handler to the pre-rendered login form, then check session
+document.getElementById('lf').addEventListener('submit',async e=>{
+  e.preventDefault();
+  const pc=document.getElementById('pc').value;
+  const r=await fetch('/admin/login',{method:'POST',headers:{'Content-Type':'application/json'},
+                                      body:JSON.stringify({passcode:pc})});
+  if(r.ok){await renderDashboard().catch(()=>renderLogin('Load error. Please refresh.'));}
+  else{renderLogin('Wrong passcode.');}
+});
+fetch('/admin/api/stats').then(async r=>{
+  if(r.ok)await renderDashboard().catch(()=>renderLogin());
+  // else: leave the pre-rendered login form as-is
+}).catch(()=>{/* leave login form as-is on network error */});
 </script>
 </body>
 </html>
@@ -1319,6 +1334,11 @@ async def _admin_index_handler(request: web.Request) -> web.Response:
         # Return the login embedded in the main HTML (JavaScript handles routing)
         pass
     return web.Response(body=_ADMIN_HTML, content_type="text/html")
+
+
+async def _admin_root_redirect_handler(request: web.Request) -> web.Response:
+    """GET / on the admin port — redirect to /admin/."""
+    raise web.HTTPFound("/admin/")
 
 
 async def _admin_stats_handler(request: web.Request) -> web.Response:
@@ -1463,6 +1483,7 @@ def build_admin_app() -> web.Application:
         logger.info("admin panel ready  port=%d", ADMIN_PORT)
 
     app.on_startup.append(on_startup)
+    app.router.add_get("/", _admin_root_redirect_handler)
     app.router.add_get("/admin/", _admin_index_handler)
     app.router.add_get("/admin", _admin_index_handler)
     app.router.add_post("/admin/login", _admin_login_handler)

@@ -1292,3 +1292,23 @@ async def test_admin_incoming_webhook_non_json_body(admin_client) -> None:
         headers={"Content-Type": "text/plain"},
     )
     assert resp.status == 200
+
+
+@pytest.mark.asyncio
+async def test_admin_root_redirects_to_admin(admin_client) -> None:
+    """GET / on the admin port redirects to /admin/."""
+    resp = await admin_client.get("/", allow_redirects=False)
+    assert resp.status in (301, 302, 303, 307, 308)
+    location = resp.headers.get("Location", "")
+    assert "/admin/" in location
+
+
+@pytest.mark.asyncio
+async def test_admin_html_pre_renders_login_form(admin_client) -> None:
+    """Admin HTML body pre-renders the login form so there is no blank-page flash."""
+    resp = await admin_client.get("/admin/")
+    assert resp.status == 200
+    body = await resp.text()
+    # The login form must be in the served HTML (not injected by JS after load)
+    assert 'id="lf"' in body
+    assert 'id="pc"' in body
