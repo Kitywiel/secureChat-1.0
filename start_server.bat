@@ -36,7 +36,7 @@ if %errorlevel% neq 0 (
 :: ── Start the server ────────────────────────────────────────
 echo.
 echo  secureChat is starting on http://127.0.0.1:5000
-echo  Point OnionShare at 127.0.0.1:5000 to create your .onion address.
+echo  To expose over Tor, configure a Tor hidden service (see README.md).
 echo  Press Ctrl+C to stop the server.
 echo.
 python server.py

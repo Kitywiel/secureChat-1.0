@@ -119,69 +119,89 @@ By default the server listens on `127.0.0.1:5000`.  Open
 
 ---
 
-## Running on OnionShare (Windows GUI)
+## Exposing secureChat over Tor (hidden service)
 
-OnionShare exposes your local server as a `.onion` address through the Tor
-network.  The steps below use **OnionShare 2.6+** on Windows.
+Running secureChat behind a Tor hidden service hides the server's IP address
+from users and gives everyone a `.onion` URL to connect to.
+
+> **Note — OnionShare limitation:** OnionShare (GUI and CLI) is a file-sharing
+> and static-website tool.  It **cannot** proxy arbitrary TCP/WebSocket
+> traffic to a running Python server.  The `onionshare-cli` command has no
+> `--connect-to` flag; you must configure a Tor hidden service directly as
+> shown below.
 
 ### Step 1 — start secureChat
 
 Double-click `start_server.bat` (or run `python server.py` in a terminal).
 Keep this window open; the server must stay running.
 
-### Step 2 — create a Tor hidden service with OnionShare
+### Step 2 — configure a Tor hidden service
 
-**Using the OnionShare desktop app (GUI):**
+#### Windows (Tor Browser)
 
-> OnionShare's GUI is designed to share files or host static websites.  To
-> proxy Tor traffic to a running Python server you need the CLI or a manual
-> hidden service (see below).
+1. Install [Tor Browser](https://www.torproject.org/download/) if you haven't
+   already.
+2. Open the `torrc` configuration file.  With a default Tor Browser install on
+   Windows it is usually at:
+   ```
+   C:\Users\<YourUsername>\Desktop\Tor Browser\Browser\TorBrowser\Data\Tor\torrc
+   ```
+3. Add the following two lines at the end of the file:
+   ```
+   HiddenServiceDir C:\Users\<YourUsername>\AppData\Roaming\tor\securechat
+   HiddenServicePort 80 127.0.0.1:5000
+   ```
+   Replace `<YourUsername>` with your Windows username.  Tor will create the
+   `securechat` directory automatically on first run.
+4. Start (or restart) Tor Browser.  Tor will generate a `.onion` address and
+   write it to:
+   ```
+   C:\Users\<YourUsername>\AppData\Roaming\tor\securechat\hostname
+   ```
+   Open that file in Notepad to read your `.onion` URL.
 
-**Using the OnionShare command-line tool:**
+#### Windows (Tor Expert Bundle)
 
-Open a *second* Command Prompt or PowerShell window and run:
+If you installed the [Tor Expert Bundle](https://www.torproject.org/download/tor/)
+instead of Tor Browser, add the same two lines to the `torrc` file you use
+with `tor.exe` and restart Tor:
 
 ```cmd
-onionshare-cli --connect-to 127.0.0.1:5000
+tor.exe -f torrc
 ```
 
-OnionShare will print a `.onion` URL, for example:
-```
-http://xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx.onion
-```
+#### Linux / macOS
 
-> **Tip:** The `onionshare-cli` executable is included with the OnionShare
-> desktop installer.  On a typical Windows install it is at:
-> `C:\Program Files\OnionShare\onionshare-cli.exe`
-
-### Step 3 — share access details
-
-Send your contacts (through a separate secure channel) all three pieces of
-information they need to connect:
-
-| What         | Where to find it                       |
-|--------------|----------------------------------------|
-| `.onion` URL | printed by OnionShare when it starts   |
-| Room ID      | you choose — any alphanumeric string   |
-| Passphrase   | you choose — the shared encryption key |
-
-### Step 4 — connect
-
-Both parties open the `.onion` URL in **Tor Browser**, enter the same Room ID
-and Passphrase, and start chatting.
-
----
-
-## Manual Tor hidden service (advanced)
-
-Add the following to your `torrc` and restart Tor:
+Add the following to `/etc/tor/torrc` (or `~/.torrc`) and restart Tor:
 
 ```
 HiddenServiceDir /var/lib/tor/securechat/
 HiddenServicePort 80 127.0.0.1:5000
 ```
 
+```bash
+sudo systemctl restart tor   # systemd
+# or
+brew services restart tor    # macOS Homebrew
+```
+
 The `.onion` address will be in `/var/lib/tor/securechat/hostname`.
+
+### Step 3 — share access details
+
+Send your contacts (through a separate secure channel) all three pieces of
+information they need to connect:
+
+| What         | Where to find it                           |
+|--------------|--------------------------------------------|
+| `.onion` URL | in the `hostname` file created by Tor      |
+| Room ID      | you choose — any alphanumeric string       |
+| Passphrase   | you choose — the shared encryption key     |
+
+### Step 4 — connect
+
+Both parties open the `.onion` URL in **Tor Browser**, enter the same Room ID
+and Passphrase, and start chatting.
 
 ---
 
@@ -219,7 +239,7 @@ pytest tests/
 | IV reuse                          | Fresh `crypto.getRandomValues(12 bytes)` per message|
 | XSS via display names / messages  | All text set via `textContent`, never `innerHTML`   |
 | Path traversal in room IDs        | Allowlist regex `[A-Za-z0-9_-]{1,64}`               |
-| Traffic analysis / metadata       | Use Tor Browser + OnionShare to hide IP and timing  |
+| Traffic analysis / metadata       | Use Tor Browser + Tor hidden service to hide IP and timing  |
 
 ---
 

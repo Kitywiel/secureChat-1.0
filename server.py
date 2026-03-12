@@ -22,10 +22,10 @@ Environment variables
     HISTORY_LIMIT  Number of messages to store and replay per room
                    (default: 100)
 
-OnionShare
-----------
-Run the server on 127.0.0.1 (default), then expose it via OnionShare
-or a manual Tor hidden service.  See README.md for details.
+Tor hidden service
+------------------
+Run the server on 127.0.0.1 (default), then configure a Tor hidden service
+to expose it as a .onion address.  See README.md for details.
 """
 
 from __future__ import annotations
@@ -376,6 +376,6 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5000"))
     logger.info("secureChat starting  host=%s  port=%d", host, port)
     logger.info(
-        "Expose via OnionShare or Tor hidden service for anonymous access."
+        "Expose via a Tor hidden service for anonymous access (see README.md)."
     )
     web.run_app(build_app(), host=host, port=port, access_log=None)
