@@ -32,6 +32,7 @@ start_server.bat (Windows) for fully automatic setup.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -94,11 +95,22 @@ MAX_UPLOAD_BYTES = 100 * 1024 * 1024   # 100 MB per file
 MAX_FILENAME_LEN = 200                 # characters in the sanitised filename
 _SHARE_TOKEN_BYTES = 32                # 256-bit token → 43-char URL-safe base64
 
+# Room-create constants
+MAX_PASSCODE_LEN = 64                  # characters in a room passcode
+MAX_DESTRUCT_MINUTES = 1440            # 24 hours maximum
+
+# Onion address — admin sets this so generated invite links carry the .onion hostname
+ONION_ADDRESS: str | None = os.environ.get("ONION_ADDRESS")
+
 # Room ID: allow alphanumeric, hyphens, underscores only
 _ROOM_RE = re.compile(r"^[A-Za-z0-9_\-]{1,64}$")
 
 # In-memory room registry: room_id → {websocket, ...}
 rooms: dict[str, set[web.WebSocketResponse]] = {}
+
+# In-memory room-metadata registry — only for rooms created via POST /room/create.
+# room_id → {"passcode_hash": str | None, "expires_at": float | None}
+_room_meta: dict[str, dict] = {}
 
 # In-memory file-share slot registry
 # token → {"tmp_dir": Path, "filename": str, "size": int, "expires_at": float}
@@ -196,6 +208,21 @@ def _get_history_sync(path: Path, room_id: str, limit: int) -> list[dict]:
     ]
 
 
+def _delete_room_history_sync(path: Path, room_id: str) -> None:
+    """Delete all stored messages for *room_id* (called on self-destruct)."""
+    con = sqlite3.connect(path)
+    try:
+        con.execute("DELETE FROM messages WHERE room = ?", (room_id,))
+        con.commit()
+    finally:
+        con.close()
+
+
+def _hash_passcode(passcode: str) -> str:
+    """Return the hex SHA-256 digest of a room passcode."""
+    return hashlib.sha256(passcode.encode()).hexdigest()
+
+
 # ---------------------------------------------------------------------------
 # Async wrappers around the synchronous DB helpers
 # ---------------------------------------------------------------------------
@@ -260,6 +287,24 @@ async def ws_handler(request: web.Request) -> web.WebSocketResponse:
                     )
                     continue
 
+                # Check room metadata if this room was created via /room/create
+                meta = _room_meta.get(candidate)
+                if meta:
+                    # Reject if the room has already expired
+                    if meta.get("expires_at") and time.time() > meta["expires_at"]:
+                        await ws.send_str(
+                            json.dumps({"type": "error", "reason": "room_expired"})
+                        )
+                        break
+                    # Enforce passcode
+                    if meta.get("passcode_hash"):
+                        provided = str(data.get("passcode", "")).strip()
+                        if not provided or _hash_passcode(provided) != meta["passcode_hash"]:
+                            await ws.send_str(
+                                json.dumps({"type": "error", "reason": "wrong_passcode"})
+                            )
+                            break
+
                 room_id = candidate
                 rooms.setdefault(room_id, set()).add(ws)
                 logger.info(
@@ -277,6 +322,15 @@ async def ws_handler(request: web.Request) -> web.WebSocketResponse:
                         )
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("failed to load history  room=%s  error=%s", room_id, exc)
+
+                # Inform the peer about the self-destruct deadline (if any)
+                if meta and meta.get("expires_at"):
+                    remaining = max(0.0, meta["expires_at"] - time.time())
+                    await ws.send_str(json.dumps({
+                        "type": "destruct_info",
+                        "expires_at": meta["expires_at"],
+                        "remaining": remaining,
+                    }))
 
                 await _broadcast_system(room_id)
 
@@ -504,6 +558,94 @@ async def _cleanup_expired_share_slots() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Room-create and server-info handlers
+# ---------------------------------------------------------------------------
+
+
+async def room_create_handler(request: web.Request) -> web.Response:
+    """POST /room/create — register a room with optional passcode and self-destruct timer."""
+    try:
+        body = await request.json()
+    except Exception:
+        raise web.HTTPBadRequest(reason="JSON body required")
+
+    passcode = str(body.get("passcode") or "").strip()[:MAX_PASSCODE_LEN]
+    try:
+        destruct_minutes = int(body.get("destruct_minutes", 0))
+    except (ValueError, TypeError):
+        destruct_minutes = 0
+    destruct_minutes = max(0, min(MAX_DESTRUCT_MINUTES, destruct_minutes))
+
+    # Generate a unique room ID (16-char hex)
+    for _ in range(20):
+        room_id = secrets.token_hex(8)
+        if room_id not in _room_meta and room_id not in rooms:
+            break
+
+    expires_at = (time.time() + destruct_minutes * 60) if destruct_minutes > 0 else None
+    passcode_hash = _hash_passcode(passcode) if passcode else None
+
+    _room_meta[room_id] = {
+        "passcode_hash": passcode_hash,
+        "expires_at": expires_at,
+    }
+    logger.info(
+        "room created  room=%s  passcode=%s  destruct=%dm",
+        room_id,
+        bool(passcode),
+        destruct_minutes,
+    )
+    return web.json_response({"room_id": room_id, "expires_at": expires_at})
+
+
+async def server_info_handler(request: web.Request) -> web.Response:
+    """GET /api/server-info — return public server information (onion address if known)."""
+    onion = ONION_ADDRESS
+    if not onion:
+        # Try well-known Tor hidden-service hostname file locations
+        for candidate in [
+            Path("/var/lib/tor/hidden_service/hostname"),
+            Path("/etc/tor/hidden_service/hostname"),
+            _HERE / "tor" / "hidden_service" / "hostname",
+        ]:
+            if candidate.exists():
+                try:
+                    onion = candidate.read_text().strip() or None
+                except Exception:  # noqa: BLE001
+                    pass
+                break
+    return web.json_response({"onion": onion})
+
+
+async def _cleanup_expired_rooms(db_path: Path) -> None:
+    """Background task: self-destruct expired rooms every 30 seconds."""
+    while True:
+        await asyncio.sleep(30)
+        now = time.time()
+        expired = [
+            r for r, m in list(_room_meta.items())
+            if m.get("expires_at") and now > m["expires_at"]
+        ]
+        for room_id in expired:
+            _room_meta.pop(room_id, None)
+            if room_id in rooms:
+                await _broadcast_to_room(room_id, json.dumps({"type": "destruct"}))
+                for peer in list(rooms.get(room_id, set())):
+                    try:
+                        await peer.close()
+                    except Exception:  # noqa: BLE001
+                        pass
+                rooms.pop(room_id, None)
+            try:
+                await asyncio.to_thread(_delete_room_history_sync, db_path, room_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "failed to delete room history  room=%s  error=%s", room_id, exc
+                )
+            logger.info("room self-destructed  room=%s", room_id)
+
+
+# ---------------------------------------------------------------------------
 # App factory
 # ---------------------------------------------------------------------------
 
@@ -517,21 +659,27 @@ def build_app(db_path: Path | None = None) -> web.Application:
     async def on_startup(app: web.Application) -> None:
         await init_db(app["db_path"])
         logger.info("database ready  path=%s", app["db_path"])
-        app["_cleanup_task"] = asyncio.create_task(_cleanup_expired_share_slots())
+        app["_cleanup_share_task"] = asyncio.create_task(_cleanup_expired_share_slots())
+        app["_cleanup_rooms_task"] = asyncio.create_task(
+            _cleanup_expired_rooms(app["db_path"])
+        )
 
     async def on_cleanup(app: web.Application) -> None:
-        task = app.get("_cleanup_task")
-        if task:
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
+        for key in ("_cleanup_share_task", "_cleanup_rooms_task"):
+            task = app.get(key)
+            if task:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
 
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_cleanup)
     app.router.add_get("/ws", ws_handler)
     app.router.add_get("/", index_handler)
+    app.router.add_post("/room/create", room_create_handler)
+    app.router.add_get("/api/server-info", server_info_handler)
     app.router.add_post("/share/upload", share_upload_handler)
     app.router.add_get("/share/download/{token}", share_download_handler)
     app.router.add_static("/static", STATIC_DIR, show_index=False)

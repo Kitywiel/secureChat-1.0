@@ -170,6 +170,96 @@ let roomKey = null;
 
 let displayName = 'Anonymous';
 
+/** Passcode sent to the server during WebSocket join (server-side auth). */
+let roomPasscode = '';
+
+/** Holds data for the room just created, used by the "Join This Room" button. */
+let currentCreateRoomData = null;
+
+/** Interval ID for the self-destruct countdown. */
+let destructTimerInterval = null;
+
+// ─── Random generation helpers ────────────────────────────────────────────────
+
+/** Generate a cryptographically random passphrase (URL-safe base64, 22 chars). */
+function randomPassphrase() {
+  const arr = new Uint8Array(16);
+  crypto.getRandomValues(arr);
+  return btoa(String.fromCharCode(...arr))
+    .replace(/\+/g, 'x')
+    .replace(/\//g, 'y')
+    .replace(/=/g, '')
+    .slice(0, 22);
+}
+
+/** Generate a random 6-digit numeric passcode. */
+function randomPasscode() {
+  const arr = new Uint32Array(1);
+  crypto.getRandomValues(arr);
+  return String(arr[0] % 1000000).padStart(6, '0');
+}
+
+// ─── URL fragment pre-fill ───────────────────────────────────────────────────
+
+/**
+ * Parse the URL fragment (#room=X&pass=Y&code=Z) and pre-fill the join form.
+ * Called once on page load so invite links work automatically.
+ */
+function applyFragmentToJoinForm() {
+  const hash = window.location.hash.slice(1);
+  if (!hash) return;
+  /** @type {Record<string, string>} */
+  const params = {};
+  hash.split('&').forEach((part) => {
+    const eq = part.indexOf('=');
+    if (eq > 0) {
+      const k = decodeURIComponent(part.slice(0, eq));
+      const v = decodeURIComponent(part.slice(eq + 1));
+      params[k] = v;
+    }
+  });
+  if (params.room) document.getElementById('room-id').value = params.room;
+  if (params.pass) document.getElementById('passphrase').value = params.pass;
+  if (params.code) document.getElementById('room-passcode').value = params.code;
+}
+
+// ─── Self-destruct timer ──────────────────────────────────────────────────────
+
+/**
+ * Start the self-destruct countdown badge in the chat header.
+ * @param {number} expiresAt  Unix epoch seconds.
+ */
+function startDestructTimer(expiresAt) {
+  stopDestructTimer();
+  const el = document.getElementById('destruct-timer');
+  el.classList.remove('hidden');
+
+  const tick = () => {
+    const remaining = Math.max(0, expiresAt - Date.now() / 1000);
+    const h = Math.floor(remaining / 3600);
+    const m = Math.floor((remaining % 3600) / 60);
+    const s = Math.floor(remaining % 60);
+    let label = '💣 ';
+    if (h > 0) label += `${h}h `;
+    label += `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+    el.textContent = label;
+    if (remaining <= 0) stopDestructTimer();
+  };
+
+  tick();
+  destructTimerInterval = setInterval(tick, 1000);
+}
+
+/** Clear the countdown interval and hide the badge. */
+function stopDestructTimer() {
+  if (destructTimerInterval !== null) {
+    clearInterval(destructTimerInterval);
+    destructTimerInterval = null;
+  }
+  const el = document.getElementById('destruct-timer');
+  if (el) el.classList.add('hidden');
+}
+
 // ─── WebSocket ────────────────────────────────────────────────────────────────
 
 /**
@@ -182,7 +272,10 @@ function connectWs(roomId) {
   ws = new WebSocket(`${proto}//${location.host}/ws`);
 
   ws.addEventListener('open', () => {
-    ws.send(JSON.stringify({ type: 'join', room: roomId }));
+    /** @type {Record<string, string>} */
+    const joinMsg = { type: 'join', room: roomId };
+    if (roomPasscode) joinMsg.passcode = roomPasscode;
+    ws.send(JSON.stringify(joinMsg));
   });
 
   ws.addEventListener('message', async (event) => {
@@ -231,8 +324,28 @@ function connectWs(roomId) {
           'error',
         );
       }
+
+    } else if (data.type === 'destruct_info') {
+      // Server told us this room has a self-destruct deadline
+      startDestructTimer(data.expires_at);
+      const d = new Date(data.expires_at * 1000);
+      appendMessage('', `⏱ Room self-destructs at ${d.toLocaleString()}`, 'system');
+
+    } else if (data.type === 'destruct') {
+      // The room has been destroyed — stop the timer and lock the UI
+      stopDestructTimer();
+      appendMessage('', '💣 Room has self-destructed. All messages have been deleted.', 'system');
+      document.getElementById('message-input').disabled = true;
+      document.getElementById('send-btn').disabled = true;
+
     } else if (data.type === 'error') {
-      appendMessage('⚠️', `Server error: ${data.reason}`, 'error');
+      const reason = data.reason || 'unknown';
+      const msgs = {
+        wrong_passcode: '🔒 Wrong room passcode — access denied.',
+        room_expired:   '💣 This room has already self-destructed.',
+        invalid_room_id: 'Invalid room ID.',
+      };
+      appendMessage('⚠️', msgs[reason] ?? `Server error: ${reason}`, 'error');
     }
   });
 
@@ -249,20 +362,43 @@ function connectWs(roomId) {
 
 // ─── Event handlers ───────────────────────────────────────────────────────────
 
+/**
+ * Enter the chat screen after successful key derivation.
+ *
+ * @param {string}     roomId
+ * @param {CryptoKey}  key
+ * @param {string}     name
+ * @param {string}     passcode  Server-side room passcode (empty string if none).
+ */
+function enterRoom(roomId, key, name, passcode) {
+  roomKey = key;
+  displayName = name.slice(0, 32);
+  roomPasscode = passcode;
+  stopDestructTimer();
+  document.getElementById('room-label').textContent = `🔒 ${roomId}`;
+  document.getElementById('message-input').disabled = false;
+  document.getElementById('send-btn').disabled = false;
+  showScreen('chat');
+  document.getElementById('message-input').focus();
+  connectWs(roomId);
+}
+
 document.getElementById('join-form').addEventListener('submit', async (e) => {
   e.preventDefault();
 
-  const nameInput = /** @type {HTMLInputElement} */ (document.getElementById('display-name'));
-  const roomInput = /** @type {HTMLInputElement} */ (document.getElementById('room-id'));
-  const passInput = /** @type {HTMLInputElement} */ (document.getElementById('passphrase'));
+  const nameInput   = /** @type {HTMLInputElement} */ (document.getElementById('display-name'));
+  const roomInput   = /** @type {HTMLInputElement} */ (document.getElementById('room-id'));
+  const passInput   = /** @type {HTMLInputElement} */ (document.getElementById('passphrase'));
+  const codeInput   = /** @type {HTMLInputElement} */ (document.getElementById('room-passcode'));
   const errEl = document.getElementById('join-error');
-  const btn = document.getElementById('join-btn');
+  const btn   = document.getElementById('join-btn');
 
   errEl.textContent = '';
 
-  const name = nameInput.value.trim() || 'Anonymous';
-  const roomId = roomInput.value.trim();
+  const name       = nameInput.value.trim() || 'Anonymous';
+  const roomId     = roomInput.value.trim();
   const passphrase = passInput.value;
+  const passcode   = codeInput.value;
 
   if (!roomId) {
     errEl.textContent = 'Room ID is required.';
@@ -284,28 +420,17 @@ document.getElementById('join-form').addEventListener('submit', async (e) => {
   btn.textContent = 'Deriving key…';
 
   try {
-    roomKey = await deriveKey(passphrase, roomId);
+    const key = await deriveKey(passphrase, roomId);
+    // Clear passphrase from DOM before switching screen
+    passInput.value = '';
+    enterRoom(roomId, key, name, passcode);
   } catch (err) {
     errEl.textContent = 'Key derivation failed: ' + err.message;
+    passInput.value = '';
+  } finally {
     btn.disabled = false;
     btn.textContent = 'Join Room →';
-    return;
-  } finally {
-    // Always clear the passphrase from the DOM as soon as possible.
-    passInput.value = '';
   }
-
-  displayName = name.slice(0, 32);
-  document.getElementById('room-label').textContent = `🔒 ${roomId}`;
-  document.getElementById('message-input').disabled = false;
-  document.getElementById('send-btn').disabled = false;
-
-  showScreen('chat');
-  document.getElementById('message-input').focus();
-  connectWs(roomId);
-
-  btn.disabled = false;
-  btn.textContent = 'Join Room →';
 });
 
 document.getElementById('message-form').addEventListener('submit', async (e) => {
@@ -347,6 +472,8 @@ document.getElementById('leave-btn').addEventListener('click', () => {
     ws = null;
   }
   roomKey = null;
+  roomPasscode = '';
+  stopDestructTimer();
   showScreen('lobby');
   document.getElementById('messages').innerHTML = '';
   document.getElementById('join-form').reset();
@@ -455,3 +582,164 @@ document.getElementById('share-copy-btn').addEventListener('click', () => {
     }
   });
 });
+
+// ─── Create Room ──────────────────────────────────────────────────────────────
+
+/** Reset the create-room screen to its initial form state. */
+function resetCreateRoomScreen() {
+  document.getElementById('create-room-form').reset();
+  document.getElementById('create-error').textContent = '';
+  document.getElementById('create-room-result').classList.add('hidden');
+  document.getElementById('create-room-form-area').classList.remove('hidden');
+  document.getElementById('create-passcode-row').classList.add('hidden');
+  document.getElementById('create-passphrase').value = randomPassphrase();
+  currentCreateRoomData = null;
+}
+
+document.getElementById('create-room-btn').addEventListener('click', () => {
+  resetCreateRoomScreen();
+  showScreen('create-room');
+});
+
+document.getElementById('create-back-btn').addEventListener('click', () => {
+  showScreen('lobby');
+});
+
+document.getElementById('refresh-passphrase-btn').addEventListener('click', () => {
+  document.getElementById('create-passphrase').value = randomPassphrase();
+});
+
+document.getElementById('refresh-passcode-btn').addEventListener('click', () => {
+  document.getElementById('create-passcode').value = randomPasscode();
+});
+
+document.getElementById('create-passcode-check').addEventListener('change', (e) => {
+  const row = document.getElementById('create-passcode-row');
+  if (/** @type {HTMLInputElement} */ (e.target).checked) {
+    row.classList.remove('hidden');
+    if (!document.getElementById('create-passcode').value) {
+      document.getElementById('create-passcode').value = randomPasscode();
+    }
+  } else {
+    row.classList.add('hidden');
+  }
+});
+
+document.getElementById('create-room-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+
+  const errEl = document.getElementById('create-error');
+  const btn   = document.getElementById('create-room-submit-btn');
+  errEl.textContent = '';
+
+  const passphrase = document.getElementById('create-passphrase').value.trim();
+  if (!passphrase) {
+    errEl.textContent = 'Passphrase is required.';
+    return;
+  }
+
+  const usePasscode      = document.getElementById('create-passcode-check').checked;
+  const passcode         = usePasscode ? document.getElementById('create-passcode').value.trim() : '';
+  const destructMinutes  = parseInt(document.getElementById('create-destruct').value, 10);
+  const creatorName      = document.getElementById('create-display-name').value.trim() || 'Anonymous';
+
+  btn.disabled = true;
+  btn.textContent = 'Creating…';
+
+  try {
+    const resp = await fetch('/room/create', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        passcode: passcode || null,
+        destruct_minutes: destructMinutes,
+      }),
+    });
+
+    if (!resp.ok) {
+      errEl.textContent = `Failed to create room (HTTP ${resp.status}).`;
+      return;
+    }
+
+    const data = await resp.json();
+    const roomId = data.room_id;
+
+    // Build invite fragment — never sent to the server
+    const fragParts = [
+      `room=${encodeURIComponent(roomId)}`,
+      `pass=${encodeURIComponent(passphrase)}`,
+    ];
+    if (passcode) fragParts.push(`code=${encodeURIComponent(passcode)}`);
+
+    // Use the server's known onion address if available, else fall back to current origin
+    let baseUrl = window.location.origin;
+    try {
+      const infoResp = await fetch('/api/server-info');
+      if (infoResp.ok) {
+        const info = await infoResp.json();
+        if (info.onion) baseUrl = `http://${info.onion}`;
+      }
+    } catch { /* ignore — not critical */ }
+
+    const inviteUrl = `${baseUrl}/#${fragParts.join('&')}`;
+
+    currentCreateRoomData = { roomId, passphrase, passcode, expiresAt: data.expires_at, creatorName };
+
+    document.getElementById('create-invite-link').textContent = inviteUrl;
+
+    if (data.expires_at) {
+      const d = new Date(data.expires_at * 1000);
+      document.getElementById('create-expiry').textContent =
+        `⏱ Room self-destructs at ${d.toLocaleString()}`;
+    } else {
+      document.getElementById('create-expiry').textContent = '♾️ Room has no expiry.';
+    }
+
+    document.getElementById('create-room-form-area').classList.add('hidden');
+    document.getElementById('create-room-result').classList.remove('hidden');
+
+  } catch (err) {
+    errEl.textContent = 'Error: ' + (err instanceof Error ? err.message : String(err));
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Create Room →';
+  }
+});
+
+document.getElementById('create-copy-btn').addEventListener('click', () => {
+  const linkEl = document.getElementById('create-invite-link');
+  const url = linkEl.textContent;
+  if (!url) return;
+  navigator.clipboard.writeText(url).then(() => {
+    const btn = document.getElementById('create-copy-btn');
+    btn.textContent = 'Copied!';
+    setTimeout(() => { btn.textContent = 'Copy'; }, 2000);
+  }).catch(() => {
+    const range = document.createRange();
+    range.selectNodeContents(linkEl);
+    const sel = window.getSelection();
+    if (sel) { sel.removeAllRanges(); sel.addRange(range); }
+  });
+});
+
+document.getElementById('create-join-btn').addEventListener('click', async () => {
+  if (!currentCreateRoomData) return;
+  const { roomId, passphrase, passcode, creatorName } = currentCreateRoomData;
+  const btn = document.getElementById('create-join-btn');
+  btn.disabled = true;
+  btn.textContent = 'Joining…';
+  try {
+    const key = await deriveKey(passphrase, roomId);
+    enterRoom(roomId, key, creatorName, passcode || '');
+  } catch (err) {
+    document.getElementById('create-error').textContent =
+      'Key derivation failed: ' + (err instanceof Error ? err.message : String(err));
+    btn.disabled = false;
+    btn.textContent = 'Join This Room →';
+  }
+});
+
+// ─── Init ─────────────────────────────────────────────────────────────────────
+
+// On page load, pre-fill the join form from any invite link fragment
+applyFragmentToJoinForm();

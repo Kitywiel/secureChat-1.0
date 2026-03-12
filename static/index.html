@@ -58,6 +58,17 @@
             autocomplete="new-password"
           />
 
+          <label for="room-passcode">
+            Room Passcode
+            <span class="hint"> — leave blank if the room has no passcode</span>
+          </label>
+          <input
+            type="password"
+            id="room-passcode"
+            placeholder="Leave blank if none"
+            autocomplete="off"
+          />
+
           <div id="join-error" class="field-error" aria-live="polite"></div>
 
           <button type="submit" id="join-btn">Join Room →</button>
@@ -69,6 +80,9 @@
         </p>
 
         <div class="lobby-actions">
+          <button type="button" id="create-room-btn" class="btn-secondary">
+            🔐 Create Room
+          </button>
           <button type="button" id="share-files-btn" class="btn-secondary">
             📎 Share Files
           </button>
@@ -80,6 +94,7 @@
     <div id="chat" class="screen hidden">
       <header class="chat-header">
         <span id="room-label" class="room-label"></span>
+        <span id="destruct-timer" class="destruct-timer hidden" aria-live="polite"></span>
         <span id="user-count" class="user-count">👤 1</span>
         <button id="leave-btn" type="button">Leave</button>
       </header>
@@ -98,6 +113,103 @@
         ></textarea>
         <button type="submit" id="send-btn" aria-label="Send message">↑</button>
       </form>
+    </div>
+
+    <!-- ── Create Room ─────────────────────────────────────────────────── -->
+    <div id="create-room" class="screen hidden">
+      <div class="card">
+        <div class="card-header">
+          <button type="button" id="create-back-btn" class="btn-back">← Back</button>
+          <h1>🔐 Create Room</h1>
+        </div>
+        <p class="subtitle">
+          Create a private encrypted room and share the generated link with
+          anyone you want to invite.
+        </p>
+
+        <div id="create-room-form-area">
+          <form id="create-room-form" novalidate>
+            <label for="create-display-name">Your Display Name</label>
+            <input
+              type="text"
+              id="create-display-name"
+              placeholder="Anonymous"
+              maxlength="32"
+              autocomplete="off"
+              spellcheck="false"
+            />
+
+            <label for="create-passphrase">
+              Encryption Passphrase
+              <span class="hint"> — auto-generated, included in the invite link</span>
+            </label>
+            <div class="gen-row">
+              <input
+                type="text"
+                id="create-passphrase"
+                required
+                autocomplete="off"
+                spellcheck="false"
+              />
+              <button
+                type="button"
+                id="refresh-passphrase-btn"
+                class="btn-icon"
+                title="Generate new passphrase"
+              >↻</button>
+            </div>
+
+            <div class="checkbox-row">
+              <input type="checkbox" id="create-passcode-check" />
+              <label for="create-passcode-check">Require a room passcode</label>
+            </div>
+
+            <div id="create-passcode-row" class="gen-row hidden">
+              <input
+                type="text"
+                id="create-passcode"
+                placeholder="Room passcode"
+                autocomplete="off"
+                spellcheck="false"
+                maxlength="64"
+              />
+              <button
+                type="button"
+                id="refresh-passcode-btn"
+                class="btn-icon"
+                title="Generate new passcode"
+              >↻</button>
+            </div>
+
+            <label for="create-destruct">Self-destruct timer</label>
+            <select id="create-destruct">
+              <option value="0">Never</option>
+              <option value="30">30 minutes</option>
+              <option value="60">1 hour</option>
+              <option value="120">2 hours</option>
+              <option value="240">4 hours</option>
+              <option value="480">8 hours</option>
+              <option value="1440">24 hours</option>
+            </select>
+
+            <div id="create-error" class="field-error" aria-live="polite"></div>
+
+            <button type="submit" id="create-room-submit-btn">Create Room →</button>
+          </form>
+        </div>
+
+        <div id="create-room-result" class="share-result hidden">
+          <p class="share-result-label">🔗 Invite link — share this with your contact:</p>
+          <div class="share-link-row">
+            <code id="create-invite-link" class="share-link"></code>
+            <button type="button" id="create-copy-btn" class="btn-copy">Copy</button>
+          </div>
+          <p id="create-expiry" class="notice"></p>
+          <button type="button" id="create-join-btn">
+            Join This Room →
+          </button>
+        </div>
+      </div>
     </div>
 
     <!-- ── Share Files ────────────────────────────────────────────────── -->

@@ -8,6 +8,7 @@ Covers:
 - WebSocket handler join / message / leave lifecycle (via aiohttp test client)
 - History replay: messages persisted before a new client joins are sent back
 - File-share endpoints: upload, one-time download, expiry, cleanup
+- Room creation, passcode enforcement, self-destruct timer, history deletion
 """
 
 from __future__ import annotations
@@ -26,8 +27,11 @@ from server import (
     _ROOM_RE,
     _broadcast_system,
     _broadcast_to_room,
+    _delete_room_history_sync,
     _get_history_sync,
+    _hash_passcode,
     _init_db_sync,
+    _room_meta,
     _sanitize_filename,
     _save_message_sync,
     _share_slots,
@@ -522,3 +526,193 @@ async def test_share_ttl_clamped(ws_client) -> None:
     assert resp_high.status == 200
     body_high = await resp_high.json()
     assert body_high["expires_at"] <= time.time() + 24 * 3600 + _EXPIRY_TOLERANCE_S
+
+
+# ─── Room-meta helpers ────────────────────────────────────────────────────────
+
+@pytest.fixture(autouse=True)
+def clear_room_meta():
+    """Ensure _room_meta is empty before/after each test."""
+    _room_meta.clear()
+    yield
+    _room_meta.clear()
+
+
+def test_hash_passcode_deterministic() -> None:
+    """Same passcode always produces the same hash."""
+    assert _hash_passcode("secret") == _hash_passcode("secret")
+
+
+def test_hash_passcode_different_inputs() -> None:
+    """Different passcodes produce different hashes."""
+    assert _hash_passcode("aaa") != _hash_passcode("bbb")
+
+
+def test_delete_room_history(tmp_db: Path) -> None:
+    """Messages for a room are removed; other rooms are unaffected."""
+    _save_message_sync(tmp_db, "del-room", "Alice", "iv1", "ct1", limit=100)
+    _save_message_sync(tmp_db, "keep-room", "Bob", "iv2", "ct2", limit=100)
+    _delete_room_history_sync(tmp_db, "del-room")
+    assert _get_history_sync(tmp_db, "del-room", limit=100) == []
+    assert len(_get_history_sync(tmp_db, "keep-room", limit=100)) == 1
+
+
+# ─── Room-create endpoint ─────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_room_create_returns_room_id(ws_client) -> None:
+    resp = await ws_client.post(
+        "/room/create",
+        json={"destruct_minutes": 0},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert "room_id" in body
+    assert len(body["room_id"]) == 16   # 8 hex bytes
+    assert body["expires_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_room_create_with_destruct(ws_client) -> None:
+    resp = await ws_client.post(
+        "/room/create",
+        json={"destruct_minutes": 60},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["expires_at"] is not None
+    assert body["expires_at"] > time.time()
+    assert body["expires_at"] <= time.time() + 3600 + _EXPIRY_TOLERANCE_S
+
+
+@pytest.mark.asyncio
+async def test_room_create_registers_in_meta(ws_client) -> None:
+    resp = await ws_client.post(
+        "/room/create",
+        json={"passcode": "abc123", "destruct_minutes": 0},
+    )
+    body = await resp.json()
+    room_id = body["room_id"]
+    assert room_id in _room_meta
+    assert _room_meta[room_id]["passcode_hash"] == _hash_passcode("abc123")
+    assert _room_meta[room_id]["expires_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_room_create_bad_body_returns_400(ws_client) -> None:
+    resp = await ws_client.post(
+        "/room/create",
+        data=b"not json",
+        headers={"Content-Type": "application/json"},
+    )
+    assert resp.status == 400
+
+
+# ─── Server-info endpoint ─────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_server_info_no_onion(ws_client, monkeypatch) -> None:
+    """When ONION_ADDRESS is unset and no hostname file exists, onion is null."""
+    monkeypatch.setattr(srv, "ONION_ADDRESS", None)
+    resp = await ws_client.get("/api/server-info")
+    assert resp.status == 200
+    body = await resp.json()
+    assert "onion" in body
+    # In the test environment there is no Tor hostname file, so expect null
+    assert body["onion"] is None
+
+
+@pytest.mark.asyncio
+async def test_server_info_with_onion(ws_client, monkeypatch) -> None:
+    """When ONION_ADDRESS is set, it is returned."""
+    monkeypatch.setattr(srv, "ONION_ADDRESS", "test1234567890.onion")
+    resp = await ws_client.get("/api/server-info")
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["onion"] == "test1234567890.onion"
+
+
+# ─── WS join with passcode / expiry ──────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_ws_join_passcode_correct(ws_client) -> None:
+    """A client that provides the correct passcode can join."""
+    # Register room with passcode
+    _room_meta["passcode-room"] = {
+        "passcode_hash": _hash_passcode("1234"),
+        "expires_at": None,
+    }
+    async with ws_client.ws_connect("/ws") as ws:
+        await ws.send_str(json.dumps({"type": "join", "room": "passcode-room", "passcode": "1234"}))
+        msg = await ws.receive_json(timeout=2)
+        assert msg["type"] == "system"
+        assert msg["users"] == 1
+
+
+@pytest.mark.asyncio
+async def test_ws_join_passcode_wrong(ws_client) -> None:
+    """A client that provides the wrong passcode receives an error."""
+    _room_meta["secure-room"] = {
+        "passcode_hash": _hash_passcode("correct"),
+        "expires_at": None,
+    }
+    async with ws_client.ws_connect("/ws") as ws:
+        await ws.send_str(json.dumps({"type": "join", "room": "secure-room", "passcode": "wrong"}))
+        msg = await ws.receive_json(timeout=2)
+        assert msg["type"] == "error"
+        assert msg["reason"] == "wrong_passcode"
+
+
+@pytest.mark.asyncio
+async def test_ws_join_passcode_missing(ws_client) -> None:
+    """A client that omits the passcode also gets an error."""
+    _room_meta["locked-room"] = {
+        "passcode_hash": _hash_passcode("secret"),
+        "expires_at": None,
+    }
+    async with ws_client.ws_connect("/ws") as ws:
+        await ws.send_str(json.dumps({"type": "join", "room": "locked-room"}))
+        msg = await ws.receive_json(timeout=2)
+        assert msg["type"] == "error"
+        assert msg["reason"] == "wrong_passcode"
+
+
+@pytest.mark.asyncio
+async def test_ws_join_expired_room(ws_client) -> None:
+    """Joining an already-expired room returns room_expired error."""
+    _room_meta["dead-room"] = {
+        "passcode_hash": None,
+        "expires_at": time.time() - 1,   # already expired
+    }
+    async with ws_client.ws_connect("/ws") as ws:
+        await ws.send_str(json.dumps({"type": "join", "room": "dead-room"}))
+        msg = await ws.receive_json(timeout=2)
+        assert msg["type"] == "error"
+        assert msg["reason"] == "room_expired"
+
+
+@pytest.mark.asyncio
+async def test_ws_join_sends_destruct_info(ws_client) -> None:
+    """Joining a room with a future expiry should receive a destruct_info message."""
+    expires_at = time.time() + 3600
+    _room_meta["timed-room"] = {
+        "passcode_hash": None,
+        "expires_at": expires_at,
+    }
+    async with ws_client.ws_connect("/ws") as ws:
+        await ws.send_str(json.dumps({"type": "join", "room": "timed-room"}))
+
+        import asyncio
+        messages = []
+        for _ in range(3):
+            try:
+                m = await asyncio.wait_for(ws.receive_json(), timeout=2)
+                messages.append(m)
+            except asyncio.TimeoutError:
+                break
+
+        types = {m["type"] for m in messages}
+        assert "destruct_info" in types, f"Expected destruct_info in {messages}"
+        di = next(m for m in messages if m["type"] == "destruct_info")
+        assert abs(di["expires_at"] - expires_at) < 1
+        assert di["remaining"] > 0
