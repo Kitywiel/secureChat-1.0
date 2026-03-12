@@ -1156,3 +1156,139 @@ async def test_room_meta_retained_when_last_peer_leaves(ws_client) -> None:
 
     # After the connection closes, metadata must still be present
     assert "retain-test" in _room_meta, "Room metadata must be retained for passcode-protected rooms"
+
+
+# ─── Admin panel tests ────────────────────────────────────────────────────────
+
+from server import (
+    build_admin_app,
+    _ADMIN_SESSIONS,
+    _make_admin_session,
+    _valid_admin_session,
+)
+import server as _srv_mod
+
+
+@pytest.fixture
+def admin_app():
+    """Return a freshly-built admin application."""
+    return build_admin_app()
+
+
+@pytest_asyncio.fixture
+async def admin_client(admin_app, aiohttp_client):
+    return await aiohttp_client(admin_app)
+
+
+async def _login(admin_client) -> None:
+    """Helper: perform admin login and set session cookie."""
+    resp = await admin_client.post(
+        "/admin/login",
+        json={"passcode": _srv_mod._ADMIN_PASSCODE},
+    )
+    assert resp.status == 200
+
+
+@pytest.mark.asyncio
+async def test_admin_html_served(admin_client) -> None:
+    """GET /admin/ returns the admin HTML page."""
+    resp = await admin_client.get("/admin/")
+    assert resp.status == 200
+    ct = resp.headers.get("Content-Type", "")
+    assert "text/html" in ct
+
+
+@pytest.mark.asyncio
+async def test_admin_login_correct_passcode(admin_client) -> None:
+    """POST /admin/login with correct passcode returns 200 and sets session cookie."""
+    resp = await admin_client.post(
+        "/admin/login",
+        json={"passcode": _srv_mod._ADMIN_PASSCODE},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["ok"] is True
+    assert "admin_session" in resp.cookies
+
+
+@pytest.mark.asyncio
+async def test_admin_login_wrong_passcode(admin_client) -> None:
+    """POST /admin/login with wrong passcode returns 403."""
+    resp = await admin_client.post(
+        "/admin/login",
+        json={"passcode": "definitely-wrong"},
+    )
+    assert resp.status == 403
+
+
+@pytest.mark.asyncio
+async def test_admin_stats_requires_auth(admin_client) -> None:
+    """GET /admin/api/stats without session returns 401."""
+    resp = await admin_client.get("/admin/api/stats")
+    assert resp.status == 401
+
+
+@pytest.mark.asyncio
+async def test_admin_stats_with_auth(admin_client) -> None:
+    """GET /admin/api/stats with valid session returns stats JSON."""
+    await _login(admin_client)
+    resp = await admin_client.get("/admin/api/stats")
+    assert resp.status == 200
+    body = await resp.json()
+    assert "open_rooms" in body
+    assert "rooms_created_total" in body
+    assert "rooms_by_destruct" in body
+
+
+@pytest.mark.asyncio
+async def test_admin_webhook_info_requires_auth(admin_client) -> None:
+    """GET /admin/api/webhook-info without session returns 401."""
+    resp = await admin_client.get("/admin/api/webhook-info")
+    assert resp.status == 401
+
+
+@pytest.mark.asyncio
+async def test_admin_webhook_info_returns_token(admin_client) -> None:
+    """GET /admin/api/webhook-info returns the webhook token."""
+    await _login(admin_client)
+    resp = await admin_client.get("/admin/api/webhook-info")
+    assert resp.status == 200
+    body = await resp.json()
+    assert "webhook_token" in body
+    assert len(body["webhook_token"]) > 0
+
+
+@pytest.mark.asyncio
+async def test_admin_incoming_webhook_wrong_token(admin_client) -> None:
+    """POST /admin/webhook/<wrong-token> returns 401."""
+    resp = await admin_client.post(
+        "/admin/webhook/not-the-right-token",
+        json={"event": "test"},
+    )
+    assert resp.status == 401
+
+
+@pytest.mark.asyncio
+async def test_admin_incoming_webhook_valid_token(admin_client) -> None:
+    """POST /admin/webhook/<valid-token> with correct token returns 200."""
+    token = _srv_mod._ADMIN_WEBHOOK_TOKEN
+    resp = await admin_client.post(
+        f"/admin/webhook/{token}",
+        json={"event": "deploy", "version": "1.2.3"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["ok"] is True
+    assert body["received"] is True
+
+
+@pytest.mark.asyncio
+async def test_admin_incoming_webhook_non_json_body(admin_client) -> None:
+    """POST /admin/webhook/<token> with non-JSON body is accepted (body defaults to {})."""
+    token = _srv_mod._ADMIN_WEBHOOK_TOKEN
+    resp = await admin_client.post(
+        f"/admin/webhook/{token}",
+        data=b"not json",
+        headers={"Content-Type": "text/plain"},
+    )
+    assert resp.status == 200

@@ -171,6 +171,7 @@ ADMIN_ONION_ADDRESS: str | None = os.environ.get("ADMIN_ONION_ADDRESS")
 ADMIN_SESSION_TTL = 3600               # 1 hour
 _ADMIN_PASSCODE: str = ""              # set at startup (see _init_admin_passcode())
 _ADMIN_SESSIONS: dict[str, float] = {}  # token → expires_at
+_ADMIN_WEBHOOK_TOKEN: str = ""         # set at startup (incoming webhook secret token)
 
 # Minimal HTML gate page returned when a share-download requires a passcode.
 # {error} is replaced with either an empty string or an <p class="err">…</p> element.
@@ -246,21 +247,21 @@ _stats: dict[str, int | float] = {
 # SSE log sink — broadcasts log records to admin live-log clients
 # ---------------------------------------------------------------------------
 
-_log_sse_queue: asyncio.Queue | None = None  # initialised in build_admin_app on_startup
+# Each connected SSE client gets its own Queue; the handler fans out to all of them.
+_log_sse_clients: list[asyncio.Queue] = []
+_admin_event_loop: asyncio.AbstractEventLoop | None = None  # set in on_startup callback within build_admin_app
 
 class _SseLogHandler(logging.Handler):
-    """Forward log records to the SSE queue (non-blocking)."""
+    """Forward log records to every connected SSE client (non-blocking, fan-out)."""
 
     def emit(self, record: logging.LogRecord) -> None:
-        if _log_sse_queue is None:
+        if not _log_sse_clients or _admin_event_loop is None:
             return
+        msg = self.format(record)
         try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                loop.call_soon_threadsafe(
-                    _log_sse_queue.put_nowait,
-                    self.format(record),
-                )
+            if _admin_event_loop.is_running():
+                for q in list(_log_sse_clients):
+                    _admin_event_loop.call_soon_threadsafe(q.put_nowait, msg)
         except Exception:
             pass
 
@@ -1087,6 +1088,14 @@ section h2{font-size:1rem;font-weight:700;margin-bottom:.75rem;padding-bottom:.4
                    border-radius:8px;color:#000;font-size:1rem;font-weight:700;cursor:pointer}
 #login-card button:hover{background:#00a87e}
 .err-msg{color:var(--red);font-size:.82rem;margin-bottom:.5rem}
+.webhook-url-row{display:flex;gap:.5rem;align-items:center;margin-top:.5rem}
+.webhook-url-row input{flex:1;padding:.5rem .75rem;background:#000;border:1px solid var(--border);
+                       border-radius:8px;color:#aaa;font-family:monospace;font-size:.78rem;
+                       outline:none;cursor:text}
+.webhook-url-row button{padding:.5rem .9rem;background:var(--surface);border:1px solid var(--border);
+                        border-radius:8px;color:var(--text);font-size:.82rem;cursor:pointer;
+                        white-space:nowrap}
+.webhook-url-row button:hover{border-color:var(--accent);color:var(--accent)}
 </style>
 </head>
 <body>
@@ -1130,6 +1139,9 @@ function renderLogin(errMsg=''){
 async function renderDashboard(){
   const stats=await fetchStats();
   if(!stats){renderLogin('Session expired.');return;}
+  const whInfo=await fetch('/admin/api/webhook-info').then(r=>r.ok?r.json():null).catch(()=>null);
+  const webhookToken=whInfo?whInfo.webhook_token:'';
+  const webhookUrl=webhookToken?`${location.origin}/admin/webhook/${webhookToken}`:'(unavailable)';
   const inactive=stats.inactive_rooms;
   const open=stats.open_rooms;
   document.getElementById('app').innerHTML=`
@@ -1162,6 +1174,20 @@ async function renderDashboard(){
       <div id="timer-breakdown">${renderTimerBreakdown(stats.rooms_by_destruct)}</div>
     </section>
     <section>
+      <h2>Incoming Webhook</h2>
+      <p style="font-size:.82rem;color:var(--dim);margin-bottom:.5rem">
+        POST JSON to this URL from any external service to log events in the admin panel.
+        The token in the URL acts as the authentication secret — keep it private.
+      </p>
+      <div class="webhook-url-row">
+        <input id="webhook-url-input" type="text" readonly value="${webhookUrl}"/>
+        <button id="copy-webhook-btn">Copy</button>
+      </div>
+      <p style="font-size:.75rem;color:var(--dim);margin-top:.4rem">
+        Example: <code style="color:#aaa">{"event":"deploy","version":"1.2.3"}</code>
+      </p>
+    </section>
+    <section>
       <h2>Live Logs</h2>
       <div id="log-box"></div>
     </section>
@@ -1170,6 +1196,18 @@ async function renderDashboard(){
       <button id="shutdown-btn">⚠️ Emergency Shutdown</button>
       <div id="shutdown-msg"></div>
     </section>`;
+
+  document.getElementById('copy-webhook-btn').addEventListener('click',()=>{
+    const inp=document.getElementById('webhook-url-input');
+    inp.select();
+    navigator.clipboard.writeText(inp.value).then(()=>{
+      const btn=document.getElementById('copy-webhook-btn');
+      btn.textContent='Copied!';
+      setTimeout(()=>{btn.textContent='Copy';},2000);
+    }).catch(()=>{
+      document.execCommand('copy');
+    });
+  });
 
   document.getElementById('shutdown-btn').addEventListener('click',async()=>{
     if(!confirm('Shutdown the secureChat server immediately?'))return;
@@ -1325,10 +1363,20 @@ async def _admin_stats_handler(request: web.Request) -> web.Response:
     })
 
 
+async def _admin_webhook_info_handler(request: web.Request) -> web.Response:
+    """GET /admin/api/webhook-info — return incoming webhook URL (requires auth)."""
+    if not _valid_admin_session(request):
+        raise web.HTTPUnauthorized()
+    return web.json_response({"webhook_token": _ADMIN_WEBHOOK_TOKEN})
+
+
 async def _admin_logs_sse_handler(request: web.Request) -> web.StreamResponse:
     """GET /admin/api/logs — SSE stream of live log records (requires auth)."""
     if not _valid_admin_session(request):
         raise web.HTTPUnauthorized()
+    # Each client gets its own queue so that all connected clients receive every message.
+    q: asyncio.Queue = asyncio.Queue(maxsize=1000)
+    _log_sse_clients.append(q)
     response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
     response.headers["Cache-Control"] = "no-cache"
     response.headers["X-Accel-Buffering"] = "no"
@@ -1337,13 +1385,18 @@ async def _admin_logs_sse_handler(request: web.Request) -> web.StreamResponse:
     try:
         while True:
             try:
-                msg = await asyncio.wait_for(_log_sse_queue.get(), timeout=15)
+                msg = await asyncio.wait_for(q.get(), timeout=15)
                 safe = msg.replace("\n", " ").replace("\r", " ")
                 await response.write(f"event: log\ndata: {safe}\n\n".encode())
             except asyncio.TimeoutError:
                 await response.write(b": keepalive\n\n")
     except (ConnectionResetError, asyncio.CancelledError):
         pass
+    finally:
+        try:
+            _log_sse_clients.remove(q)
+        except ValueError:
+            pass
     return response
 
 
@@ -1352,8 +1405,31 @@ async def _admin_shutdown_handler(request: web.Request) -> web.Response:
     if not _valid_admin_session(request):
         raise web.HTTPUnauthorized()
     logger.warning("EMERGENCY SHUTDOWN triggered via admin panel")
-    asyncio.get_event_loop().call_later(0.5, os._exit, 0)  # noqa: SLF001
+    # os._exit is intentional here: this is an *emergency* shutdown that must
+    # terminate the process immediately, bypassing the event loop's normal cleanup
+    # to prevent any in-flight tasks from delaying the stop.
+    asyncio.get_running_loop().call_later(0.5, os._exit, 0)  # noqa: SLF001
     return web.json_response({"ok": True, "msg": "Shutting down…"})
+
+
+async def _admin_incoming_webhook_handler(request: web.Request) -> web.Response:
+    """POST /admin/webhook/{token} — incoming webhook from an external service.
+
+    Any service that knows the webhook token can POST a JSON payload here.
+    The event is logged immediately and appears in the live-log SSE stream.
+    No admin session is required — the token in the URL path acts as authentication.
+    """
+    token = request.match_info["token"]
+    if not token or token != _ADMIN_WEBHOOK_TOKEN:
+        raise web.HTTPUnauthorized(reason="Invalid webhook token")
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    event = str(body.get("event", "webhook"))
+    logger.info("incoming webhook  event=%s  source=%s  payload=%s",
+                event, request.remote, json.dumps(body))
+    return web.json_response({"ok": True, "received": True})
 
 
 def _init_admin_passcode() -> str:
@@ -1368,14 +1444,16 @@ def _init_admin_passcode() -> str:
 
 def build_admin_app() -> web.Application:
     """Build the admin aiohttp Application (served on ADMIN_PORT)."""
-    global _ADMIN_PASSCODE  # noqa: PLW0603
+    global _ADMIN_PASSCODE, _ADMIN_WEBHOOK_TOKEN  # noqa: PLW0603
     _ADMIN_PASSCODE = _init_admin_passcode()
+    _ADMIN_WEBHOOK_TOKEN = secrets.token_urlsafe(32)
+    logger.info("admin webhook token (incoming): /admin/webhook/%s", _ADMIN_WEBHOOK_TOKEN)
 
     app = web.Application()
 
     async def on_startup(app: web.Application) -> None:  # noqa: ARG001
-        global _log_sse_queue  # noqa: PLW0603
-        _log_sse_queue = asyncio.Queue(maxsize=1000)
+        global _admin_event_loop  # noqa: PLW0603
+        _admin_event_loop = asyncio.get_running_loop()
         handler = _SseLogHandler()
         handler.setFormatter(logging.Formatter(
             fmt="%(asctime)s  %(levelname)-8s  %(message)s",
@@ -1389,8 +1467,10 @@ def build_admin_app() -> web.Application:
     app.router.add_get("/admin", _admin_index_handler)
     app.router.add_post("/admin/login", _admin_login_handler)
     app.router.add_get("/admin/api/stats", _admin_stats_handler)
+    app.router.add_get("/admin/api/webhook-info", _admin_webhook_info_handler)
     app.router.add_get("/admin/api/logs", _admin_logs_sse_handler)
     app.router.add_post("/admin/api/shutdown", _admin_shutdown_handler)
+    app.router.add_post("/admin/webhook/{token}", _admin_incoming_webhook_handler)
     return app
 
 
