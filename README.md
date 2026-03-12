@@ -31,7 +31,65 @@ Browser A                    Server (relay)                 Browser B
 
 ---
 
-## Quick start
+## Requirements
+
+* **Python 3.9 or newer** — download from <https://www.python.org/downloads/>
+  (on Windows, tick *"Add python.exe to PATH"* during installation)
+* The packages listed in `requirements.txt` (installed automatically by
+  `start_server.bat` or manually with `pip install -r requirements.txt`)
+
+---
+
+## Quick start — Windows
+
+### Option A — double-click launcher (recommended)
+
+1. Make sure Python 3.9+ is installed and on your `PATH`.
+2. Double-click **`start_server.bat`** in the project folder.
+   The script installs dependencies automatically and starts the server.
+3. You should see:
+   ```
+   secureChat is starting on http://127.0.0.1:5000
+   ```
+4. Open `http://127.0.0.1:5000` in your browser to test locally.
+
+### Option B — Command Prompt
+
+```cmd
+cd path\to\secureChat-1.0
+pip install -r requirements.txt
+python server.py
+```
+
+### Option C — PowerShell
+
+```powershell
+cd path\to\secureChat-1.0
+pip install -r requirements.txt
+python server.py
+```
+
+### Changing settings on Windows
+
+Use `set` (Command Prompt) or `$env:` (PowerShell) before starting the server:
+
+**Command Prompt:**
+```cmd
+set PORT=8080
+set HISTORY_LIMIT=200
+python server.py
+```
+
+**PowerShell:**
+```powershell
+$env:PORT = "8080"
+$env:HISTORY_LIMIT = "200"
+python server.py
+```
+
+---
+
+## Quick start — Linux / macOS
 
 ### 1. Install dependencies
 
@@ -48,40 +106,73 @@ python server.py
 By default the server listens on `127.0.0.1:5000`.  Open
 `http://127.0.0.1:5000` in your browser to test locally.
 
-Environment variables:
+---
 
-| Variable        | Default            | Description                                     |
-|-----------------|--------------------|-------------------------------------------------|
-| `HOST`          | `127.0.0.1`        | Interface to bind                               |
-| `PORT`          | `5000`             | TCP port                                        |
-| `DB_PATH`       | `./securechat.db`  | Path to the SQLite message store                |
-| `HISTORY_LIMIT` | `100`              | Max messages stored and replayed per room       |
+## Environment variables
+
+| Variable        | Default                       | Description                               |
+|-----------------|-------------------------------|-------------------------------------------|
+| `HOST`          | `127.0.0.1`                   | Interface to bind                         |
+| `PORT`          | `5000`                        | TCP port                                  |
+| `DB_PATH`       | `securechat.db` (beside `server.py`) | Path to the SQLite message store |
+| `HISTORY_LIMIT` | `100`                         | Max messages stored and replayed per room |
 
 ---
 
-## Running on OnionShare
+## Running on OnionShare (Windows GUI)
 
-OnionShare can expose any local TCP service as a `.onion` address.
+OnionShare exposes your local server as a `.onion` address through the Tor
+network.  The steps below use **OnionShare 2.6+** on Windows.
 
-### Using the OnionShare GUI
+### Step 1 — start secureChat
 
-1. Open OnionShare → **"Host a Service"** tab (or use the *Custom* mode).
-2. Choose **"Connect to server"** and point it at `127.0.0.1:5000`.
-3. Start the OnionShare service — it will display a `.onion` URL.
-4. Share the `.onion` URL, the **Room ID**, and the **Passphrase** with your
-   contact (through a secure side-channel).
+Double-click `start_server.bat` (or run `python server.py` in a terminal).
+Keep this window open; the server must stay running.
 
-### Using the OnionShare CLI
+### Step 2 — create a Tor hidden service with OnionShare
 
-```bash
-# Start secureChat in one terminal
-python server.py
+**Using the OnionShare desktop app (GUI):**
 
-# Expose it via OnionShare CLI in another terminal
-onionshare --connect-to 127.0.0.1:5000
+> OnionShare's GUI is designed to share files or host static websites.  To
+> proxy Tor traffic to a running Python server you need the CLI or a manual
+> hidden service (see below).
+
+**Using the OnionShare command-line tool:**
+
+Open a *second* Command Prompt or PowerShell window and run:
+
+```cmd
+onionshare-cli --connect-to 127.0.0.1:5000
 ```
 
-### Manual Tor hidden service
+OnionShare will print a `.onion` URL, for example:
+```
+http://xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx.onion
+```
+
+> **Tip:** The `onionshare-cli` executable is included with the OnionShare
+> desktop installer.  On a typical Windows install it is at:
+> `C:\Program Files\OnionShare\onionshare-cli.exe`
+
+### Step 3 — share access details
+
+Send your contacts (through a separate secure channel) all three pieces of
+information they need to connect:
+
+| What         | Where to find it                       |
+|--------------|----------------------------------------|
+| `.onion` URL | printed by OnionShare when it starts   |
+| Room ID      | you choose — any alphanumeric string   |
+| Passphrase   | you choose — the shared encryption key |
+
+### Step 4 — connect
+
+Both parties open the `.onion` URL in **Tor Browser**, enter the same Room ID
+and Passphrase, and start chatting.
+
+---
+
+## Manual Tor hidden service (advanced)
 
 Add the following to your `torrc` and restart Tor:
 
@@ -100,6 +191,8 @@ The `.onion` address will be in `/var/lib/tor/securechat/hostname`.
    testing) in **Tor Browser** (or any browser for local use).
 2. Enter the same **Room ID** and **Passphrase**.
 3. Chat — all messages are encrypted before they leave your browser.
+4. When you rejoin after the server restarts, the last 100 messages will be
+   replayed and decrypted automatically in your browser.
 
 > ⚠️ The Room ID and Passphrase must be shared with your contact through a
 > separate secure channel *before* you start chatting.
@@ -109,7 +202,7 @@ The `.onion` address will be in `/var/lib/tor/securechat/hostname`.
 ## Running tests
 
 ```bash
-pip install pytest pytest-asyncio aiohttp
+pip install pytest pytest-asyncio aiohttp pytest-aiohttp
 pytest tests/
 ```
 
@@ -135,6 +228,7 @@ pytest tests/
 ```
 secureChat-1.0/
 ├── server.py          # aiohttp HTTP + WebSocket relay server
+├── start_server.bat   # Windows one-click launcher
 ├── requirements.txt   # Python dependencies
 ├── static/
 │   ├── index.html     # Chat UI (lobby + chat screens)
@@ -143,3 +237,4 @@ secureChat-1.0/
 └── tests/
     └── test_server.py # pytest test suite
 ```
+

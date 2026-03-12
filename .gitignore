@@ -32,3 +32,9 @@ Thumbs.db
 # Logs
 *.log
 nohup.out
+
+# SQLite message store (runtime artifact — not for version control)
+securechat.db
+*.db-journal
+*.db-wal
+*.db-shm

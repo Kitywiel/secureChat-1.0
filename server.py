@@ -36,10 +36,21 @@ import logging
 import os
 import re
 import sqlite3
+import sys
 import time
 from pathlib import Path
 
 from aiohttp import web, WSMsgType
+
+# ---------------------------------------------------------------------------
+# Python version guard — asyncio.to_thread requires 3.9+
+# ---------------------------------------------------------------------------
+if sys.version_info < (3, 9):
+    sys.exit(
+        f"secureChat requires Python 3.9 or newer "
+        f"(you are running {sys.version}).  "
+        f"Please upgrade: https://www.python.org/downloads/"
+    )
 
 # ---------------------------------------------------------------------------
 # Logging — never log message payloads.
@@ -54,10 +65,15 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-STATIC_DIR = Path(__file__).parent / "static"
+# Resolve __file__ to an absolute path so that relative invocations (e.g.
+# "python server.py" from a different working directory on Windows) still
+# place the database next to server.py rather than in the current directory.
+_HERE = Path(__file__).resolve().parent
+
+STATIC_DIR = _HERE / "static"
 
 # Database — path defaults to the same directory as server.py
-DB_PATH = Path(os.environ.get("DB_PATH", str(Path(__file__).parent / "securechat.db")))
+DB_PATH = Path(os.environ.get("DB_PATH", str(_HERE / "securechat.db")))
 
 # Maximum messages stored *and* replayed per room.  Oldest messages are
 # pruned automatically when the limit is exceeded.
