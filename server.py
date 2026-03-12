@@ -353,15 +353,17 @@ async def ws_handler(request: web.Request) -> web.WebSocketResponse:
                     len(rooms[room_id]),
                 )
 
-                # Send stored history to the newly joined peer only
-                try:
-                    history = await get_history(db_path, room_id)
-                    if history:
-                        await ws.send_str(
-                            json.dumps({"type": "history", "messages": history})
-                        )
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("failed to load history  room=%s  error=%s", room_id, exc)
+                # Send stored history to the newly joined peer only.
+                # History is only kept for passcode-protected rooms.
+                if _room_meta.get(room_id, {}).get("passcode_hash"):
+                    try:
+                        history = await get_history(db_path, room_id)
+                        if history:
+                            await ws.send_str(
+                                json.dumps({"type": "history", "messages": history})
+                            )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("failed to load history  room=%s  error=%s", room_id, exc)
 
                 # Inform the peer about the self-destruct deadline (if any)
                 if meta and meta.get("expires_at"):
@@ -384,13 +386,15 @@ async def ws_handler(request: web.Request) -> web.WebSocketResponse:
                 if len(iv) > MAX_IV_LEN or len(ciphertext) > MAX_CIPHERTEXT_LEN:
                     continue
 
-                # Persist before relaying (best-effort; relay still happens on error)
-                try:
-                    await save_message(db_path, room_id, sender, iv, ciphertext)
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning(
-                        "failed to save message  room=%s  error=%s", room_id, exc
-                    )
+                # Persist before relaying — only for passcode-protected rooms.
+                # Rooms without a passcode do not store message history.
+                if _room_meta.get(room_id, {}).get("passcode_hash"):
+                    try:
+                        await save_message(db_path, room_id, sender, iv, ciphertext)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "failed to save message  room=%s  error=%s", room_id, exc
+                        )
 
                 relay = json.dumps(
                     {

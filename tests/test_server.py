@@ -320,10 +320,13 @@ async def test_ws_user_count_decrements_on_leave(ws_client) -> None:
 
 @pytest.mark.asyncio
 async def test_ws_history_replayed_on_join(ws_client) -> None:
-    """A client joining a room with stored messages receives a history batch."""
+    """A client joining a passcode-protected room receives stored history."""
+    # Pre-register the room with a passcode so history is persisted
+    _room_meta["roomE"] = {"passcode_hash": _hash_passcode("pass"), "expires_at": None}
+
     # First client sends a message
     async with ws_client.ws_connect("/ws") as ws1:
-        await ws1.send_str(json.dumps({"type": "join", "room": "roomE"}))
+        await ws1.send_str(json.dumps({"type": "join", "room": "roomE", "passcode": "pass"}))
         await ws1.receive_json(timeout=2)  # system
 
         await ws1.send_str(json.dumps({
@@ -335,7 +338,7 @@ async def test_ws_history_replayed_on_join(ws_client) -> None:
 
     # Second client joins the same room and should receive history
     async with ws_client.ws_connect("/ws") as ws2:
-        await ws2.send_str(json.dumps({"type": "join", "room": "roomE"}))
+        await ws2.send_str(json.dumps({"type": "join", "room": "roomE", "passcode": "pass"}))
 
         # May receive history before or after system depending on timing;
         # collect the next two messages
@@ -355,6 +358,37 @@ async def test_ws_history_replayed_on_join(ws_client) -> None:
         assert history_msg["messages"][0]["iv"] == "aGVsbG93b3JsZA=="
         assert history_msg["messages"][0]["ciphertext"] == "c2VjcmV0"
         assert history_msg["messages"][0]["sender"] == "Alice"
+
+
+@pytest.mark.asyncio
+async def test_ws_messages_not_stored_without_passcode(ws_client) -> None:
+    """Messages in a room without a passcode are NOT persisted — no history on rejoin."""
+    # Room has no entry in _room_meta (no passcode)
+    async with ws_client.ws_connect("/ws") as ws1:
+        await ws1.send_str(json.dumps({"type": "join", "room": "open-room"}))
+        await ws1.receive_json(timeout=2)  # system
+
+        await ws1.send_str(json.dumps({
+            "type": "message",
+            "iv": "aGVsbG93b3JsZA==",
+            "ciphertext": "c2VjcmV0",
+            "sender": "Bob",
+        }))
+
+    # Second client joins — must NOT receive any history
+    async with ws_client.ws_connect("/ws") as ws2:
+        await ws2.send_str(json.dumps({"type": "join", "room": "open-room"}))
+
+        import asyncio
+        msg = await asyncio.wait_for(ws2.receive_json(), timeout=2)
+        assert msg["type"] == "system"
+
+        # No further messages expected
+        try:
+            extra = await asyncio.wait_for(ws2.receive_json(), timeout=0.4)
+            assert extra["type"] != "history", f"Unexpected history in room without passcode: {extra}"
+        except asyncio.TimeoutError:
+            pass  # expected
 
 
 @pytest.mark.asyncio
