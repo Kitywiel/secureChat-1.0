@@ -163,7 +163,12 @@ async function decryptFile(key, ivB64, ciphertextB64) {
 function appendFileMessage(sender, filename, mime, bytes, kind, timestamp = null, nsfw = false, oneTime = false) {
   const log = document.getElementById('messages');
   const el  = document.createElement('div');
-  el.className = 'message ' + kind;
+  el.className = 'message ' + kind + (oneTime ? ' one-time-msg' : '');
+
+  // One-time view: prevent right-click save / context menu
+  if (oneTime) {
+    el.addEventListener('contextmenu', (e) => e.preventDefault());
+  }
 
   // Header row (sender + timestamp)
   const headerEl = document.createElement('div');
@@ -196,6 +201,10 @@ function appendFileMessage(sender, filename, mime, bytes, kind, timestamp = null
     img.src   = url;
     img.alt   = filename;
     img.title = filename;
+    if (oneTime) {
+      img.draggable = false;
+      img.addEventListener('contextmenu', (e) => e.preventDefault());
+    }
 
     if (nsfw) {
       // Wrap in container so the overlay sits on top
@@ -359,6 +368,9 @@ let pendingFiles = [];
 
 /** The room ID currently joined (used for the delete-room API call). */
 let currentRoomId = '';
+
+/** Delete code for the current room (only available if this client created the room). */
+let roomDeleteCode = '';
 
 // ─── Random generation helpers ────────────────────────────────────────────────
 
@@ -568,13 +580,15 @@ function connectWs(roomId) {
  * @param {string}     roomId
  * @param {CryptoKey}  key
  * @param {string}     name
- * @param {string}     passcode  Server-side room passcode (empty string if none).
+ * @param {string}     passcode    Server-side room passcode (empty string if none).
+ * @param {string}     [deleteCode] Delete code (only available if this client created the room).
  */
-function enterRoom(roomId, key, name, passcode) {
+function enterRoom(roomId, key, name, passcode, deleteCode = '') {
   roomKey = key;
   displayName = name.slice(0, 32);
   roomPasscode = passcode;
   currentRoomId = roomId;
+  roomDeleteCode = deleteCode;
   stopDestructTimer();
   document.getElementById('room-label').textContent = `🔒 ${roomId}`;
   document.getElementById('message-input').disabled = false;
@@ -655,6 +669,7 @@ document.getElementById('message-form').addEventListener('submit', async (e) => 
 
   input.value = '';
   input.style.height = 'auto';
+  input.focus(); // restore focus so the user can keep typing / pasting
 
   const { iv, ciphertext } = await encryptMessage(roomKey, text);
   ws.send(JSON.stringify({ type: 'message', iv, ciphertext, sender: displayName }));
@@ -686,6 +701,7 @@ document.getElementById('leave-btn').addEventListener('click', () => {
   roomKey = null;
   roomPasscode = '';
   currentRoomId = '';
+  roomDeleteCode = '';
   stopDestructTimer();
   clearPendingFiles();
   showScreen('lobby');
@@ -762,8 +778,27 @@ document.getElementById('delete-room-btn').addEventListener('click', async () =>
   if (!currentRoomId) return;
   if (!confirm(`Delete room "${currentRoomId}" and all its messages? This cannot be undone.`)) return;
 
+  // If we have a delete code (room was created by this client), verify it.
+  // For rooms joined without a delete code, we attempt deletion anyway.
+  let deleteCodeToSend = roomDeleteCode;
+  if (!deleteCodeToSend) {
+    // Prompt user for the delete code if we don't have it stored locally
+    const entered = prompt('Enter the room delete code (required to delete this room):');
+    if (entered === null) return; // user cancelled
+    deleteCodeToSend = entered.trim();
+  }
+
   try {
-    await fetch(`/room/${encodeURIComponent(currentRoomId)}/delete`, { method: 'POST' });
+    const resp = await fetch(`/room/${encodeURIComponent(currentRoomId)}/delete`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ delete_code: deleteCodeToSend }),
+    });
+    if (!resp.ok) {
+      const reason = await resp.text().catch(() => '');
+      alert(`Could not delete room: ${reason || resp.statusText}`);
+      return;
+    }
   } catch { /* ignore network errors — room may already be gone */ }
 
   // The server will broadcast a "destruct" event that clears the UI;
@@ -775,6 +810,7 @@ document.getElementById('delete-room-btn').addEventListener('click', async () =>
   roomKey = null;
   roomPasscode = '';
   currentRoomId = '';
+  roomDeleteCode = '';
   stopDestructTimer();
   clearPendingFiles();
   showScreen('lobby');
@@ -792,13 +828,94 @@ function resetShareScreen() {
   document.getElementById('share-error').textContent = '';
   document.getElementById('share-result').classList.add('hidden');
   document.getElementById('share-upload-area').classList.remove('hidden');
-  // Hide the passcode row and result
+  // Hide the passcode row
   document.getElementById('share-passcode-row').classList.add('hidden');
-  document.getElementById('share-passcode-result').classList.add('hidden');
-  // Hide QR container and reset button label
-  document.getElementById('share-qr-container').classList.add('hidden');
-  document.getElementById('share-qr-btn').textContent = '📱 Show QR Code';
-  document.getElementById('share-qr-img').src = '';
+  // Clear the links container
+  document.getElementById('share-links-container').innerHTML = '';
+}
+
+/**
+ * Render a single file's result card inside the links container.
+ * @param {{download_url: string, filename: string, expires_at: number}} data
+ * @param {string} passcode
+ */
+function _appendShareResult(data, passcode) {
+  const container = document.getElementById('share-links-container');
+  const downloadUrl = new URL(data.download_url, window.location.href).href;
+  const expiresAt = new Date(data.expires_at * 1000);
+
+  const wrap = document.createElement('div');
+  wrap.className = 'share-file-result';
+  wrap.style.cssText = 'margin-bottom:1.2rem;padding:.85rem;background:#111;border:1px solid #2e2e2e;border-radius:8px';
+
+  const nameEl = document.createElement('p');
+  nameEl.style.cssText = 'font-size:.82rem;color:#888;margin-bottom:.4rem';
+  nameEl.textContent = `📎 ${data.filename}`;
+  wrap.appendChild(nameEl);
+
+  // Link row
+  const linkRow = document.createElement('div');
+  linkRow.className = 'share-link-row';
+  const linkEl = document.createElement('code');
+  linkEl.className = 'share-link';
+  linkEl.textContent = downloadUrl;
+  const copyBtn = document.createElement('button');
+  copyBtn.type = 'button';
+  copyBtn.className = 'btn-copy';
+  copyBtn.textContent = 'Copy';
+  copyBtn.addEventListener('click', () => {
+    navigator.clipboard.writeText(downloadUrl).then(() => {
+      copyBtn.textContent = 'Copied!';
+      setTimeout(() => { copyBtn.textContent = 'Copy'; }, 2000);
+    }).catch(() => {
+      const range = document.createRange();
+      range.selectNodeContents(linkEl);
+      const sel = window.getSelection();
+      if (sel) { sel.removeAllRanges(); sel.addRange(range); }
+    });
+  });
+  linkRow.appendChild(linkEl);
+  linkRow.appendChild(copyBtn);
+  wrap.appendChild(linkRow);
+
+  // Passcode (if any)
+  if (passcode) {
+    const pcLabel = document.createElement('p');
+    pcLabel.style.cssText = 'font-size:.82rem;color:#888;margin:.6rem 0 .3rem';
+    pcLabel.textContent = '🔒 Passcode for this file:';
+    wrap.appendChild(pcLabel);
+    const pcRow = document.createElement('div');
+    pcRow.className = 'share-link-row';
+    const pcEl = document.createElement('code');
+    pcEl.className = 'share-link';
+    pcEl.textContent = passcode;
+    const pcCopyBtn = document.createElement('button');
+    pcCopyBtn.type = 'button';
+    pcCopyBtn.className = 'btn-copy';
+    pcCopyBtn.textContent = 'Copy';
+    pcCopyBtn.addEventListener('click', () => {
+      navigator.clipboard.writeText(passcode).then(() => {
+        pcCopyBtn.textContent = 'Copied!';
+        setTimeout(() => { pcCopyBtn.textContent = 'Copy'; }, 2000);
+      }).catch(() => {
+        const range = document.createRange();
+        range.selectNodeContents(pcEl);
+        const sel = window.getSelection();
+        if (sel) { sel.removeAllRanges(); sel.addRange(range); }
+      });
+    });
+    pcRow.appendChild(pcEl);
+    pcRow.appendChild(pcCopyBtn);
+    wrap.appendChild(pcRow);
+  }
+
+  // Expiry note
+  const expEl = document.createElement('p');
+  expEl.className = 'notice';
+  expEl.textContent = `⚠️ One-time link — expires ${expiresAt.toLocaleString()}`;
+  wrap.appendChild(expEl);
+
+  container.appendChild(wrap);
 }
 
 document.getElementById('share-files-btn').addEventListener('click', () => {
@@ -846,101 +963,66 @@ document.getElementById('share-form').addEventListener('submit', async (e) => {
 
   errEl.textContent = '';
 
-  const file = fileInput.files && fileInput.files[0];
-  if (!file) {
-    errEl.textContent = 'Please select a file.';
+  const files = fileInput.files ? Array.from(fileInput.files) : [];
+  if (!files.length) {
+    errEl.textContent = 'Please select at least one file.';
     return;
   }
 
-  const MAX_BYTES = 100 * 1024 * 1024; // 100 MB
-  if (file.size > MAX_BYTES) {
-    errEl.textContent = 'File is too large (100 MB maximum).';
-    return;
+  const MAX_BYTES = 10 * 1024 * 1024 * 1024; // 10 GB
+  for (const f of files) {
+    if (f.size > MAX_BYTES) {
+      errEl.textContent = `"${f.name}" is too large (10 GB maximum per file).`;
+      return;
+    }
   }
 
   const ttl = ttlSelect.value;
   btn.disabled = true;
-  btn.textContent = 'Uploading…';
+  btn.textContent = `Uploading 0 / ${files.length}…`;
 
-  const formData = new FormData();
-  formData.append('file', file);
-  if (passcode) formData.append('passcode', passcode);
+  // Clear previous results
+  document.getElementById('share-links-container').innerHTML = '';
 
-  try {
-    const resp = await fetch(`/share/upload?ttl=${encodeURIComponent(ttl)}`, {
-      method: 'POST',
-      body: formData,
-    });
+  let successCount = 0;
+  for (let i = 0; i < files.length; i++) {
+    const file = files[i];
+    btn.textContent = `Uploading ${i + 1} / ${files.length}…`;
 
-    if (!resp.ok) {
-      const text = await resp.text();
-      errEl.textContent = `Upload failed (${resp.status}): ${text}`;
-      return;
+    const formData = new FormData();
+    formData.append('file', file);
+    if (passcode) formData.append('passcode', passcode);
+
+    try {
+      const resp = await fetch(`/share/upload?ttl=${encodeURIComponent(ttl)}`, {
+        method: 'POST',
+        body: formData,
+      });
+
+      if (!resp.ok) {
+        const text = await resp.text();
+        errEl.textContent += `\n"${file.name}" failed (${resp.status}): ${text}`;
+        continue;
+      }
+
+      const data = await resp.json();
+      _appendShareResult(data, passcode);
+      successCount++;
+    } catch (err) {
+      errEl.textContent += `\n"${file.name}" failed: ${err instanceof Error ? err.message : String(err)}`;
     }
+  }
 
-    const data = await resp.json();
-    const downloadUrl = new URL(data.download_url, window.location.href).href;
-    const expiresAt = new Date(data.expires_at * 1000);
+  btn.disabled = false;
+  btn.textContent = 'Upload & Generate Link';
 
-    document.getElementById('share-link').textContent = downloadUrl;
-    document.getElementById('share-expiry').textContent =
-      `⚠️ One-time link — expires ${expiresAt.toLocaleString()}`;
-
-    // Show the passcode to the uploader if one was set
-    const passcodeResult = document.getElementById('share-passcode-result');
-    if (passcode) {
-      document.getElementById('share-result-passcode').textContent = passcode;
-      passcodeResult.classList.remove('hidden');
-    } else {
-      passcodeResult.classList.add('hidden');
-    }
-
+  if (successCount > 0) {
     document.getElementById('share-result').classList.remove('hidden');
     document.getElementById('share-upload-area').classList.add('hidden');
-  } catch (err) {
-    errEl.textContent = 'Upload failed: ' + (err instanceof Error ? err.message : String(err));
-  } finally {
-    btn.disabled = false;
-    btn.textContent = 'Upload & Generate Link';
   }
 });
 
-document.getElementById('share-copy-btn').addEventListener('click', () => {
-  const linkEl = document.getElementById('share-link');
-  const url = linkEl.textContent;
-  if (!url) return;
-
-  navigator.clipboard.writeText(url).then(() => {
-    const btn = document.getElementById('share-copy-btn');
-    btn.textContent = 'Copied!';
-    setTimeout(() => { btn.textContent = 'Copy'; }, 2000);
-  }).catch(() => {
-    // Fallback: select the text so the user can copy manually
-    const range = document.createRange();
-    range.selectNodeContents(linkEl);
-    const sel = window.getSelection();
-    if (sel) {
-      sel.removeAllRanges();
-      sel.addRange(range);
-    }
-  });
-});
-
-document.getElementById('share-copy-passcode-btn').addEventListener('click', () => {
-  const el = document.getElementById('share-result-passcode');
-  const text = el.textContent;
-  if (!text) return;
-  navigator.clipboard.writeText(text).then(() => {
-    const btn = document.getElementById('share-copy-passcode-btn');
-    btn.textContent = 'Copied!';
-    setTimeout(() => { btn.textContent = 'Copy'; }, 2000);
-  }).catch(() => {
-    const range = document.createRange();
-    range.selectNodeContents(el);
-    const sel = window.getSelection();
-    if (sel) { sel.removeAllRanges(); sel.addRange(range); }
-  });
-});
+// ─── QR Code — removed from share screen (multi-file, links are now inline) ──
 
 // ─── Create Room ──────────────────────────────────────────────────────────────
 
@@ -951,6 +1033,7 @@ function resetCreateRoomScreen() {
   document.getElementById('create-room-result').classList.add('hidden');
   document.getElementById('create-room-form-area').classList.remove('hidden');
   document.getElementById('create-passcode-row').classList.add('hidden');
+  document.getElementById('create-webhook-row').classList.add('hidden');
   document.getElementById('create-passphrase').value = randomPassphrase();
   // Hide QR container and reset button label
   document.getElementById('create-qr-container').classList.add('hidden');
@@ -988,6 +1071,15 @@ document.getElementById('create-passcode-check').addEventListener('change', (e) 
   }
 });
 
+document.getElementById('create-webhook-check').addEventListener('change', (e) => {
+  const row = document.getElementById('create-webhook-row');
+  if (/** @type {HTMLInputElement} */ (e.target).checked) {
+    row.classList.remove('hidden');
+  } else {
+    row.classList.add('hidden');
+  }
+});
+
 document.getElementById('create-room-form').addEventListener('submit', async (e) => {
   e.preventDefault();
 
@@ -1005,6 +1097,8 @@ document.getElementById('create-room-form').addEventListener('submit', async (e)
   const passcode         = usePasscode ? document.getElementById('create-passcode').value.trim() : '';
   const destructMinutes  = parseInt(document.getElementById('create-destruct').value, 10);
   const creatorName      = document.getElementById('create-display-name').value.trim() || 'Anonymous';
+  const useWebhook       = document.getElementById('create-webhook-check').checked;
+  const webhookUrl       = useWebhook ? document.getElementById('create-webhook-url').value.trim() : '';
 
   btn.disabled = true;
   btn.textContent = 'Creating…';
@@ -1016,6 +1110,7 @@ document.getElementById('create-room-form').addEventListener('submit', async (e)
       body: JSON.stringify({
         passcode: passcode || null,
         destruct_minutes: destructMinutes,
+        webhook_url: webhookUrl || null,
       }),
     });
 
@@ -1026,6 +1121,7 @@ document.getElementById('create-room-form').addEventListener('submit', async (e)
 
     const data = await resp.json();
     const roomId = data.room_id;
+    const deleteCode = data.delete_code || '';
 
     // Build invite fragment — room ID and optional passcode only.
     // The passphrase is intentionally omitted: it must be shared separately
@@ -1045,10 +1141,11 @@ document.getElementById('create-room-form').addEventListener('submit', async (e)
 
     const inviteUrl = `${baseUrl}/#${fragParts.join('&')}`;
 
-    currentCreateRoomData = { roomId, passphrase, passcode, expiresAt: data.expires_at, creatorName };
+    currentCreateRoomData = { roomId, passphrase, passcode, expiresAt: data.expires_at, creatorName, deleteCode };
 
     document.getElementById('create-invite-link').textContent = inviteUrl;
     document.getElementById('create-passphrase-display').textContent = passphrase;
+    document.getElementById('create-delete-code-display').textContent = deleteCode || '(none)';
 
     if (data.expires_at) {
       const d = new Date(data.expires_at * 1000);
@@ -1103,13 +1200,13 @@ document.getElementById('create-copy-passphrase-btn').addEventListener('click', 
 
 document.getElementById('create-join-btn').addEventListener('click', async () => {
   if (!currentCreateRoomData) return;
-  const { roomId, passphrase, passcode, creatorName } = currentCreateRoomData;
+  const { roomId, passphrase, passcode, creatorName, deleteCode } = currentCreateRoomData;
   const btn = document.getElementById('create-join-btn');
   btn.disabled = true;
   btn.textContent = 'Joining…';
   try {
     const key = await deriveKey(passphrase, roomId);
-    enterRoom(roomId, key, creatorName, passcode || '');
+    enterRoom(roomId, key, creatorName, passcode || '', deleteCode || '');
   } catch (err) {
     document.getElementById('create-error').textContent =
       'Key derivation failed: ' + (err instanceof Error ? err.message : String(err));
@@ -1159,10 +1256,22 @@ document.getElementById('create-qr-btn').addEventListener('click', () => {
   toggleQr('create-qr-btn', 'create-qr-img', 'create-qr-container', qrData);
 });
 
-document.getElementById('share-qr-btn').addEventListener('click', () => {
-  const url = document.getElementById('share-link').textContent;
-  if (!url) return;
-  toggleQr('share-qr-btn', 'share-qr-img', 'share-qr-container', url);
+// ─── Add copy handler for delete code ─────────────────────────────────────────
+
+document.getElementById('create-copy-delete-code-btn').addEventListener('click', () => {
+  const el = document.getElementById('create-delete-code-display');
+  const text = el.textContent;
+  if (!text || text === '(none)') return;
+  navigator.clipboard.writeText(text).then(() => {
+    const btn = document.getElementById('create-copy-delete-code-btn');
+    btn.textContent = 'Copied!';
+    setTimeout(() => { btn.textContent = 'Copy'; }, 2000);
+  }).catch(() => {
+    const range = document.createRange();
+    range.selectNodeContents(el);
+    const sel = window.getSelection();
+    if (sel) { sel.removeAllRanges(); sel.addRange(range); }
+  });
 });
 
 // ─── Init ─────────────────────────────────────────────────────────────────────

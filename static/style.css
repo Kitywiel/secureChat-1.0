@@ -880,3 +880,25 @@ select:focus {
   border-color: #ff5555;
   background: rgba(255, 85, 85, 0.12);
 }
+
+/* ── One-time view message ─────────────────────────────────────────────────── */
+.message.one-time-msg {
+  background: #000 !important;
+  border-color: #333 !important;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.message.one-time-msg .text {
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.message.one-time-msg .message-img {
+  user-select: none;
+  -webkit-user-drag: none;
+}
+
+.message.one-time-msg .message-file {
+  pointer-events: auto; /* allow clicking to download */
+}

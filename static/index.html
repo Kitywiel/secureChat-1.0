@@ -119,6 +119,7 @@
 
       <form id="message-form" class="message-bar">
         <input type="file" id="chat-file-input" multiple class="hidden" aria-hidden="true" />
+        <button type="button" id="attach-btn" class="btn-attach" aria-label="Attach file" disabled>📎</button>
         <textarea
           id="message-input"
           placeholder="Type a message… (Enter to send, Shift+Enter for new line)"
@@ -128,7 +129,6 @@
           aria-label="Message"
           rows="1"
         ></textarea>
-        <button type="button" id="attach-btn" class="btn-attach" aria-label="Attach file" disabled>📎</button>
         <button type="submit" id="send-btn" aria-label="Send message">↑</button>
       </form>
     </div>
@@ -210,6 +210,22 @@
               <option value="1440">24 hours</option>
             </select>
 
+            <div class="checkbox-row">
+              <input type="checkbox" id="create-webhook-check" />
+              <label for="create-webhook-check">Add a webhook (notified on join/leave)</label>
+            </div>
+
+            <div id="create-webhook-row" class="hidden">
+              <input
+                type="url"
+                id="create-webhook-url"
+                placeholder="https://your-webhook-endpoint.example"
+                autocomplete="off"
+                spellcheck="false"
+                maxlength="512"
+              />
+            </div>
+
             <div id="create-error" class="field-error" aria-live="polite"></div>
 
             <button type="submit" id="create-room-submit-btn">Create Room →</button>
@@ -228,6 +244,13 @@
           <div class="share-link-row">
             <code id="create-passphrase-display" class="share-link"></code>
             <button type="button" id="create-copy-passphrase-btn" class="btn-copy">Copy</button>
+          </div>
+          <p class="share-result-label share-result-label--mt">
+            🗑 Delete code — <strong>keep private</strong>, required to delete this room:
+          </p>
+          <div class="share-link-row">
+            <code id="create-delete-code-display" class="share-link"></code>
+            <button type="button" id="create-copy-delete-code-btn" class="btn-copy">Copy</button>
           </div>
           <div class="qr-row">
             <button type="button" id="create-qr-btn" class="btn-secondary btn-qr">
@@ -261,9 +284,9 @@
         <div id="share-upload-area">
           <form id="share-form" novalidate>
             <label for="share-file">
-              Select file <span class="hint">— max 100 MB</span>
+              Select file(s) <span class="hint">— max 10 GB each</span>
             </label>
-            <input type="file" id="share-file" required />
+            <input type="file" id="share-file" required multiple />
 
             <label for="share-ttl">Link expires after</label>
             <select id="share-ttl">
@@ -304,32 +327,10 @@
         </div>
 
         <div id="share-result" class="share-result hidden">
-          <p class="share-result-label">Your one-time download link:</p>
-          <div class="share-link-row">
-            <code id="share-link" class="share-link"></code>
-            <button type="button" id="share-copy-btn" class="btn-copy">Copy</button>
-          </div>
-          <div id="share-passcode-result" class="hidden">
-            <p class="share-result-label share-result-label--mt">
-              🔒 Passcode — <strong>share this with the recipient:</strong>
-            </p>
-            <div class="share-link-row">
-              <code id="share-result-passcode" class="share-link"></code>
-              <button type="button" id="share-copy-passcode-btn" class="btn-copy">Copy</button>
-            </div>
-          </div>
-          <div class="qr-row">
-            <button type="button" id="share-qr-btn" class="btn-secondary btn-qr">
-              📱 Show QR Code
-            </button>
-            <div id="share-qr-container" class="qr-container hidden">
-              <img id="share-qr-img" class="qr-code" alt="QR code for download link" />
-              <p class="qr-note">Scan to open the download link</p>
-            </div>
-          </div>
-          <p id="share-expiry" class="notice"></p>
-          <button type="button" id="share-again-btn" class="btn-secondary">
-            Share Another File
+          <p class="share-result-label">Your one-time download link(s):</p>
+          <div id="share-links-container"></div>
+          <button type="button" id="share-again-btn" class="btn-secondary" style="margin-top:1rem">
+            Share More Files
           </button>
         </div>
       </div>

@@ -1037,16 +1037,38 @@ async def test_room_delete_removes_meta_and_history(ws_client, tmp_path) -> None
     resp = await ws_client.post("/room/create", json={"passcode": "del-test"})
     body = await resp.json()
     room_id = body["room_id"]
+    delete_code = body["delete_code"]
     assert room_id in _room_meta
 
-    # Call the delete endpoint
-    del_resp = await ws_client.post(f"/room/{room_id}/delete")
+    # Call the delete endpoint with the delete code
+    del_resp = await ws_client.post(
+        f"/room/{room_id}/delete",
+        json={"delete_code": delete_code},
+    )
     assert del_resp.status == 200
     del_body = await del_resp.json()
     assert del_body["ok"] is True
 
     # Metadata must be gone
     assert room_id not in _room_meta
+
+
+@pytest.mark.asyncio
+async def test_room_delete_wrong_code_returns_403(ws_client) -> None:
+    """POST /room/{room_id}/delete with wrong delete code returns 403."""
+    resp = await ws_client.post("/room/create", json={"passcode": "del-code-test"})
+    body = await resp.json()
+    room_id = body["room_id"]
+
+    del_resp = await ws_client.post(
+        f"/room/{room_id}/delete",
+        json={"delete_code": "wrong-code"},
+    )
+    assert del_resp.status == 403
+    # Room should still exist
+    assert room_id in _room_meta
+    # Cleanup
+    _room_meta.pop(room_id, None)
 
 
 @pytest.mark.asyncio
@@ -1064,6 +1086,7 @@ async def test_room_delete_broadcasts_destruct_to_peers(ws_client) -> None:
     resp = await ws_client.post("/room/create", json={"passcode": "del-broadcast"})
     body = await resp.json()
     room_id = body["room_id"]
+    delete_code = body["delete_code"]
 
     async with ws_client.ws_connect("/ws") as ws:
         await ws.send_str(json.dumps({"type": "join", "room": room_id, "passcode": "del-broadcast"}))
@@ -1075,7 +1098,7 @@ async def test_room_delete_broadcasts_destruct_to_peers(ws_client) -> None:
                 break
 
         # Delete the room
-        await ws_client.post(f"/room/{room_id}/delete")
+        await ws_client.post(f"/room/{room_id}/delete", json={"delete_code": delete_code})
 
         # The peer should receive a 'destruct' message
         try:

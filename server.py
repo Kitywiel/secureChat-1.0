@@ -73,6 +73,8 @@ class _ColourFormatter(logging.Formatter):
     Red     — deletion / expiry / error events
     Purple  — share download events
     Pink    — share upload events
+    Blue    — inactive room events
+    Cyan    — in-chat file share events
     """
 
     _GREEN  = "\x1b[32m"
@@ -80,14 +82,18 @@ class _ColourFormatter(logging.Formatter):
     _RED    = "\x1b[31m"
     _PURPLE = "\x1b[35m"
     _PINK   = "\x1b[95m"
+    _BLUE   = "\x1b[34m"
+    _CYAN   = "\x1b[36m"
     _RESET  = "\x1b[0m"
 
     # Sub-strings matched (lower-cased) against the formatted message
-    _CREATION      = frozenset(["room created", "database ready", "securechat starting"])
-    _DELETION      = frozenset(["room deleted", "room self-destructed", "cleaned up", "expired"])
-    _JOINED        = frozenset(["peer joined"])
-    _SHARE_UPLOAD  = frozenset(["share upload"])
+    _CREATION       = frozenset(["room created", "database ready", "securechat starting"])
+    _DELETION       = frozenset(["room deleted", "room self-destructed", "cleaned up", "expired"])
+    _JOINED         = frozenset(["peer joined"])
+    _SHARE_UPLOAD   = frozenset(["share upload"])
     _SHARE_DOWNLOAD = frozenset(["share download"])
+    _INACTIVE       = frozenset(["room inactive"])
+    _CHAT_FILE      = frozenset(["chat file share"])
 
     def format(self, record: logging.LogRecord) -> str:
         msg = super().format(record)
@@ -105,6 +111,10 @@ class _ColourFormatter(logging.Formatter):
             return f"{self._GREEN}{msg}{self._RESET}"
         if any(kw in text for kw in self._JOINED):
             return f"{self._YELLOW}{msg}{self._RESET}"
+        if any(kw in text for kw in self._INACTIVE):
+            return f"{self._BLUE}{msg}{self._RESET}"
+        if any(kw in text for kw in self._CHAT_FILE):
+            return f"{self._CYAN}{msg}{self._RESET}"
         return msg
 
 
@@ -146,13 +156,21 @@ MAX_MIME_LEN = 64                    # characters in a MIME type string
 MAX_CHAT_FILENAME_LEN = 200          # characters in an in-chat attachment filename
 
 # File-share constants
-MAX_UPLOAD_BYTES = 100 * 1024 * 1024   # 100 MB per file
-MAX_FILENAME_LEN = 200                 # characters in the sanitised filename
-_SHARE_TOKEN_BYTES = 32                # 256-bit token → 43-char URL-safe base64
+MAX_UPLOAD_BYTES = 10 * 1024 * 1024 * 1024  # 10 GB per file
+MAX_FILENAME_LEN = 200                       # characters in the sanitised filename
+_SHARE_TOKEN_BYTES = 32                      # 256-bit token → 43-char URL-safe base64
 
 # Room-create / passcode constants
 MAX_PASSCODE_LEN = 64                  # characters in a room or share passcode
 MAX_DESTRUCT_MINUTES = 1440            # 24 hours maximum
+MAX_WEBHOOK_URL_LEN = 512              # characters in a webhook URL
+
+# Admin panel constants
+ADMIN_PORT    = int(os.environ.get("ADMIN_PORT", "5001"))
+ADMIN_ONION_ADDRESS: str | None = os.environ.get("ADMIN_ONION_ADDRESS")
+ADMIN_SESSION_TTL = 3600               # 1 hour
+_ADMIN_PASSCODE: str = ""              # set at startup (see _init_admin_passcode())
+_ADMIN_SESSIONS: dict[str, float] = {}  # token → expires_at
 
 # Minimal HTML gate page returned when a share-download requires a passcode.
 # {error} is replaced with either an empty string or an <p class="err">…</p> element.
@@ -210,6 +228,41 @@ _room_meta: dict[str, dict] = {}
 # In-memory file-share slot registry
 # token → {"tmp_dir": Path, "filename": str, "size": int, "expires_at": float}
 _share_slots: dict[str, dict] = {}
+
+# ---------------------------------------------------------------------------
+# Global statistics counters
+# ---------------------------------------------------------------------------
+
+_stats: dict[str, int | float] = {
+    "rooms_created_total": 0,
+    "files_uploaded_count": 0,
+    "files_uploaded_bytes": 0,
+    "files_downloaded_count": 0,
+    "files_downloaded_bytes": 0,
+    "chat_files_shared": 0,
+}
+
+# ---------------------------------------------------------------------------
+# SSE log sink — broadcasts log records to admin live-log clients
+# ---------------------------------------------------------------------------
+
+_log_sse_queue: asyncio.Queue | None = None  # initialised in build_admin_app on_startup
+
+class _SseLogHandler(logging.Handler):
+    """Forward log records to the SSE queue (non-blocking)."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if _log_sse_queue is None:
+            return
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                loop.call_soon_threadsafe(
+                    _log_sse_queue.put_nowait,
+                    self.format(record),
+                )
+        except Exception:
+            pass
 
 # ---------------------------------------------------------------------------
 # Database helpers — synchronous, executed in a thread-pool via asyncio.to_thread
@@ -408,6 +461,14 @@ async def ws_handler(request: web.Request) -> web.WebSocketResponse:
                     len(rooms[room_id]),
                 )
 
+                # Fire webhook for join event
+                webhook_url = (_room_meta.get(room_id) or {}).get("webhook_url") or ""
+                if webhook_url:
+                    asyncio.ensure_future(_fire_webhook(
+                        webhook_url, "peer_joined",
+                        {"room": room_id, "peers": len(rooms[room_id])},
+                    ))
+
                 # Send stored history to the newly joined peer only.
                 # History is only kept for passcode-protected rooms.
                 if _room_meta.get(room_id, {}).get("passcode_hash"):
@@ -488,6 +549,11 @@ async def ws_handler(request: web.Request) -> web.WebSocketResponse:
                     "nsfw": nsfw,
                 })
                 await _broadcast_to_room(room_id, relay, exclude=ws)
+                _stats["chat_files_shared"] += 1
+                logger.info(
+                    "chat file share  room=%s  file=%s  sender=%s  one_time=%s  nsfw=%s",
+                    room_id, filename, sender, one_time, nsfw,
+                )
 
     finally:
         # Clean up regardless of how the connection closed
@@ -594,19 +660,17 @@ async def share_upload_handler(request: web.Request) -> web.Response:
         filename = _sanitize_filename(file_part.filename or "file")
         dest = tmp_dir / filename
 
-        # Stream into memory (enforcing limit), then write to disk
-        chunks: list[bytes] = []
+        # Stream directly to disk (enforcing limit) to support large files
         total = 0
-        while True:
-            chunk = await file_part.read_chunk(65536)
-            if not chunk:
-                break
-            total += len(chunk)
-            if total > MAX_UPLOAD_BYTES:
-                raise web.HTTPRequestEntityTooLarge()
-            chunks.append(chunk)
-
-        await asyncio.to_thread(dest.write_bytes, b"".join(chunks))
+        with dest.open("wb") as f_out:
+            while True:
+                chunk = await file_part.read_chunk(65536)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > MAX_UPLOAD_BYTES:
+                    raise web.HTTPRequestEntityTooLarge()
+                f_out.write(chunk)
 
         # Optionally read the "passcode" field that follows the file
         passcode = ""
@@ -627,6 +691,8 @@ async def share_upload_handler(request: web.Request) -> web.Response:
             "expires_at": expires_at,
             "passcode_hash": _hash_passcode(passcode) if passcode else None,
         }
+        _stats["files_uploaded_count"] += 1
+        _stats["files_uploaded_bytes"] += total
         logger.info("share upload  file=%s  size=%d  ttl=%dh  passcode=%s",
                     filename, total, ttl_hours, bool(passcode))
         return web.json_response(
@@ -712,7 +778,7 @@ async def _stream_share_file(
     slot: dict,
     request: web.Request,
 ) -> web.StreamResponse:
-    """Pop *token* from _share_slots, stream the file, then delete the temp dir."""
+    """Pop *token* from _share_slots, stream the file in chunks, then delete the temp dir."""
     # Remove slot before streaming — guarantees one-time use even on concurrent requests.
     _share_slots.pop(token, None)
     tmp_dir: Path = slot["tmp_dir"]
@@ -725,7 +791,6 @@ async def _stream_share_file(
         raise web.HTTPNotFound(reason="File not found")
 
     try:
-        file_content = await asyncio.to_thread(filepath.read_bytes)
         response = web.StreamResponse(
             headers={
                 "Content-Disposition": f'attachment; filename="{filename}"',
@@ -734,8 +799,21 @@ async def _stream_share_file(
             }
         )
         await response.prepare(request)
-        await response.write(file_content)
+        # Stream file in 256 KiB chunks to support large files without loading
+        # the entire file into RAM.
+        def _iter_file(path: Path, chunk_size: int = 262144):
+            with path.open("rb") as fh:
+                while True:
+                    data = fh.read(chunk_size)
+                    if not data:
+                        break
+                    yield data
+
+        for chunk in await asyncio.to_thread(list, _iter_file(filepath)):
+            await response.write(chunk)
         await response.write_eof()
+        _stats["files_downloaded_count"] += 1
+        _stats["files_downloaded_bytes"] += size
         logger.info("share download complete  file=%s  size=%d", filename, size)
         return response
     finally:
@@ -775,6 +853,11 @@ async def room_create_handler(request: web.Request) -> web.Response:
         destruct_minutes = 0
     destruct_minutes = max(0, min(MAX_DESTRUCT_MINUTES, destruct_minutes))
 
+    # Webhook URL — validated to start with http/https and within length limit
+    webhook_url = str(body.get("webhook_url") or "").strip()[:MAX_WEBHOOK_URL_LEN]
+    if webhook_url and not re.match(r"^https?://", webhook_url):
+        webhook_url = ""
+
     # Generate a unique room ID (16-char hex)
     for _ in range(20):
         room_id = secrets.token_hex(8)
@@ -784,24 +867,53 @@ async def room_create_handler(request: web.Request) -> web.Response:
     expires_at = (time.time() + destruct_minutes * 60) if destruct_minutes > 0 else None
     passcode_hash = _hash_passcode(passcode) if passcode else None
 
+    # Generate a delete code (returned to creator only; stored as a hash)
+    delete_code = secrets.token_urlsafe(9)  # ~12 URL-safe chars
+    delete_code_hash = _hash_passcode(delete_code)
+
     _room_meta[room_id] = {
         "passcode_hash": passcode_hash,
         "expires_at": expires_at,
+        "delete_code_hash": delete_code_hash,
+        "webhook_url": webhook_url or None,
     }
+    _stats["rooms_created_total"] += 1
     logger.info(
-        "room created  room=%s  passcode=%s  destruct=%dm",
+        "room created  room=%s  passcode=%s  destruct=%dm  webhook=%s",
         room_id,
         bool(passcode),
         destruct_minutes,
+        bool(webhook_url),
     )
-    return web.json_response({"room_id": room_id, "expires_at": expires_at})
+    return web.json_response({
+        "room_id": room_id,
+        "expires_at": expires_at,
+        "delete_code": delete_code,
+    })
 
 
 async def room_delete_handler(request: web.Request) -> web.Response:
-    """POST /room/{room_id}/delete — destroy a room and all associated data."""
+    """POST /room/{room_id}/delete — destroy a room and all associated data.
+
+    If the room was created with a delete code the request body must supply it::
+
+        {"delete_code": "<code>"}
+    """
     room_id = request.match_info["room_id"]
     if not _ROOM_RE.match(room_id):
         raise web.HTTPBadRequest(reason="Invalid room ID")
+
+    # Read optional JSON body for delete code verification
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    meta = _room_meta.get(room_id)
+    if meta and meta.get("delete_code_hash"):
+        provided_code = str(body.get("delete_code", "")).strip()
+        if not provided_code or _hash_passcode(provided_code) != meta["delete_code_hash"]:
+            raise web.HTTPForbidden(reason="Wrong or missing delete code")
 
     # Remove room metadata
     _room_meta.pop(room_id, None)
@@ -813,15 +925,17 @@ async def room_delete_handler(request: web.Request) -> web.Response:
     except Exception as exc:  # noqa: BLE001
         logger.warning("failed to delete room history  room=%s  error=%s", room_id, exc)
 
-    # Notify connected peers and disconnect them
+    # Notify connected peers and disconnect them.
+    # Pop the room BEFORE closing peers so that the ws_handler cleanup
+    # does not find the room and emit a spurious "room deleted" log entry.
     if room_id in rooms:
         await _broadcast_to_room(room_id, json.dumps({"type": "destruct"}))
-        for peer in list(rooms.get(room_id, set())):
+        peers_to_close = list(rooms.pop(room_id))
+        for peer in peers_to_close:
             try:
                 await peer.close()
             except Exception:  # noqa: BLE001
                 pass
-        rooms.pop(room_id, None)
 
     logger.info("room deleted  room=%s  (manual delete)", room_id)
     return web.json_response({"ok": True})
@@ -900,6 +1014,387 @@ async def _cleanup_expired_rooms(db_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Webhook helper
+# ---------------------------------------------------------------------------
+
+
+async def _fire_webhook(url: str, event: str, data: dict) -> None:
+    """POST a JSON event payload to *url*; all errors are silently swallowed."""
+    if not url:
+        return
+    try:
+        from aiohttp import ClientSession, ClientTimeout
+        payload = {"event": event, "ts": time.time(), **data}
+        timeout = ClientTimeout(total=8)
+        async with ClientSession(timeout=timeout) as session:
+            await session.post(url, json=payload)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Admin panel — served on ADMIN_PORT (default 5001)
+# ---------------------------------------------------------------------------
+
+# Embedded admin HTML (served directly; avoids a second static directory).
+_ADMIN_HTML = """\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>secureChat Admin</title>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{--bg:#0d0d0d;--surface:#1a1a1a;--border:#2e2e2e;--accent:#00c896;--red:#ff5555;
+      --text:#e8e8e8;--dim:#888;--font:"Segoe UI",system-ui,sans-serif}
+body{background:var(--bg);color:var(--text);font-family:var(--font);font-size:16px;line-height:1.5}
+header{background:var(--surface);border-bottom:1px solid var(--border);padding:.75rem 1.5rem;
+       display:flex;align-items:center;justify-content:space-between}
+header h1{font-size:1.1rem;font-weight:700}
+header span{font-size:.8rem;color:var(--dim)}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:1rem;
+      padding:1.5rem}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:10px;
+      padding:1.25rem 1.5rem}
+.card h2{font-size:.78rem;color:var(--dim);font-weight:600;text-transform:uppercase;
+         letter-spacing:.06em;margin-bottom:.4rem}
+.card .val{font-size:1.9rem;font-weight:700;color:var(--accent)}
+.card .sub{font-size:.75rem;color:var(--dim);margin-top:.2rem}
+section{padding:0 1.5rem 1.5rem}
+section h2{font-size:1rem;font-weight:700;margin-bottom:.75rem;padding-bottom:.4rem;
+           border-bottom:1px solid var(--border)}
+#log-box{background:#000;border:1px solid var(--border);border-radius:8px;height:320px;
+         overflow-y:auto;padding:.75rem;font-family:monospace;font-size:.78rem;
+         color:#aaa;white-space:pre-wrap;word-break:break-all}
+.log-line.err{color:var(--red)}
+.log-line.warn{color:#ffb347}
+.log-line.info{color:#aaa}
+#shutdown-btn{padding:.6rem 1.4rem;background:var(--red);border:none;border-radius:8px;
+              color:#fff;font-size:.95rem;font-weight:700;cursor:pointer;margin-top:1rem;
+              font-family:var(--font)}
+#shutdown-btn:hover{background:#cc3333}
+#shutdown-msg{margin-top:.5rem;font-size:.85rem;color:var(--dim)}
+#login-wrap{display:flex;align-items:center;justify-content:center;min-height:100vh}
+#login-card{background:var(--surface);border:1px solid var(--border);border-radius:12px;
+            padding:2rem 1.75rem;width:100%;max-width:400px}
+#login-card h1{font-size:1.2rem;margin-bottom:1.25rem}
+#login-card input{width:100%;padding:.6rem .75rem;background:var(--bg);
+                  border:1px solid var(--border);border-radius:8px;color:var(--text);
+                  font-size:.95rem;font-family:monospace;margin-bottom:.75rem;outline:none}
+#login-card input:focus{border-color:var(--accent)}
+#login-card button{width:100%;padding:.65rem;background:var(--accent);border:none;
+                   border-radius:8px;color:#000;font-size:1rem;font-weight:700;cursor:pointer}
+#login-card button:hover{background:#00a87e}
+.err-msg{color:var(--red);font-size:.82rem;margin-bottom:.5rem}
+</style>
+</head>
+<body>
+<div id="app"></div>
+<script>
+const _csrfToken = document.cookie.split(';').find(c=>c.trim().startsWith('admin_session='));
+
+async function fetchStats(){
+  const r=await fetch('/admin/api/stats');
+  if(!r.ok)return null;
+  return r.json();
+}
+
+function fmtBytes(b){
+  if(b<1024)return b+' B';
+  if(b<1048576)return (b/1024).toFixed(1)+' KB';
+  if(b<1073741824)return (b/1048576).toFixed(1)+' MB';
+  return (b/1073741824).toFixed(2)+' GB';
+}
+
+function renderLogin(errMsg=''){
+  document.getElementById('app').innerHTML=`
+    <div id="login-wrap"><div id="login-card">
+      <h1>🔒 Admin Login</h1>
+      ${errMsg?`<div class="err-msg">${errMsg}</div>`:''}
+      <form id="lf">
+        <input type="password" id="pc" placeholder="Admin passcode" autocomplete="off" autofocus/>
+        <button type="submit">Login →</button>
+      </form>
+    </div></div>`;
+  document.getElementById('lf').addEventListener('submit',async e=>{
+    e.preventDefault();
+    const pc=document.getElementById('pc').value;
+    const r=await fetch('/admin/login',{method:'POST',headers:{'Content-Type':'application/json'},
+                                        body:JSON.stringify({passcode:pc})});
+    if(r.ok){renderDashboard();}
+    else{renderLogin('Wrong passcode.');}
+  });
+}
+
+async function renderDashboard(){
+  const stats=await fetchStats();
+  if(!stats){renderLogin('Session expired.');return;}
+  const inactive=stats.inactive_rooms;
+  const open=stats.open_rooms;
+  document.getElementById('app').innerHTML=`
+    <header>
+      <h1>🛡 secureChat Admin</h1>
+      <span>Admin Panel</span>
+    </header>
+    <div class="grid">
+      <div class="card"><h2>Total Rooms Created</h2>
+        <div class="val">${stats.rooms_created_total}</div></div>
+      <div class="card"><h2>Open Chats</h2>
+        <div class="val">${open}</div></div>
+      <div class="card"><h2>Inactive Chats</h2>
+        <div class="val">${inactive}</div></div>
+      <div class="card"><h2>Rooms w/ Invite</h2>
+        <div class="val">${stats.invite_rooms}</div></div>
+      <div class="card"><h2>Open File Transfers</h2>
+        <div class="val">${stats.open_file_transfers}</div></div>
+      <div class="card"><h2>Files Uploaded</h2>
+        <div class="val">${stats.files_uploaded_count}</div>
+        <div class="sub">${fmtBytes(stats.files_uploaded_bytes)}</div></div>
+      <div class="card"><h2>Files Downloaded</h2>
+        <div class="val">${stats.files_downloaded_count}</div>
+        <div class="sub">${fmtBytes(stats.files_downloaded_bytes)}</div></div>
+      <div class="card"><h2>Chat Files Shared</h2>
+        <div class="val">${stats.chat_files_shared}</div></div>
+    </div>
+    <section>
+      <h2>Chats by Self-Destruct Timer</h2>
+      <div id="timer-breakdown">${renderTimerBreakdown(stats.rooms_by_destruct)}</div>
+    </section>
+    <section>
+      <h2>Live Logs</h2>
+      <div id="log-box"></div>
+    </section>
+    <section>
+      <h2>Emergency Controls</h2>
+      <button id="shutdown-btn">⚠️ Emergency Shutdown</button>
+      <div id="shutdown-msg"></div>
+    </section>`;
+
+  document.getElementById('shutdown-btn').addEventListener('click',async()=>{
+    if(!confirm('Shutdown the secureChat server immediately?'))return;
+    const r=await fetch('/admin/api/shutdown',{method:'POST'});
+    document.getElementById('shutdown-msg').textContent=r.ok?'Server is shutting down…':'Shutdown failed.';
+  });
+
+  startLogStream();
+
+  // Refresh stats every 10 s
+  setInterval(async()=>{
+    const s=await fetchStats();
+    if(!s)return;
+    document.querySelector('.grid').outerHTML=`<div class="grid">
+      <div class="card"><h2>Total Rooms Created</h2><div class="val">${s.rooms_created_total}</div></div>
+      <div class="card"><h2>Open Chats</h2><div class="val">${s.open_rooms}</div></div>
+      <div class="card"><h2>Inactive Chats</h2><div class="val">${s.inactive_rooms}</div></div>
+      <div class="card"><h2>Rooms w/ Invite</h2><div class="val">${s.invite_rooms}</div></div>
+      <div class="card"><h2>Open File Transfers</h2><div class="val">${s.open_file_transfers}</div></div>
+      <div class="card"><h2>Files Uploaded</h2><div class="val">${s.files_uploaded_count}</div>
+        <div class="sub">${fmtBytes(s.files_uploaded_bytes)}</div></div>
+      <div class="card"><h2>Files Downloaded</h2><div class="val">${s.files_downloaded_count}</div>
+        <div class="sub">${fmtBytes(s.files_downloaded_bytes)}</div></div>
+      <div class="card"><h2>Chat Files Shared</h2><div class="val">${s.chat_files_shared}</div></div>
+    </div>`;
+    document.getElementById('timer-breakdown').innerHTML=renderTimerBreakdown(s.rooms_by_destruct);
+  },10000);
+}
+
+function renderTimerBreakdown(obj){
+  if(!obj||!Object.keys(obj).length)return '<em style="color:#555">No active rooms</em>';
+  return Object.entries(obj).map(([k,v])=>
+    `<div style="display:inline-block;margin:.3rem .5rem .3rem 0;padding:.3rem .7rem;
+      background:#1a1a1a;border:1px solid #2e2e2e;border-radius:6px;font-size:.82rem">
+      <strong>${k}</strong>: ${v}</div>`).join('');
+}
+
+function startLogStream(){
+  const box=document.getElementById('log-box');
+  if(!box)return;
+  const es=new EventSource('/admin/api/logs');
+  es.addEventListener('log',e=>{
+    const line=document.createElement('div');
+    const t=e.data||'';
+    line.className='log-line '+(t.includes('ERROR')||t.includes('WARNING')?'err':
+                                t.includes('WARN')?'warn':'info');
+    line.textContent=t;
+    box.appendChild(line);
+    box.scrollTop=box.scrollHeight;
+    // Keep last 500 lines
+    while(box.children.length>500)box.removeChild(box.firstChild);
+  });
+  es.onerror=()=>{es.close();setTimeout(startLogStream,3000);};
+}
+
+// Bootstrap
+fetch('/admin/api/stats').then(r=>{
+  if(r.ok)renderDashboard();
+  else renderLogin();
+}).catch(()=>renderLogin());
+</script>
+</body>
+</html>
+"""
+
+
+def _make_admin_session() -> str:
+    """Generate a new admin session token."""
+    return secrets.token_hex(32)
+
+
+def _valid_admin_session(request: web.Request) -> bool:
+    """Return True if the request carries a valid, non-expired admin session cookie."""
+    token = request.cookies.get("admin_session", "")
+    exp = _ADMIN_SESSIONS.get(token)
+    if exp is None:
+        return False
+    if time.time() > exp:
+        _ADMIN_SESSIONS.pop(token, None)
+        return False
+    return True
+
+
+async def _admin_login_handler(request: web.Request) -> web.Response:
+    """POST /admin/login — verify passcode; set session cookie on success."""
+    try:
+        body = await request.json()
+    except Exception:
+        raise web.HTTPBadRequest(reason="JSON body required")
+    provided = str(body.get("passcode", ""))
+    if not provided or provided != _ADMIN_PASSCODE:
+        raise web.HTTPForbidden(reason="Wrong passcode")
+    token = _make_admin_session()
+    _ADMIN_SESSIONS[token] = time.time() + ADMIN_SESSION_TTL
+    resp = web.json_response({"ok": True})
+    resp.set_cookie(
+        "admin_session",
+        token,
+        max_age=ADMIN_SESSION_TTL,
+        httponly=True,
+        samesite="Strict",
+    )
+    return resp
+
+
+async def _admin_index_handler(request: web.Request) -> web.Response:
+    """GET /admin/ — return admin panel HTML (authentication check first)."""
+    if not _valid_admin_session(request):
+        # Return the login embedded in the main HTML (JavaScript handles routing)
+        pass
+    return web.Response(body=_ADMIN_HTML, content_type="text/html")
+
+
+async def _admin_stats_handler(request: web.Request) -> web.Response:
+    """GET /admin/api/stats — return current server stats as JSON."""
+    if not _valid_admin_session(request):
+        raise web.HTTPUnauthorized()
+    now = time.time()
+    open_rooms = set(rooms.keys())
+    meta_rooms = set(_room_meta.keys())
+    inactive_rooms = meta_rooms - open_rooms
+
+    # Rooms by destruct timer label
+    by_destruct: dict[str, int] = {}
+    for rid, meta in _room_meta.items():
+        exp = meta.get("expires_at")
+        if exp:
+            remaining = max(0.0, exp - now)
+            h = remaining / 3600
+            if h <= 0.5:
+                label = "< 30 min"
+            elif h <= 1:
+                label = "1 h"
+            elif h <= 2:
+                label = "2 h"
+            elif h <= 4:
+                label = "4 h"
+            elif h <= 8:
+                label = "8 h"
+            else:
+                label = "24 h"
+        else:
+            label = "Never"
+        by_destruct[label] = by_destruct.get(label, 0) + 1
+
+    return web.json_response({
+        **_stats,
+        "open_rooms": len(open_rooms),
+        "inactive_rooms": len(inactive_rooms),
+        "invite_rooms": len(meta_rooms),
+        "open_file_transfers": len(_share_slots),
+        "rooms_by_destruct": by_destruct,
+    })
+
+
+async def _admin_logs_sse_handler(request: web.Request) -> web.StreamResponse:
+    """GET /admin/api/logs — SSE stream of live log records (requires auth)."""
+    if not _valid_admin_session(request):
+        raise web.HTTPUnauthorized()
+    response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+    response.headers["Cache-Control"] = "no-cache"
+    response.headers["X-Accel-Buffering"] = "no"
+    await response.prepare(request)
+    await response.write(b"retry: 3000\n\n")
+    try:
+        while True:
+            try:
+                msg = await asyncio.wait_for(_log_sse_queue.get(), timeout=15)
+                safe = msg.replace("\n", " ").replace("\r", " ")
+                await response.write(f"event: log\ndata: {safe}\n\n".encode())
+            except asyncio.TimeoutError:
+                await response.write(b": keepalive\n\n")
+    except (ConnectionResetError, asyncio.CancelledError):
+        pass
+    return response
+
+
+async def _admin_shutdown_handler(request: web.Request) -> web.Response:
+    """POST /admin/api/shutdown — emergency shutdown."""
+    if not _valid_admin_session(request):
+        raise web.HTTPUnauthorized()
+    logger.warning("EMERGENCY SHUTDOWN triggered via admin panel")
+    asyncio.get_event_loop().call_later(0.5, os._exit, 0)  # noqa: SLF001
+    return web.json_response({"ok": True, "msg": "Shutting down…"})
+
+
+def _init_admin_passcode() -> str:
+    """Return the admin passcode — from env or auto-generated (100 chars)."""
+    pc = os.environ.get("ADMIN_PASSCODE", "").strip()
+    if not pc:
+        # Generate a 100-character random passcode: 75 raw bytes → 100 url-safe base64 chars
+        pc = secrets.token_urlsafe(75)[:100]
+        logger.info("admin passcode (auto-generated, save this): %s", pc)
+    return pc
+
+
+def build_admin_app() -> web.Application:
+    """Build the admin aiohttp Application (served on ADMIN_PORT)."""
+    global _ADMIN_PASSCODE  # noqa: PLW0603
+    _ADMIN_PASSCODE = _init_admin_passcode()
+
+    app = web.Application()
+
+    async def on_startup(app: web.Application) -> None:  # noqa: ARG001
+        global _log_sse_queue  # noqa: PLW0603
+        _log_sse_queue = asyncio.Queue(maxsize=1000)
+        handler = _SseLogHandler()
+        handler.setFormatter(logging.Formatter(
+            fmt="%(asctime)s  %(levelname)-8s  %(message)s",
+            datefmt="%Y-%m-%dT%H:%M:%SZ",
+        ))
+        logging.root.addHandler(handler)
+        logger.info("admin panel ready  port=%d", ADMIN_PORT)
+
+    app.on_startup.append(on_startup)
+    app.router.add_get("/admin/", _admin_index_handler)
+    app.router.add_get("/admin", _admin_index_handler)
+    app.router.add_post("/admin/login", _admin_login_handler)
+    app.router.add_get("/admin/api/stats", _admin_stats_handler)
+    app.router.add_get("/admin/api/logs", _admin_logs_sse_handler)
+    app.router.add_post("/admin/api/shutdown", _admin_shutdown_handler)
+    return app
+
+
+# ---------------------------------------------------------------------------
 # App factory
 # ---------------------------------------------------------------------------
 
@@ -907,7 +1402,8 @@ async def _cleanup_expired_rooms(db_path: Path) -> None:
 def build_app(db_path: Path | None = None) -> web.Application:
     resolved_db = db_path if db_path is not None else DB_PATH
 
-    app = web.Application()
+    # Allow up to MAX_UPLOAD_BYTES for multipart uploads
+    app = web.Application(client_max_size=MAX_UPLOAD_BYTES)
     app["db_path"] = resolved_db
 
     async def on_startup(app: web.Application) -> None:
@@ -955,4 +1451,26 @@ if __name__ == "__main__":
         "Expose via a Tor hidden service for anonymous access — "
         "run start_server.bat for automatic setup (Windows)."
     )
-    web.run_app(build_app(), host=host, port=port, access_log=None)
+
+    chat_app   = build_app()
+    admin_app  = build_admin_app()
+
+    async def _run_both() -> None:
+        runner_chat  = web.AppRunner(chat_app,  access_log=None)
+        runner_admin = web.AppRunner(admin_app, access_log=None)
+        await runner_chat.setup()
+        await runner_admin.setup()
+        site_chat  = web.TCPSite(runner_chat,  host, port)
+        site_admin = web.TCPSite(runner_admin, host, ADMIN_PORT)
+        await site_chat.start()
+        await site_admin.start()
+        logger.info("admin panel starting  host=%s  port=%d", host, ADMIN_PORT)
+        if ADMIN_ONION_ADDRESS:
+            logger.info("admin onion address  %s", ADMIN_ONION_ADDRESS)
+        try:
+            await asyncio.Event().wait()          # run forever
+        finally:
+            await runner_chat.cleanup()
+            await runner_admin.cleanup()
+
+    asyncio.run(_run_both())
