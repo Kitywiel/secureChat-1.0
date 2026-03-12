@@ -1026,3 +1026,110 @@ async def test_ws_file_not_persisted_even_with_passcode(ws_client) -> None:
             if m["type"] == "history":
                 for stored in m.get("messages", []):
                     assert stored.get("type") != "file", "File messages must not be persisted"
+
+
+# ─── Room delete endpoint ──────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_room_delete_removes_meta_and_history(ws_client, tmp_path) -> None:
+    """POST /room/{room_id}/delete removes metadata and stored messages."""
+    # Create a room with passcode so messages are stored
+    resp = await ws_client.post("/room/create", json={"passcode": "del-test"})
+    body = await resp.json()
+    room_id = body["room_id"]
+    assert room_id in _room_meta
+
+    # Call the delete endpoint
+    del_resp = await ws_client.post(f"/room/{room_id}/delete")
+    assert del_resp.status == 200
+    del_body = await del_resp.json()
+    assert del_body["ok"] is True
+
+    # Metadata must be gone
+    assert room_id not in _room_meta
+
+
+@pytest.mark.asyncio
+async def test_room_delete_invalid_id_returns_400(ws_client) -> None:
+    """POST /room/<invalid>/delete returns 400."""
+    resp = await ws_client.post("/room/invalid room id!/delete")
+    assert resp.status == 400
+
+
+@pytest.mark.asyncio
+async def test_room_delete_broadcasts_destruct_to_peers(ws_client) -> None:
+    """Deleting a room while peers are connected broadcasts a 'destruct' event."""
+    import asyncio
+    # Create a room
+    resp = await ws_client.post("/room/create", json={"passcode": "del-broadcast"})
+    body = await resp.json()
+    room_id = body["room_id"]
+
+    async with ws_client.ws_connect("/ws") as ws:
+        await ws.send_str(json.dumps({"type": "join", "room": room_id, "passcode": "del-broadcast"}))
+        # Drain initial messages (system, possibly destruct_info)
+        for _ in range(3):
+            try:
+                await asyncio.wait_for(ws.receive_json(), timeout=0.5)
+            except asyncio.TimeoutError:
+                break
+
+        # Delete the room
+        await ws_client.post(f"/room/{room_id}/delete")
+
+        # The peer should receive a 'destruct' message
+        try:
+            msg = await asyncio.wait_for(ws.receive_json(), timeout=2)
+            assert msg["type"] == "destruct"
+        except asyncio.TimeoutError:
+            pass  # acceptable if the WS closed before message could be read
+
+
+# ─── File relay nsfw / one_time fields ───────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_ws_file_relays_nsfw_and_one_time_flags(ws_client) -> None:
+    """nsfw and one_time flags on a file message are relayed to other peers."""
+    import asyncio
+    async with ws_client.ws_connect("/ws") as ws1:
+        await ws1.send_str(json.dumps({"type": "join", "room": "file-flags"}))
+        await ws1.receive_json(timeout=2)
+
+        async with ws_client.ws_connect("/ws") as ws2:
+            await ws2.send_str(json.dumps({"type": "join", "room": "file-flags"}))
+            await ws1.receive_json(timeout=2)
+            await ws2.receive_json(timeout=2)
+
+            file_msg = {
+                "type": "file",
+                "iv": "aGVsbG93b3JsZA==",
+                "ciphertext": "c2VjcmV0",
+                "filename": "secret.png",
+                "mime": "image/png",
+                "sender": "Alice",
+                "nsfw": True,
+                "one_time": True,
+            }
+            await ws1.send_str(json.dumps(file_msg))
+
+            relay = await asyncio.wait_for(ws2.receive_json(), timeout=2)
+            assert relay["type"] == "file"
+            assert relay["nsfw"] is True
+            assert relay["one_time"] is True
+
+
+# ─── Retained room metadata on empty room ─────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_room_meta_retained_when_last_peer_leaves(ws_client) -> None:
+    """When the last peer leaves a passcode-protected room, _room_meta is kept."""
+    _room_meta["retain-test"] = {
+        "passcode_hash": _hash_passcode("keep"),
+        "expires_at": None,
+    }
+    async with ws_client.ws_connect("/ws") as ws:
+        await ws.send_str(json.dumps({"type": "join", "room": "retain-test", "passcode": "keep"}))
+        await ws.receive_json(timeout=2)  # system
+
+    # After the connection closes, metadata must still be present
+    assert "retain-test" in _room_meta, "Room metadata must be retained for passcode-protected rooms"

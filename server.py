@@ -68,20 +68,26 @@ if sys.version_info < (3, 9):
 class _ColourFormatter(logging.Formatter):
     """Apply ANSI colour codes when stderr is a TTY.
 
-    Green  — creation events (room/upload created, server starting)
-    Yellow — user-join events
-    Red    — deletion / expiry / error events
+    Green   — creation events (room created, server starting, database ready)
+    Yellow  — user-join events
+    Red     — deletion / expiry / error events
+    Purple  — share download events
+    Pink    — share upload events
     """
 
     _GREEN  = "\x1b[32m"
     _YELLOW = "\x1b[33m"
     _RED    = "\x1b[31m"
+    _PURPLE = "\x1b[35m"
+    _PINK   = "\x1b[95m"
     _RESET  = "\x1b[0m"
 
     # Sub-strings matched (lower-cased) against the formatted message
-    _CREATION = frozenset(["room created", "share upload", "database ready", "securechat starting"])
-    _DELETION = frozenset(["room deleted", "room self-destructed", "cleaned up", "expired"])
-    _JOINED   = frozenset(["peer joined"])
+    _CREATION      = frozenset(["room created", "database ready", "securechat starting"])
+    _DELETION      = frozenset(["room deleted", "room self-destructed", "cleaned up", "expired"])
+    _JOINED        = frozenset(["peer joined"])
+    _SHARE_UPLOAD  = frozenset(["share upload"])
+    _SHARE_DOWNLOAD = frozenset(["share download"])
 
     def format(self, record: logging.LogRecord) -> str:
         msg = super().format(record)
@@ -91,6 +97,10 @@ class _ColourFormatter(logging.Formatter):
         text = record.getMessage().lower()
         if record.levelno >= logging.WARNING or any(kw in text for kw in self._DELETION):
             return f"{self._RED}{msg}{self._RESET}"
+        if any(kw in text for kw in self._SHARE_DOWNLOAD):
+            return f"{self._PURPLE}{msg}{self._RESET}"
+        if any(kw in text for kw in self._SHARE_UPLOAD):
+            return f"{self._PINK}{msg}{self._RESET}"
         if any(kw in text for kw in self._CREATION):
             return f"{self._GREEN}{msg}{self._RESET}"
         if any(kw in text for kw in self._JOINED):
@@ -459,6 +469,8 @@ async def ws_handler(request: web.Request) -> web.WebSocketResponse:
                 sender     = str(data.get("sender", ""))[:MAX_DISPLAY_NAME_LEN]
                 filename   = str(data.get("filename", "file"))[:MAX_CHAT_FILENAME_LEN]
                 mime       = str(data.get("mime", "application/octet-stream"))[:MAX_MIME_LEN]
+                one_time   = bool(data.get("one_time", False))
+                nsfw       = bool(data.get("nsfw", False))
 
                 # Reject obviously malformed or oversized payloads.
                 # File attachments are never persisted — always ephemeral.
@@ -472,6 +484,8 @@ async def ws_handler(request: web.Request) -> web.WebSocketResponse:
                     "filename": filename,
                     "mime": mime,
                     "sender": sender,
+                    "one_time": one_time,
+                    "nsfw": nsfw,
                 })
                 await _broadcast_to_room(room_id, relay, exclude=ws)
 
@@ -483,7 +497,14 @@ async def ws_handler(request: web.Request) -> web.WebSocketResponse:
                 await _broadcast_system(room_id)
             else:
                 del rooms[room_id]
-                logger.info("room deleted  room=%s", room_id)
+                # A room that was created with a passcode or self-destruct timer
+                # retains its metadata so it can be rejoined later — do NOT treat
+                # it as permanently deleted.
+                meta = _room_meta.get(room_id)
+                if meta:
+                    logger.info("room inactive (retained)  room=%s", room_id)
+                else:
+                    logger.info("room deleted  room=%s", room_id)
 
     return ws
 
@@ -776,6 +797,36 @@ async def room_create_handler(request: web.Request) -> web.Response:
     return web.json_response({"room_id": room_id, "expires_at": expires_at})
 
 
+async def room_delete_handler(request: web.Request) -> web.Response:
+    """POST /room/{room_id}/delete — destroy a room and all associated data."""
+    room_id = request.match_info["room_id"]
+    if not _ROOM_RE.match(room_id):
+        raise web.HTTPBadRequest(reason="Invalid room ID")
+
+    # Remove room metadata
+    _room_meta.pop(room_id, None)
+
+    # Delete stored messages from DB
+    db_path: Path = request.app["db_path"]
+    try:
+        await asyncio.to_thread(_delete_room_history_sync, db_path, room_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("failed to delete room history  room=%s  error=%s", room_id, exc)
+
+    # Notify connected peers and disconnect them
+    if room_id in rooms:
+        await _broadcast_to_room(room_id, json.dumps({"type": "destruct"}))
+        for peer in list(rooms.get(room_id, set())):
+            try:
+                await peer.close()
+            except Exception:  # noqa: BLE001
+                pass
+        rooms.pop(room_id, None)
+
+    logger.info("room deleted  room=%s  (manual delete)", room_id)
+    return web.json_response({"ok": True})
+
+
 async def server_info_handler(request: web.Request) -> web.Response:
     """GET /api/server-info — return public server information (onion address if known)."""
     onion = ONION_ADDRESS
@@ -882,6 +933,7 @@ def build_app(db_path: Path | None = None) -> web.Application:
     app.router.add_get("/ws", ws_handler)
     app.router.add_get("/", index_handler)
     app.router.add_post("/room/create", room_create_handler)
+    app.router.add_post("/room/{room_id}/delete", room_delete_handler)
     app.router.add_get("/api/server-info", server_info_handler)
     app.router.add_get("/api/qrcode", qrcode_handler)
     app.router.add_post("/share/upload", share_upload_handler)

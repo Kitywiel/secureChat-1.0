@@ -707,6 +707,55 @@ select:focus {
   opacity: 0.9;
 }
 
+.message-img.nsfw {
+  filter: blur(18px);
+  transition: filter 0.3s;
+}
+
+.message-img.nsfw:hover {
+  opacity: 1;
+}
+
+.nsfw-wrapper {
+  position: relative;
+  display: inline-block;
+  margin-top: 0.35rem;
+}
+
+.nsfw-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.25);
+  user-select: none;
+}
+
+.nsfw-overlay span {
+  background: rgba(0, 0, 0, 0.65);
+  color: #fff;
+  font-size: 0.75rem;
+  font-weight: 700;
+  padding: 0.25rem 0.6rem;
+  border-radius: 4px;
+  letter-spacing: 0.04em;
+}
+
+.once-badge {
+  display: inline-block;
+  font-size: 0.68rem;
+  color: #fff;
+  background: #6a4fcf;
+  border-radius: 4px;
+  padding: 0.1rem 0.4rem;
+  margin-left: 0.4rem;
+  vertical-align: middle;
+  font-weight: 600;
+}
+
 .message-file {
   display: inline-flex;
   align-items: center;
@@ -725,4 +774,100 @@ select:focus {
 
 .message-file:hover {
   border-color: var(--accent);
+}
+
+/* ── File preview area ─────────────────────────────────────────────────────── */
+.file-preview-area {
+  padding: 0.5rem 1rem 0;
+  background: var(--surface);
+  border-top: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.file-preview-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  margin-bottom: 0.4rem;
+}
+
+.file-preview-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.25rem 0.55rem;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 0.8rem;
+  color: var(--text);
+  max-width: 180px;
+  overflow: hidden;
+}
+
+.file-preview-item span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+  min-width: 0;
+}
+
+.file-preview-item button {
+  flex-shrink: 0;
+  background: transparent;
+  border: none;
+  color: var(--text-dim);
+  font-size: 0.85rem;
+  cursor: pointer;
+  padding: 0;
+  line-height: 1;
+  width: auto;
+  height: auto;
+  border-radius: 0;
+}
+
+.file-preview-item button:hover {
+  color: var(--error-color);
+  background: transparent;
+}
+
+.file-options {
+  display: flex;
+  gap: 1rem;
+  margin-bottom: 0.45rem;
+}
+
+.file-opt-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.8rem;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+
+.file-opt-label input[type="checkbox"] {
+  width: auto;
+  accent-color: var(--accent);
+  margin: 0;
+}
+
+/* ── Danger (delete) button in chat header ─────────────────────────────────── */
+.btn-danger-sm {
+  flex-shrink: 0;
+  padding: 0.3rem 0.75rem;
+  background: transparent;
+  border: 1px solid rgba(255, 85, 85, 0.4);
+  border-radius: 6px;
+  color: #ff5555;
+  font-size: 0.82rem;
+  font-family: var(--font);
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+}
+
+.btn-danger-sm:hover {
+  border-color: #ff5555;
+  background: rgba(255, 85, 85, 0.12);
 }

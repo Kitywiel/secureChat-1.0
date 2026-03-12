@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta
       http-equiv="Content-Security-Policy"
-      content="default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self' ws: wss:; img-src 'self'; object-src 'none';"
+      content="default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self' ws: wss:; img-src 'self' blob:; object-src 'none';"
     />
     <title>secureChat</title>
     <link rel="stylesheet" href="/static/style.css" />
@@ -96,14 +96,29 @@
         <span id="room-label" class="room-label"></span>
         <span id="destruct-timer" class="destruct-timer hidden" aria-live="polite"></span>
         <span id="user-count" class="user-count">👤 1</span>
+        <button id="delete-room-btn" type="button" class="btn-danger-sm" title="Delete room and all its data">🗑 Delete</button>
         <button id="leave-btn" type="button">Leave</button>
       </header>
 
       <main id="messages" class="messages" role="log" aria-live="polite"></main>
 
+      <!-- File preview area — only visible when files are queued -->
+      <div id="file-preview-area" class="file-preview-area hidden">
+        <div id="file-preview-list" class="file-preview-list"></div>
+        <div class="file-options">
+          <label class="file-opt-label">
+            <input type="checkbox" id="file-nsfw-check" />
+            <span>🔞 NSFW</span>
+          </label>
+          <label class="file-opt-label">
+            <input type="checkbox" id="file-once-check" />
+            <span>👁 One-time view</span>
+          </label>
+        </div>
+      </div>
+
       <form id="message-form" class="message-bar">
         <input type="file" id="chat-file-input" multiple style="display:none" aria-hidden="true" />
-        <button type="button" id="attach-btn" class="btn-attach" aria-label="Attach file" disabled>📎</button>
         <textarea
           id="message-input"
           placeholder="Type a message… (Enter to send, Shift+Enter for new line)"
@@ -113,6 +128,7 @@
           aria-label="Message"
           rows="1"
         ></textarea>
+        <button type="button" id="attach-btn" class="btn-attach" aria-label="Attach file" disabled>📎</button>
         <button type="submit" id="send-btn" aria-label="Send message">↑</button>
       </form>
     </div>
@@ -219,7 +235,7 @@
             </button>
             <div id="create-qr-container" class="qr-container hidden">
               <img id="create-qr-img" class="qr-code" alt="QR code for invite link" />
-              <p class="qr-note">Scan to open the invite link</p>
+              <p class="qr-note">Scan to open the invite link (includes passphrase)</p>
             </div>
           </div>
           <p id="create-expiry" class="notice"></p>

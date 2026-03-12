@@ -157,8 +157,10 @@ async function decryptFile(key, ivB64, ciphertextB64) {
  * @param {Uint8Array} bytes     Decrypted file bytes
  * @param {'outgoing'|'incoming'} kind
  * @param {number|null} [timestamp]
+ * @param {boolean} [nsfw]       Blur image until clicked
+ * @param {boolean} [oneTime]    Remove message element after first view
  */
-function appendFileMessage(sender, filename, mime, bytes, kind, timestamp = null) {
+function appendFileMessage(sender, filename, mime, bytes, kind, timestamp = null, nsfw = false, oneTime = false) {
   const log = document.getElementById('messages');
   const el  = document.createElement('div');
   el.className = 'message ' + kind;
@@ -175,6 +177,12 @@ function appendFileMessage(sender, filename, mime, bytes, kind, timestamp = null
   timeEl.dateTime = d.toISOString();
   timeEl.textContent = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   headerEl.appendChild(senderEl);
+  if (oneTime) {
+    const badge = document.createElement('span');
+    badge.className = 'once-badge';
+    badge.textContent = '👁 once';
+    headerEl.appendChild(badge);
+  }
   headerEl.appendChild(timeEl);
   el.appendChild(headerEl);
 
@@ -184,18 +192,54 @@ function appendFileMessage(sender, filename, mime, bytes, kind, timestamp = null
 
   if (SAFE_IMAGE_MIMES.has(mime)) {
     const img = document.createElement('img');
-    img.className = 'message-img';
+    img.className = 'message-img' + (nsfw ? ' nsfw' : '');
     img.src   = url;
     img.alt   = filename;
     img.title = filename;
-    img.addEventListener('click', () => window.open(url, '_blank'));
-    el.appendChild(img);
+
+    if (nsfw) {
+      // Wrap in container so the overlay sits on top
+      const wrapper = document.createElement('div');
+      wrapper.className = 'nsfw-wrapper';
+      wrapper.appendChild(img);
+
+      const overlay = document.createElement('div');
+      overlay.className = 'nsfw-overlay';
+      const label = document.createElement('span');
+      label.textContent = '🔞 NSFW — click to reveal';
+      overlay.appendChild(label);
+      wrapper.appendChild(overlay);
+
+      const reveal = () => {
+        img.classList.remove('nsfw');
+        wrapper.removeChild(overlay);
+        if (oneTime) {
+          img.addEventListener('click', () => { URL.revokeObjectURL(url); el.remove(); }, { once: true });
+        } else {
+          img.addEventListener('click', () => window.open(url, '_blank'));
+        }
+      };
+      overlay.addEventListener('click', reveal);
+      el.appendChild(wrapper);
+    } else {
+      if (oneTime) {
+        img.addEventListener('click', () => { URL.revokeObjectURL(url); el.remove(); }, { once: true });
+      } else {
+        img.addEventListener('click', () => window.open(url, '_blank'));
+      }
+      el.appendChild(img);
+    }
   } else {
     const a = document.createElement('a');
     a.className  = 'message-file';
     a.href       = url;
     a.download   = filename;
     a.textContent = `📎 ${filename}`;
+    if (oneTime) {
+      a.addEventListener('click', () => {
+        setTimeout(() => { URL.revokeObjectURL(url); el.remove(); }, 100);
+      }, { once: true });
+    }
     el.appendChild(a);
   }
 
@@ -217,9 +261,11 @@ const SAFE_IMAGE_MIMES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image
  * Encrypt and send a file over the current WebSocket connection.
  * Shows the file locally (outgoing) immediately without waiting for relay echo.
  *
- * @param {File} file
+ * @param {File}    file
+ * @param {boolean} [nsfw]    Mark as NSFW
+ * @param {boolean} [oneTime] Mark as one-time view
  */
-async function sendFile(file) {
+async function sendFile(file, nsfw = false, oneTime = false) {
   if (!roomKey || !ws || ws.readyState !== WebSocket.OPEN) return;
 
   if (file.size > MAX_CHAT_FILE_BYTES) {
@@ -233,10 +279,10 @@ async function sendFile(file) {
 
   const { iv, ciphertext } = await encryptFile(roomKey, bytes);
 
-  ws.send(JSON.stringify({ type: 'file', iv, ciphertext, filename, mime, sender: displayName }));
+  ws.send(JSON.stringify({ type: 'file', iv, ciphertext, filename, mime, sender: displayName, nsfw, one_time: oneTime }));
 
   // Render own attachment immediately
-  appendFileMessage(displayName, filename, mime, bytes, 'outgoing');
+  appendFileMessage(displayName, filename, mime, bytes, 'outgoing', null, nsfw, oneTime);
 }
 
 // ─── UI helpers ───────────────────────────────────────────────────────────────
@@ -306,6 +352,13 @@ let currentCreateRoomData = null;
 
 /** Interval ID for the self-destruct countdown. */
 let destructTimerInterval = null;
+
+/** Pending files queued for the next send (cleared after each send). */
+/** @type {File[]} */
+let pendingFiles = [];
+
+/** The room ID currently joined (used for the delete-room API call). */
+let currentRoomId = '';
 
 // ─── Random generation helpers ────────────────────────────────────────────────
 
@@ -462,6 +515,9 @@ function connectWs(roomId) {
           data.mime || 'application/octet-stream',
           bytes,
           'incoming',
+          null,
+          !!data.nsfw,
+          !!data.one_time,
         );
       } else {
         appendMessage('⚠️', '[File could not be decrypted — wrong passphrase?]', 'error');
@@ -518,6 +574,7 @@ function enterRoom(roomId, key, name, passcode) {
   roomKey = key;
   displayName = name.slice(0, 32);
   roomPasscode = passcode;
+  currentRoomId = roomId;
   stopDestructTimer();
   document.getElementById('room-label').textContent = `🔒 ${roomId}`;
   document.getElementById('message-input').disabled = false;
@@ -584,6 +641,16 @@ document.getElementById('message-form').addEventListener('submit', async (e) => 
   const input = /** @type {HTMLTextAreaElement} */ (document.getElementById('message-input'));
   const text = input.value.trim();
 
+  // Send any queued files first
+  if (pendingFiles.length > 0) {
+    const nsfw    = /** @type {HTMLInputElement} */ (document.getElementById('file-nsfw-check')).checked;
+    const oneTime = /** @type {HTMLInputElement} */ (document.getElementById('file-once-check')).checked;
+    for (const file of pendingFiles) {
+      await sendFile(file, nsfw, oneTime);
+    }
+    clearPendingFiles();
+  }
+
   if (!text || !roomKey || !ws || ws.readyState !== WebSocket.OPEN) return;
 
   input.value = '';
@@ -618,7 +685,9 @@ document.getElementById('leave-btn').addEventListener('click', () => {
   }
   roomKey = null;
   roomPasscode = '';
+  currentRoomId = '';
   stopDestructTimer();
+  clearPendingFiles();
   showScreen('lobby');
   document.getElementById('messages').innerHTML = '';
   document.getElementById('join-form').reset();
@@ -628,40 +697,91 @@ document.getElementById('leave-btn').addEventListener('click', () => {
 
 // ─── In-chat file / image attachments ────────────────────────────────────────
 
+/**
+ * Update the file preview area to reflect the current pendingFiles list.
+ * Shows the area when files are pending; hides it when empty.
+ */
+function updateFilePreview() {
+  const area = document.getElementById('file-preview-area');
+  const list = document.getElementById('file-preview-list');
+  list.innerHTML = '';
+
+  if (pendingFiles.length === 0) {
+    area.classList.add('hidden');
+    return;
+  }
+
+  area.classList.remove('hidden');
+  pendingFiles.forEach((file, idx) => {
+    const item = document.createElement('div');
+    item.className = 'file-preview-item';
+
+    const nameEl = document.createElement('span');
+    nameEl.textContent = file.name;
+    item.appendChild(nameEl);
+
+    const rmBtn = document.createElement('button');
+    rmBtn.type = 'button';
+    rmBtn.textContent = '✕';
+    rmBtn.title = 'Remove';
+    rmBtn.addEventListener('click', () => {
+      pendingFiles.splice(idx, 1);
+      updateFilePreview();
+    });
+    item.appendChild(rmBtn);
+    list.appendChild(item);
+  });
+}
+
+/** Clear pending files and hide the preview area. */
+function clearPendingFiles() {
+  pendingFiles = [];
+  document.getElementById('file-nsfw-check').checked = false;
+  document.getElementById('file-once-check').checked = false;
+  updateFilePreview();
+}
+
 // Clicking the 📎 button opens the hidden file picker.
 document.getElementById('attach-btn').addEventListener('click', () => {
   document.getElementById('chat-file-input').click();
 });
 
-// File chosen via the picker — send each selected file.
-document.getElementById('chat-file-input').addEventListener('change', async (e) => {
+// File chosen via the picker — queue for sending on Enter.
+document.getElementById('chat-file-input').addEventListener('change', (e) => {
   const input = /** @type {HTMLInputElement} */ (e.target);
   if (!input.files?.length) return;
   for (const file of input.files) {
-    await sendFile(file);
+    pendingFiles.push(file);
   }
   input.value = ''; // reset so the same file can be re-selected
+  updateFilePreview();
 });
 
-// Paste from clipboard — intercept image/file items and send them as attachments
-// without inserting anything into the textarea.
-document.getElementById('message-input').addEventListener('paste', async (e) => {
-  const items = e.clipboardData?.items;
-  if (!items) return;
-  /** @type {File[]} */
-  const files = [];
-  for (const item of items) {
-    if (item.kind === 'file') {
-      const file = item.getAsFile();
-      if (file) files.push(file);
-    }
+// Delete room button — removes all room data from the server and leaves.
+document.getElementById('delete-room-btn').addEventListener('click', async () => {
+  if (!currentRoomId) return;
+  if (!confirm(`Delete room "${currentRoomId}" and all its messages? This cannot be undone.`)) return;
+
+  try {
+    await fetch(`/room/${encodeURIComponent(currentRoomId)}/delete`, { method: 'POST' });
+  } catch { /* ignore network errors — room may already be gone */ }
+
+  // The server will broadcast a "destruct" event that clears the UI;
+  // also clean up locally in case the WS event doesn't arrive in time.
+  if (ws) {
+    ws.close();
+    ws = null;
   }
-  if (files.length > 0) {
-    e.preventDefault(); // don't paste binary data as text
-    for (const file of files) {
-      await sendFile(file);
-    }
-  }
+  roomKey = null;
+  roomPasscode = '';
+  currentRoomId = '';
+  stopDestructTimer();
+  clearPendingFiles();
+  showScreen('lobby');
+  document.getElementById('messages').innerHTML = '';
+  document.getElementById('join-form').reset();
+  document.getElementById('join-error').textContent = '';
+  document.getElementById('attach-btn').disabled = true;
 });
 
 // ─── Share Files ──────────────────────────────────────────────────────────────
@@ -1027,9 +1147,16 @@ function toggleQr(btnId, imgId, containerId, url) {
 }
 
 document.getElementById('create-qr-btn').addEventListener('click', () => {
-  const url = document.getElementById('create-invite-link').textContent;
-  if (!url) return;
-  toggleQr('create-qr-btn', 'create-qr-img', 'create-qr-container', url);
+  const inviteUrl = document.getElementById('create-invite-link').textContent;
+  if (!inviteUrl) return;
+  // Include the passphrase in the QR code so a single scan gives full access.
+  const passphrase = document.getElementById('create-passphrase-display').textContent;
+  let qrData = inviteUrl;
+  if (passphrase) {
+    // Append pass= to the fragment so the join form is pre-filled on scan.
+    qrData = inviteUrl + (inviteUrl.includes('#') ? '&' : '#') + 'pass=' + encodeURIComponent(passphrase);
+  }
+  toggleQr('create-qr-btn', 'create-qr-img', 'create-qr-container', qrData);
 });
 
 document.getElementById('share-qr-btn').addEventListener('click', () => {
