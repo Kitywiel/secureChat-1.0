@@ -861,3 +861,38 @@ async def test_ws_join_sends_destruct_info(ws_client) -> None:
         di = next(m for m in messages if m["type"] == "destruct_info")
         assert abs(di["expires_at"] - expires_at) < 1
         assert di["remaining"] > 0
+
+
+# ─── QR code endpoint ─────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_qrcode_returns_svg(ws_client) -> None:
+    """GET /api/qrcode?data=<url> returns HTTP 200 with SVG content."""
+    resp = await ws_client.get("/api/qrcode?data=https://example.onion/%23room%3Dabc")
+    assert resp.status == 200
+    ct = resp.headers.get("Content-Type", "")
+    assert "svg" in ct
+    body = await resp.text()
+    assert body.startswith("<?xml") or "<svg" in body
+
+
+@pytest.mark.asyncio
+async def test_qrcode_no_data_returns_400(ws_client) -> None:
+    """GET /api/qrcode with no data parameter returns 400."""
+    resp = await ws_client.get("/api/qrcode")
+    assert resp.status == 400
+
+
+@pytest.mark.asyncio
+async def test_qrcode_too_long_returns_400(ws_client) -> None:
+    """GET /api/qrcode with data longer than 2048 chars returns 400."""
+    resp = await ws_client.get("/api/qrcode?data=" + "x" * 2049)
+    assert resp.status == 400
+
+
+@pytest.mark.asyncio
+async def test_qrcode_no_cache_header(ws_client) -> None:
+    """QR response must carry Cache-Control: no-store."""
+    resp = await ws_client.get("/api/qrcode?data=test")
+    assert resp.status == 200
+    assert "no-store" in resp.headers.get("Cache-Control", "")

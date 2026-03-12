@@ -628,3 +628,36 @@ select:focus {
   opacity: 0.5;
   cursor: not-allowed;
 }
+
+/* ── QR code ───────────────────────────────────────────────────────────────── */
+.qr-row {
+  margin-top: 1rem;
+}
+
+.btn-qr {
+  font-size: 0.85rem;
+  padding: 0.45rem 0.9rem;
+}
+
+.qr-container {
+  margin-top: 0.75rem;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.qr-code {
+  width: 200px;
+  height: 200px;
+  border-radius: 8px;
+  background: #fff;
+  padding: 0.5rem;
+  display: block;
+}
+
+.qr-note {
+  font-size: 0.75rem;
+  color: var(--text-dim);
+  text-align: center;
+}

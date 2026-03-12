@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import io
 import json
 import logging
 import os
@@ -45,6 +46,9 @@ import tempfile
 import time
 from pathlib import Path
 
+import qrcode
+import qrcode.constants
+from qrcode.image.svg import SvgImage as _QrSvgImage
 from aiohttp import web, WSMsgType
 
 # ---------------------------------------------------------------------------
@@ -727,6 +731,31 @@ async def server_info_handler(request: web.Request) -> web.Response:
     return web.json_response({"onion": onion})
 
 
+async def qrcode_handler(request: web.Request) -> web.Response:
+    """GET /api/qrcode?data=<url> — return a QR code SVG for the given URL."""
+    data = request.query.get("data", "").strip()
+    if not data:
+        raise web.HTTPBadRequest(reason="data parameter is required")
+    if len(data) > 2048:
+        raise web.HTTPBadRequest(reason="data too long (max 2048 chars)")
+
+    qr = qrcode.QRCode(
+        error_correction=qrcode.constants.ERROR_CORRECT_L,
+        box_size=10,
+        border=4,
+    )
+    qr.add_data(data)
+    qr.make(fit=True)
+    img = qr.make_image(image_factory=_QrSvgImage)
+    buf = io.BytesIO()
+    img.save(buf)
+    return web.Response(
+        body=buf.getvalue(),
+        content_type="image/svg+xml",
+        headers={"Cache-Control": "no-store"},
+    )
+
+
 async def _cleanup_expired_rooms(db_path: Path) -> None:
     """Background task: self-destruct expired rooms every 30 seconds."""
     while True:
@@ -790,6 +819,7 @@ def build_app(db_path: Path | None = None) -> web.Application:
     app.router.add_get("/", index_handler)
     app.router.add_post("/room/create", room_create_handler)
     app.router.add_get("/api/server-info", server_info_handler)
+    app.router.add_get("/api/qrcode", qrcode_handler)
     app.router.add_post("/share/upload", share_upload_handler)
     app.router.add_get("/share/download/{token}", share_download_handler)
     app.router.add_post("/share/download/{token}", share_download_post_handler)

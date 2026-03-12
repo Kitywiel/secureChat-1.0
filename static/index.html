@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta
       http-equiv="Content-Security-Policy"
-      content="default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self' ws: wss:; img-src 'none'; object-src 'none';"
+      content="default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self' ws: wss:; img-src 'self'; object-src 'none';"
     />
     <title>secureChat</title>
     <link rel="stylesheet" href="/static/style.css" />
@@ -211,6 +211,15 @@
             <code id="create-passphrase-display" class="share-link"></code>
             <button type="button" id="create-copy-passphrase-btn" class="btn-copy">Copy</button>
           </div>
+          <div class="qr-row">
+            <button type="button" id="create-qr-btn" class="btn-secondary btn-qr">
+              📱 Show QR Code
+            </button>
+            <div id="create-qr-container" class="qr-container hidden">
+              <img id="create-qr-img" class="qr-code" alt="QR code for invite link" />
+              <p class="qr-note">Scan to open the invite link</p>
+            </div>
+          </div>
           <p id="create-expiry" class="notice"></p>
           <button type="button" id="create-join-btn">
             Join This Room →
@@ -289,6 +298,15 @@
             <div class="share-link-row">
               <code id="share-result-passcode" class="share-link"></code>
               <button type="button" id="share-copy-passcode-btn" class="btn-copy">Copy</button>
+            </div>
+          </div>
+          <div class="qr-row">
+            <button type="button" id="share-qr-btn" class="btn-secondary btn-qr">
+              📱 Show QR Code
+            </button>
+            <div id="share-qr-container" class="qr-container hidden">
+              <img id="share-qr-img" class="qr-code" alt="QR code for download link" />
+              <p class="qr-note">Scan to open the download link</p>
             </div>
           </div>
           <p id="share-expiry" class="notice"></p>

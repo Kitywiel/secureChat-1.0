@@ -491,6 +491,10 @@ function resetShareScreen() {
   // Hide the passcode row and result
   document.getElementById('share-passcode-row').classList.add('hidden');
   document.getElementById('share-passcode-result').classList.add('hidden');
+  // Hide QR container and reset button label
+  document.getElementById('share-qr-container').classList.add('hidden');
+  document.getElementById('share-qr-btn').textContent = '📱 Show QR Code';
+  document.getElementById('share-qr-img').src = '';
 }
 
 document.getElementById('share-files-btn').addEventListener('click', () => {
@@ -644,6 +648,10 @@ function resetCreateRoomScreen() {
   document.getElementById('create-room-form-area').classList.remove('hidden');
   document.getElementById('create-passcode-row').classList.add('hidden');
   document.getElementById('create-passphrase').value = randomPassphrase();
+  // Hide QR container and reset button label
+  document.getElementById('create-qr-container').classList.add('hidden');
+  document.getElementById('create-qr-btn').textContent = '📱 Show QR Code';
+  document.getElementById('create-qr-img').src = '';
   currentCreateRoomData = null;
 }
 
@@ -804,6 +812,46 @@ document.getElementById('create-join-btn').addEventListener('click', async () =>
     btn.disabled = false;
     btn.textContent = 'Join This Room →';
   }
+});
+
+// ─── QR Code toggles ─────────────────────────────────────────────────────────
+
+/**
+ * Generic toggle: show/hide the QR code container for a given link.
+ * @param {string} btnId       ID of the toggle button
+ * @param {string} imgId       ID of the <img> element
+ * @param {string} containerId ID of the container div
+ * @param {string} url         URL to encode in the QR code
+ */
+function toggleQr(btnId, imgId, containerId, url) {
+  const btn       = document.getElementById(btnId);
+  const img       = document.getElementById(imgId);
+  const container = document.getElementById(containerId);
+
+  if (container.classList.contains('hidden')) {
+    // Show — load the SVG from the server if not already loaded for this URL
+    const currentSrc = img.getAttribute('src') || '';
+    if (!currentSrc.includes('/api/qrcode')) {
+      img.src = '/api/qrcode?data=' + encodeURIComponent(url);
+    }
+    container.classList.remove('hidden');
+    btn.textContent = '📱 Hide QR Code';
+  } else {
+    container.classList.add('hidden');
+    btn.textContent = '📱 Show QR Code';
+  }
+}
+
+document.getElementById('create-qr-btn').addEventListener('click', () => {
+  const url = document.getElementById('create-invite-link').textContent;
+  if (!url) return;
+  toggleQr('create-qr-btn', 'create-qr-img', 'create-qr-container', url);
+});
+
+document.getElementById('share-qr-btn').addEventListener('click', () => {
+  const url = document.getElementById('share-link').textContent;
+  if (!url) return;
+  toggleQr('share-qr-btn', 'share-qr-img', 'share-qr-container', url);
 });
 
 // ─── Init ─────────────────────────────────────────────────────────────────────
