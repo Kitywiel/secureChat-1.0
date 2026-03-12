@@ -7,7 +7,7 @@
  * -----------------
  *  1. User supplies a room ID and a shared passphrase.
  *  2. A 256-bit AES-GCM key is derived with PBKDF2-SHA-256
- *     (600 000 iterations, OWASP-recommended minimum as of 2023).
+ *     (600 000 iterations, meets the OWASP-recommended minimum).
  *     Salt = SHA-256("secureChat-v1:" + roomId).
  *  3. Every outgoing message is encrypted with a fresh random 12-byte IV.
  *     The IV is sent alongside the ciphertext (base64-encoded).
