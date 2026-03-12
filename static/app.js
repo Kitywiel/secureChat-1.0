@@ -488,6 +488,9 @@ function resetShareScreen() {
   document.getElementById('share-error').textContent = '';
   document.getElementById('share-result').classList.add('hidden');
   document.getElementById('share-upload-area').classList.remove('hidden');
+  // Hide the passcode row and result
+  document.getElementById('share-passcode-row').classList.add('hidden');
+  document.getElementById('share-passcode-result').classList.add('hidden');
 }
 
 document.getElementById('share-files-btn').addEventListener('click', () => {
@@ -504,13 +507,34 @@ document.getElementById('share-again-btn').addEventListener('click', () => {
   resetShareScreen();
 });
 
+document.getElementById('share-passcode-check').addEventListener('change', (e) => {
+  const row = document.getElementById('share-passcode-row');
+  if (/** @type {HTMLInputElement} */ (e.target).checked) {
+    row.classList.remove('hidden');
+    if (!document.getElementById('share-passcode').value) {
+      document.getElementById('share-passcode').value = randomPasscode();
+    }
+  } else {
+    row.classList.add('hidden');
+  }
+});
+
+document.getElementById('refresh-share-passcode-btn').addEventListener('click', () => {
+  document.getElementById('share-passcode').value = randomPasscode();
+});
+
 document.getElementById('share-form').addEventListener('submit', async (e) => {
   e.preventDefault();
 
-  const fileInput = /** @type {HTMLInputElement} */ (document.getElementById('share-file'));
-  const ttlSelect = /** @type {HTMLSelectElement} */ (document.getElementById('share-ttl'));
-  const errEl = document.getElementById('share-error');
-  const btn = document.getElementById('share-btn');
+  const fileInput  = /** @type {HTMLInputElement} */ (document.getElementById('share-file'));
+  const ttlSelect  = /** @type {HTMLSelectElement} */ (document.getElementById('share-ttl'));
+  const errEl      = document.getElementById('share-error');
+  const btn        = document.getElementById('share-btn');
+  const usePasscode = /** @type {HTMLInputElement} */ (
+    document.getElementById('share-passcode-check')).checked;
+  const passcode   = usePasscode
+    ? document.getElementById('share-passcode').value.trim()
+    : '';
 
   errEl.textContent = '';
 
@@ -532,6 +556,7 @@ document.getElementById('share-form').addEventListener('submit', async (e) => {
 
   const formData = new FormData();
   formData.append('file', file);
+  if (passcode) formData.append('passcode', passcode);
 
   try {
     const resp = await fetch(`/share/upload?ttl=${encodeURIComponent(ttl)}`, {
@@ -552,6 +577,16 @@ document.getElementById('share-form').addEventListener('submit', async (e) => {
     document.getElementById('share-link').textContent = downloadUrl;
     document.getElementById('share-expiry').textContent =
       `⚠️ One-time link — expires ${expiresAt.toLocaleString()}`;
+
+    // Show the passcode to the uploader if one was set
+    const passcodeResult = document.getElementById('share-passcode-result');
+    if (passcode) {
+      document.getElementById('share-result-passcode').textContent = passcode;
+      passcodeResult.classList.remove('hidden');
+    } else {
+      passcodeResult.classList.add('hidden');
+    }
+
     document.getElementById('share-result').classList.remove('hidden');
     document.getElementById('share-upload-area').classList.add('hidden');
   } catch (err) {
@@ -580,6 +615,22 @@ document.getElementById('share-copy-btn').addEventListener('click', () => {
       sel.removeAllRanges();
       sel.addRange(range);
     }
+  });
+});
+
+document.getElementById('share-copy-passcode-btn').addEventListener('click', () => {
+  const el = document.getElementById('share-result-passcode');
+  const text = el.textContent;
+  if (!text) return;
+  navigator.clipboard.writeText(text).then(() => {
+    const btn = document.getElementById('share-copy-passcode-btn');
+    btn.textContent = 'Copied!';
+    setTimeout(() => { btn.textContent = 'Copy'; }, 2000);
+  }).catch(() => {
+    const range = document.createRange();
+    range.selectNodeContents(el);
+    const sel = window.getSelection();
+    if (sel) { sel.removeAllRanges(); sel.addRange(range); }
   });
 });
 
@@ -664,11 +715,10 @@ document.getElementById('create-room-form').addEventListener('submit', async (e)
     const data = await resp.json();
     const roomId = data.room_id;
 
-    // Build invite fragment — never sent to the server
-    const fragParts = [
-      `room=${encodeURIComponent(roomId)}`,
-      `pass=${encodeURIComponent(passphrase)}`,
-    ];
+    // Build invite fragment — room ID and optional passcode only.
+    // The passphrase is intentionally omitted: it must be shared separately
+    // (out-of-band) so that the invite link alone cannot decrypt messages.
+    const fragParts = [`room=${encodeURIComponent(roomId)}`];
     if (passcode) fragParts.push(`code=${encodeURIComponent(passcode)}`);
 
     // Use the server's known onion address if available, else fall back to current origin
@@ -686,6 +736,7 @@ document.getElementById('create-room-form').addEventListener('submit', async (e)
     currentCreateRoomData = { roomId, passphrase, passcode, expiresAt: data.expires_at, creatorName };
 
     document.getElementById('create-invite-link').textContent = inviteUrl;
+    document.getElementById('create-passphrase-display').textContent = passphrase;
 
     if (data.expires_at) {
       const d = new Date(data.expires_at * 1000);
@@ -717,6 +768,22 @@ document.getElementById('create-copy-btn').addEventListener('click', () => {
   }).catch(() => {
     const range = document.createRange();
     range.selectNodeContents(linkEl);
+    const sel = window.getSelection();
+    if (sel) { sel.removeAllRanges(); sel.addRange(range); }
+  });
+});
+
+document.getElementById('create-copy-passphrase-btn').addEventListener('click', () => {
+  const el = document.getElementById('create-passphrase-display');
+  const text = el.textContent;
+  if (!text) return;
+  navigator.clipboard.writeText(text).then(() => {
+    const btn = document.getElementById('create-copy-passphrase-btn');
+    btn.textContent = 'Copied!';
+    setTimeout(() => { btn.textContent = 'Copy'; }, 2000);
+  }).catch(() => {
+    const range = document.createRange();
+    range.selectNodeContents(el);
     const sel = window.getSelection();
     if (sel) { sel.removeAllRanges(); sel.addRange(range); }
   });

@@ -95,9 +95,49 @@ MAX_UPLOAD_BYTES = 100 * 1024 * 1024   # 100 MB per file
 MAX_FILENAME_LEN = 200                 # characters in the sanitised filename
 _SHARE_TOKEN_BYTES = 32                # 256-bit token → 43-char URL-safe base64
 
-# Room-create constants
-MAX_PASSCODE_LEN = 64                  # characters in a room passcode
+# Room-create / passcode constants
+MAX_PASSCODE_LEN = 64                  # characters in a room or share passcode
 MAX_DESTRUCT_MINUTES = 1440            # 24 hours maximum
+
+# Minimal HTML gate page returned when a share-download requires a passcode.
+# {error} is replaced with either an empty string or an <p class="err">…</p> element.
+_PASSCODE_GATE_PAGE = """\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>secureChat — Enter Passcode</title>
+<style>
+*,*::before,*::after{{box-sizing:border-box;margin:0;padding:0}}
+body{{background:#0d0d0d;color:#e8e8e8;font-family:"Segoe UI",system-ui,sans-serif;
+      display:flex;align-items:center;justify-content:center;min-height:100vh;padding:1rem}}
+.card{{background:#1a1a1a;border:1px solid #2e2e2e;border-radius:12px;
+       padding:2rem 1.75rem;width:100%;max-width:380px}}
+h1{{font-size:1.2rem;margin-bottom:1rem}}
+label{{display:block;font-size:.85rem;color:#888;margin-bottom:.35rem}}
+input{{width:100%;padding:.65rem .75rem;background:#0d0d0d;border:1px solid #2e2e2e;
+       border-radius:8px;color:#e8e8e8;font-size:1rem;margin-bottom:1rem}}
+input:focus{{outline:none;border-color:#00c896}}
+button{{width:100%;padding:.65rem;background:#00c896;border:none;border-radius:8px;
+        color:#000;font-size:1rem;font-weight:700;cursor:pointer}}
+button:hover{{background:#00a87e}}
+.err{{color:#ff5555;font-size:.85rem;margin-bottom:.75rem}}
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>🔒 Passcode Required</h1>
+  <form method="POST">
+    <label for="pc">Enter the passcode to download this file:</label>
+    <input type="password" id="pc" name="passcode" autofocus required />
+    {error}
+    <button type="submit">Download File ↓</button>
+  </form>
+</div>
+</body>
+</html>
+"""
 
 # Onion address — admin sets this so generated invite links carry the .onion hostname
 ONION_ADDRESS: str | None = os.environ.get("ONION_ADDRESS")
@@ -475,6 +515,16 @@ async def share_upload_handler(request: web.Request) -> web.Response:
 
         await asyncio.to_thread(dest.write_bytes, b"".join(chunks))
 
+        # Optionally read the "passcode" field that follows the file
+        passcode = ""
+        try:
+            next_part = await reader.next()
+            if next_part is not None and next_part.name == "passcode":
+                raw = await next_part.read(decode=True)
+                passcode = raw.decode("utf-8", errors="replace")[:MAX_PASSCODE_LEN].strip()
+        except Exception:  # noqa: BLE001
+            pass
+
         token = secrets.token_urlsafe(_SHARE_TOKEN_BYTES)
         expires_at = time.time() + ttl_hours * 3600
         _share_slots[token] = {
@@ -482,8 +532,10 @@ async def share_upload_handler(request: web.Request) -> web.Response:
             "filename": filename,
             "size": total,
             "expires_at": expires_at,
+            "passcode_hash": _hash_passcode(passcode) if passcode else None,
         }
-        logger.info("share upload  file=%s  size=%d  ttl=%dh", filename, total, ttl_hours)
+        logger.info("share upload  file=%s  size=%d  ttl=%dh  passcode=%s",
+                    filename, total, ttl_hours, bool(passcode))
         return web.json_response(
             {
                 "download_url": f"/share/download/{token}",
@@ -502,7 +554,11 @@ async def share_upload_handler(request: web.Request) -> web.Response:
 
 
 async def share_download_handler(request: web.Request) -> web.StreamResponse:
-    """GET /share/download/{token} — one-time download; temp files destroyed afterwards."""
+    """GET /share/download/{token} — one-time download; temp files destroyed afterwards.
+
+    If the slot requires a passcode an HTML gate page is returned instead of the
+    file.  The user then submits the passcode via POST to the same URL.
+    """
     token = request.match_info["token"]
     slot = _share_slots.get(token)
 
@@ -514,8 +570,58 @@ async def share_download_handler(request: web.Request) -> web.StreamResponse:
         await asyncio.to_thread(_rmtree, slot["tmp_dir"])
         raise web.HTTPGone(reason="Download link has expired")
 
-    # Remove slot before streaming — one-time use
-    _share_slots.pop(token)
+    # If the slot is protected by a passcode, return the gate page without
+    # consuming the slot (so the user can try the passcode via POST).
+    if slot.get("passcode_hash"):
+        return web.Response(
+            body=_PASSCODE_GATE_PAGE.format(error=""),
+            content_type="text/html",
+        )
+
+    # No passcode — stream the file immediately (one-time).
+    return await _stream_share_file(token, slot, request)
+
+
+async def share_download_post_handler(request: web.Request) -> web.StreamResponse:
+    """POST /share/download/{token} — verify passcode and deliver the file once."""
+    token = request.match_info["token"]
+    slot = _share_slots.get(token)
+
+    if slot is None:
+        raise web.HTTPNotFound(reason="Link not found or already used")
+
+    if time.time() > slot["expires_at"]:
+        _share_slots.pop(token, None)
+        await asyncio.to_thread(_rmtree, slot["tmp_dir"])
+        raise web.HTTPGone(reason="Download link has expired")
+
+    # This endpoint only makes sense for passcode-protected slots.
+    if not slot.get("passcode_hash"):
+        raise web.HTTPMethodNotAllowed(method="POST", allowed_methods=["GET"])
+
+    # Read the submitted passcode from a standard URL-encoded form.
+    form = await request.post()
+    provided = str(form.get("passcode", "")).strip()
+    if not provided or _hash_passcode(provided) != slot["passcode_hash"]:
+        error_html = '<p class="err">❌ Wrong passcode. Please try again.</p>'
+        return web.Response(
+            body=_PASSCODE_GATE_PAGE.format(error=error_html),
+            content_type="text/html",
+            status=403,
+        )
+
+    # Correct passcode — stream the file (one-time).
+    return await _stream_share_file(token, slot, request)
+
+
+async def _stream_share_file(
+    token: str,
+    slot: dict,
+    request: web.Request,
+) -> web.StreamResponse:
+    """Pop *token* from _share_slots, stream the file, then delete the temp dir."""
+    # Remove slot before streaming — guarantees one-time use even on concurrent requests.
+    _share_slots.pop(token, None)
     tmp_dir: Path = slot["tmp_dir"]
     filename: str = slot["filename"]
     size: int = slot["size"]
@@ -682,6 +788,7 @@ def build_app(db_path: Path | None = None) -> web.Application:
     app.router.add_get("/api/server-info", server_info_handler)
     app.router.add_post("/share/upload", share_upload_handler)
     app.router.add_get("/share/download/{token}", share_download_handler)
+    app.router.add_post("/share/download/{token}", share_download_post_handler)
     app.router.add_static("/static", STATIC_DIR, show_index=False)
     return app
 

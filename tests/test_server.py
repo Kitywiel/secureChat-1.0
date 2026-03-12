@@ -528,6 +528,117 @@ async def test_share_ttl_clamped(ws_client) -> None:
     assert body_high["expires_at"] <= time.time() + 24 * 3600 + _EXPIRY_TOLERANCE_S
 
 
+# ─── File-share passcode tests ────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_share_upload_with_passcode_stores_hash(ws_client) -> None:
+    """Upload with a passcode field stores a passcode_hash in the slot."""
+    data = aiohttp.FormData()
+    data.add_field("file", b"protected content", filename="secret.txt",
+                   content_type="text/plain")
+    data.add_field("passcode", "hunter2")
+    resp = await ws_client.post("/share/upload?ttl=1", data=data)
+    assert resp.status == 200
+    body = await resp.json()
+    token = body["download_url"].rsplit("/", 1)[-1]
+    slot = _share_slots[token]
+    assert slot["passcode_hash"] is not None
+    assert slot["passcode_hash"] == _hash_passcode("hunter2")
+
+
+@pytest.mark.asyncio
+async def test_share_download_passcode_required_returns_gate_page(ws_client) -> None:
+    """GET on a passcode-protected slot returns an HTML gate page (slot not consumed)."""
+    data = aiohttp.FormData()
+    data.add_field("file", b"gated", filename="gated.txt", content_type="text/plain")
+    data.add_field("passcode", "s3cr3t")
+    upload_resp = await ws_client.post("/share/upload?ttl=1", data=data)
+    body = await upload_resp.json()
+    url = body["download_url"]
+
+    gate_resp = await ws_client.get(url)
+    assert gate_resp.status == 200
+    ct = gate_resp.headers.get("Content-Type", "")
+    assert "text/html" in ct
+    html = await gate_resp.text()
+    assert "passcode" in html.lower() or "Passcode" in html
+
+    # Slot must still exist — the GET must not consume it
+    token = url.rsplit("/", 1)[-1]
+    assert token in _share_slots
+
+
+@pytest.mark.asyncio
+async def test_share_download_post_wrong_passcode_returns_403(ws_client) -> None:
+    """POST with wrong passcode returns HTTP 403 and does not consume the slot."""
+    data = aiohttp.FormData()
+    data.add_field("file", b"wrong", filename="w.txt", content_type="text/plain")
+    data.add_field("passcode", "correct")
+    upload_resp = await ws_client.post("/share/upload?ttl=1", data=data)
+    body = await upload_resp.json()
+    url = body["download_url"]
+    token = url.rsplit("/", 1)[-1]
+
+    resp = await ws_client.post(url, data={"passcode": "wrong"})
+    assert resp.status == 403
+    # Slot must still be there
+    assert token in _share_slots
+
+
+@pytest.mark.asyncio
+async def test_share_download_post_correct_passcode_delivers_file(ws_client) -> None:
+    """POST with correct passcode streams the file and consumes the slot."""
+    content = b"super secret bytes"
+    data = aiohttp.FormData()
+    data.add_field("file", content, filename="p.bin",
+                   content_type="application/octet-stream")
+    data.add_field("passcode", "mypass")
+    upload_resp = await ws_client.post("/share/upload?ttl=1", data=data)
+    body = await upload_resp.json()
+    url = body["download_url"]
+
+    dl_resp = await ws_client.post(url, data={"passcode": "mypass"})
+    assert dl_resp.status == 200
+    downloaded = await dl_resp.read()
+    assert downloaded == content
+
+    # One-time: slot consumed
+    token = url.rsplit("/", 1)[-1]
+    assert token not in _share_slots
+
+
+@pytest.mark.asyncio
+async def test_share_download_post_one_time(ws_client) -> None:
+    """A second POST with the correct passcode returns 404 (slot already consumed)."""
+    data = aiohttp.FormData()
+    data.add_field("file", b"x", filename="x.txt", content_type="text/plain")
+    data.add_field("passcode", "pass")
+    upload_resp = await ws_client.post("/share/upload?ttl=1", data=data)
+    body = await upload_resp.json()
+    url = body["download_url"]
+
+    resp1 = await ws_client.post(url, data={"passcode": "pass"})
+    assert resp1.status == 200
+    await resp1.read()
+
+    resp2 = await ws_client.post(url, data={"passcode": "pass"})
+    assert resp2.status == 404
+
+
+@pytest.mark.asyncio
+async def test_share_download_no_passcode_still_works_via_get(ws_client) -> None:
+    """Files without passcode continue to be served via GET as before."""
+    content = b"no password needed"
+    data = aiohttp.FormData()
+    data.add_field("file", content, filename="open.txt", content_type="text/plain")
+    upload_resp = await ws_client.post("/share/upload?ttl=1", data=data)
+    body = await upload_resp.json()
+
+    resp = await ws_client.get(body["download_url"])
+    assert resp.status == 200
+    assert await resp.read() == content
+
+
 # ─── Room-meta helpers ────────────────────────────────────────────────────────
 
 @pytest.fixture(autouse=True)

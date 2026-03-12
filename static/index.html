@@ -141,7 +141,7 @@
 
             <label for="create-passphrase">
               Encryption Passphrase
-              <span class="hint"> — auto-generated, included in the invite link</span>
+              <span class="hint"> — auto-generated; share this separately with your contact</span>
             </label>
             <div class="gen-row">
               <input
@@ -204,6 +204,13 @@
             <code id="create-invite-link" class="share-link"></code>
             <button type="button" id="create-copy-btn" class="btn-copy">Copy</button>
           </div>
+          <p class="share-result-label" style="margin-top:1rem">
+            🔑 Passphrase — <strong>share this separately</strong> (NOT in the link):
+          </p>
+          <div class="share-link-row">
+            <code id="create-passphrase-display" class="share-link"></code>
+            <button type="button" id="create-copy-passphrase-btn" class="btn-copy">Copy</button>
+          </div>
           <p id="create-expiry" class="notice"></p>
           <button type="button" id="create-join-btn">
             Join This Room →
@@ -241,6 +248,28 @@
               <option value="24">24 hours</option>
             </select>
 
+            <div class="checkbox-row">
+              <input type="checkbox" id="share-passcode-check" />
+              <label for="share-passcode-check">Protect with a passcode</label>
+            </div>
+
+            <div id="share-passcode-row" class="gen-row hidden">
+              <input
+                type="text"
+                id="share-passcode"
+                placeholder="Passcode"
+                autocomplete="off"
+                spellcheck="false"
+                maxlength="64"
+              />
+              <button
+                type="button"
+                id="refresh-share-passcode-btn"
+                class="btn-icon"
+                title="Generate new passcode"
+              >↻</button>
+            </div>
+
             <div id="share-error" class="field-error" aria-live="polite"></div>
 
             <button type="submit" id="share-btn">Upload &amp; Generate Link</button>
@@ -252,6 +281,15 @@
           <div class="share-link-row">
             <code id="share-link" class="share-link"></code>
             <button type="button" id="share-copy-btn" class="btn-copy">Copy</button>
+          </div>
+          <div id="share-passcode-result" class="hidden">
+            <p class="share-result-label" style="margin-top:1rem">
+              🔒 Passcode — <strong>share this with the recipient:</strong>
+            </p>
+            <div class="share-link-row">
+              <code id="share-result-passcode" class="share-link"></code>
+              <button type="button" id="share-copy-passcode-btn" class="btn-copy">Copy</button>
+            </div>
           </div>
           <p id="share-expiry" class="notice"></p>
           <button type="button" id="share-again-btn" class="btn-secondary">
