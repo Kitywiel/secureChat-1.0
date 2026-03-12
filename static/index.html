@@ -81,16 +81,15 @@
       <main id="messages" class="messages" role="log" aria-live="polite"></main>
 
       <form id="message-form" class="message-bar">
-        <input
-          type="text"
+        <textarea
           id="message-input"
-          placeholder="Type a message…"
+          placeholder="Type a message… (Enter to send, Shift+Enter for new line)"
           maxlength="2048"
           autocomplete="off"
           spellcheck="true"
           aria-label="Message"
-        />
-        <button type="submit" id="send-btn">Send</button>
+          rows="1"
+        ></textarea>
       </form>
     </div>
 

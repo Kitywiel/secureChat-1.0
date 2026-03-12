@@ -294,29 +294,29 @@ button[type="submit"]:disabled {
   flex-shrink: 0;
 }
 
-.message-bar input {
+.message-bar textarea {
   flex: 1;
-}
-
-.message-bar button {
-  background: var(--accent);
-  border: none;
+  resize: none;
+  min-height: 2.4rem;
+  max-height: 10rem;
+  overflow-y: auto;
+  line-height: 1.4;
+  padding: 0.5rem 0.75rem;
+  background: var(--bg);
+  border: 1px solid var(--border);
   border-radius: 7px;
-  padding: 0.6rem 1.1rem;
-  color: #000;
+  color: var(--text);
   font-size: 0.95rem;
-  font-weight: 700;
   font-family: var(--font);
-  cursor: pointer;
-  transition: background 0.15s;
-  white-space: nowrap;
+  outline: none;
+  transition: border-color 0.15s;
 }
 
-.message-bar button:hover {
-  background: var(--accent-hover);
+.message-bar textarea:focus {
+  border-color: var(--accent);
 }
 
-.message-bar button:disabled {
+.message-bar textarea:disabled {
   opacity: 0.4;
   cursor: not-allowed;
 }

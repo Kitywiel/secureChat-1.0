@@ -238,7 +238,7 @@ function connectWs(roomId) {
 
   ws.addEventListener('close', () => {
     appendMessage('', 'Disconnected from room.', 'system');
-    document.getElementById('send-btn').disabled = true;
+    document.getElementById('message-input').disabled = true;
   });
 
   ws.addEventListener('error', () => {
@@ -296,7 +296,7 @@ document.getElementById('join-form').addEventListener('submit', async (e) => {
 
   displayName = name.slice(0, 32);
   document.getElementById('room-label').textContent = `🔒 ${roomId}`;
-  document.getElementById('send-btn').disabled = false;
+  document.getElementById('message-input').disabled = false;
 
   showScreen('chat');
   document.getElementById('message-input').focus();
@@ -309,18 +309,34 @@ document.getElementById('join-form').addEventListener('submit', async (e) => {
 document.getElementById('message-form').addEventListener('submit', async (e) => {
   e.preventDefault();
 
-  const input = /** @type {HTMLInputElement} */ (document.getElementById('message-input'));
+  const input = /** @type {HTMLTextAreaElement} */ (document.getElementById('message-input'));
   const text = input.value.trim();
 
   if (!text || !roomKey || !ws || ws.readyState !== WebSocket.OPEN) return;
 
   input.value = '';
+  input.style.height = 'auto';
 
   const { iv, ciphertext } = await encryptMessage(roomKey, text);
   ws.send(JSON.stringify({ type: 'message', iv, ciphertext, sender: displayName }));
 
   // Show own message immediately without waiting for relay echo.
   appendMessage(displayName, text, 'outgoing');
+});
+
+// Enter sends; Shift+Enter inserts a newline.
+document.getElementById('message-input').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    document.getElementById('message-form').dispatchEvent(new Event('submit', { cancelable: true }));
+  }
+});
+
+// Auto-resize textarea as the user types.
+document.getElementById('message-input').addEventListener('input', (e) => {
+  const textarea = /** @type {HTMLTextAreaElement} */ (e.target);
+  textarea.style.height = 'auto';
+  textarea.style.height = `${textarea.scrollHeight}px`;
 });
 
 document.getElementById('leave-btn').addEventListener('click', () => {
