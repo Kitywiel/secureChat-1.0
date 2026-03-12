@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self' ws: wss:; img-src 'none'; object-src 'none';"
+    />
+    <title>secureChat</title>
+    <link rel="stylesheet" href="/static/style.css" />
+  </head>
+  <body>
+    <!-- ── Lobby ─────────────────────────────────────────────────────── -->
+    <div id="lobby" class="screen">
+      <div class="card">
+        <h1>🔒 secureChat</h1>
+        <p class="subtitle">
+          End-to-end encrypted. The server only routes ciphertext — it never
+          sees your messages.
+        </p>
+
+        <form id="join-form" novalidate>
+          <label for="display-name">Display Name</label>
+          <input
+            type="text"
+            id="display-name"
+            placeholder="Anonymous"
+            maxlength="32"
+            autocomplete="off"
+            spellcheck="false"
+          />
+
+          <label for="room-id">
+            Room ID
+            <span class="hint"> — alphanumeric, hyphens, underscores</span>
+          </label>
+          <input
+            type="text"
+            id="room-id"
+            placeholder="my-secret-room"
+            required
+            maxlength="64"
+            pattern="[A-Za-z0-9_\-]+"
+            autocomplete="off"
+            spellcheck="false"
+          />
+
+          <label for="passphrase">
+            Passphrase
+            <span class="hint"> — shared secret used to derive the key</span>
+          </label>
+          <input
+            type="password"
+            id="passphrase"
+            placeholder="Strong shared passphrase"
+            required
+            autocomplete="new-password"
+          />
+
+          <div id="join-error" class="field-error" aria-live="polite"></div>
+
+          <button type="submit" id="join-btn">Join Room →</button>
+        </form>
+
+        <p class="notice">
+          ⚠️ Both parties must use the <strong>same Room ID</strong> and
+          <strong>same Passphrase</strong> to communicate.
+        </p>
+      </div>
+    </div>
+
+    <!-- ── Chat ──────────────────────────────────────────────────────── -->
+    <div id="chat" class="screen hidden">
+      <header class="chat-header">
+        <span id="room-label" class="room-label"></span>
+        <span id="user-count" class="user-count">👤 1</span>
+        <button id="leave-btn" type="button">Leave</button>
+      </header>
+
+      <main id="messages" class="messages" role="log" aria-live="polite"></main>
+
+      <form id="message-form" class="message-bar">
+        <textarea
+          id="message-input"
+          placeholder="Type a message… (Enter to send, Shift+Enter for new line)"
+          maxlength="2048"
+          autocomplete="off"
+          spellcheck="true"
+          aria-label="Message"
+          rows="1"
+        ></textarea>
+        <button type="submit" id="send-btn" aria-label="Send message">↑</button>
+      </form>
+    </div>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>
