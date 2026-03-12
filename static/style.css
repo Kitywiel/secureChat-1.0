@@ -321,6 +321,36 @@ button[type="submit"]:disabled {
   cursor: not-allowed;
 }
 
+.message-bar button {
+  flex-shrink: 0;
+  align-self: flex-end;
+  width: 2.4rem;
+  height: 2.4rem;
+  background: var(--accent);
+  border: none;
+  border-radius: 50%;
+  color: #000;
+  font-size: 1.1rem;
+  font-weight: 700;
+  font-family: var(--font);
+  cursor: pointer;
+  transition: background 0.15s, opacity 0.15s;
+  line-height: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+}
+
+.message-bar button:hover {
+  background: var(--accent-hover);
+}
+
+.message-bar button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
 /* ── Responsive ────────────────────────────────────────────────────────────── */
 @media (max-width: 480px) {
   .card {

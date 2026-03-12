@@ -239,6 +239,7 @@ function connectWs(roomId) {
   ws.addEventListener('close', () => {
     appendMessage('', 'Disconnected from room.', 'system');
     document.getElementById('message-input').disabled = true;
+    document.getElementById('send-btn').disabled = true;
   });
 
   ws.addEventListener('error', () => {
@@ -297,6 +298,7 @@ document.getElementById('join-form').addEventListener('submit', async (e) => {
   displayName = name.slice(0, 32);
   document.getElementById('room-label').textContent = `🔒 ${roomId}`;
   document.getElementById('message-input').disabled = false;
+  document.getElementById('send-btn').disabled = false;
 
   showScreen('chat');
   document.getElementById('message-input').focus();
