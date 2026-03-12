@@ -64,11 +64,47 @@ if sys.version_info < (3, 9):
 # ---------------------------------------------------------------------------
 # Logging — never log message payloads.
 # ---------------------------------------------------------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)-8s  %(message)s",
+
+class _ColourFormatter(logging.Formatter):
+    """Apply ANSI colour codes when stderr is a TTY.
+
+    Green  — creation events (room/upload created, server starting)
+    Yellow — user-join events
+    Red    — deletion / expiry / error events
+    """
+
+    _GREEN  = "\x1b[32m"
+    _YELLOW = "\x1b[33m"
+    _RED    = "\x1b[31m"
+    _RESET  = "\x1b[0m"
+
+    # Sub-strings matched (lower-cased) against the formatted message
+    _CREATION = frozenset(["room created", "share upload", "database ready", "securechat starting"])
+    _DELETION = frozenset(["room deleted", "room self-destructed", "cleaned up", "expired"])
+    _JOINED   = frozenset(["peer joined"])
+
+    def format(self, record: logging.LogRecord) -> str:
+        msg = super().format(record)
+        # Only colour output when writing to a real terminal
+        if not getattr(sys.stderr, "isatty", lambda: False)():
+            return msg
+        text = record.getMessage().lower()
+        if record.levelno >= logging.WARNING or any(kw in text for kw in self._DELETION):
+            return f"{self._RED}{msg}{self._RESET}"
+        if any(kw in text for kw in self._CREATION):
+            return f"{self._GREEN}{msg}{self._RESET}"
+        if any(kw in text for kw in self._JOINED):
+            return f"{self._YELLOW}{msg}{self._RESET}"
+        return msg
+
+
+_log_handler = logging.StreamHandler()
+_log_handler.setFormatter(_ColourFormatter(
+    fmt="%(asctime)s  %(levelname)-8s  %(message)s",
     datefmt="%Y-%m-%dT%H:%M:%SZ",
-)
+))
+logging.root.setLevel(logging.INFO)
+logging.root.addHandler(_log_handler)
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -93,6 +129,11 @@ MAX_ROOM_ID_LEN = 64
 MAX_DISPLAY_NAME_LEN = 32
 MAX_IV_LEN = 24          # 12 raw bytes → 16 base64 chars; 24 allows padding variants
 MAX_CIPHERTEXT_LEN = 8192  # ~6 KiB plaintext after base64 expansion
+
+# In-chat file/image relay limits (files are never persisted)
+MAX_FILE_CIPHERTEXT_LEN = 1_500_000  # base64+AES-GCM limit; ≈1 MiB plaintext before encoding
+MAX_MIME_LEN = 64                    # characters in a MIME type string
+MAX_CHAT_FILENAME_LEN = 200          # characters in an in-chat attachment filename
 
 # File-share constants
 MAX_UPLOAD_BYTES = 100 * 1024 * 1024   # 100 MB per file
@@ -409,6 +450,29 @@ async def ws_handler(request: web.Request) -> web.WebSocketResponse:
                     }
                 )
                 # Relay to all other peers; sender renders its own message locally.
+                await _broadcast_to_room(room_id, relay, exclude=ws)
+
+            # ── file (in-chat attachment) ──────────────────────────────────
+            elif msg_type == "file" and room_id is not None:
+                iv         = str(data.get("iv", ""))
+                ciphertext = str(data.get("ciphertext", ""))
+                sender     = str(data.get("sender", ""))[:MAX_DISPLAY_NAME_LEN]
+                filename   = str(data.get("filename", "file"))[:MAX_CHAT_FILENAME_LEN]
+                mime       = str(data.get("mime", "application/octet-stream"))[:MAX_MIME_LEN]
+
+                # Reject obviously malformed or oversized payloads.
+                # File attachments are never persisted — always ephemeral.
+                if len(iv) > MAX_IV_LEN or len(ciphertext) > MAX_FILE_CIPHERTEXT_LEN:
+                    continue
+
+                relay = json.dumps({
+                    "type": "file",
+                    "iv": iv,
+                    "ciphertext": ciphertext,
+                    "filename": filename,
+                    "mime": mime,
+                    "sender": sender,
+                })
                 await _broadcast_to_room(room_id, relay, exclude=ws)
 
     finally:

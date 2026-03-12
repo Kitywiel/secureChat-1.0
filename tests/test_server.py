@@ -40,6 +40,7 @@ from server import (
     rooms,
     save_message,
     HISTORY_LIMIT,
+    MAX_FILE_CIPHERTEXT_LEN,
 )
 
 
@@ -896,3 +897,132 @@ async def test_qrcode_no_cache_header(ws_client) -> None:
     resp = await ws_client.get("/api/qrcode?data=test")
     assert resp.status == 200
     assert "no-store" in resp.headers.get("Cache-Control", "")
+
+
+# ─── In-chat file relay ───────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_ws_file_relayed_to_other_peer(ws_client) -> None:
+    """A type:'file' message sent by one peer is relayed to the other."""
+    import asyncio
+    async with ws_client.ws_connect("/ws") as ws1:
+        await ws1.send_str(json.dumps({"type": "join", "room": "file-room"}))
+        await ws1.receive_json(timeout=2)  # system
+
+        async with ws_client.ws_connect("/ws") as ws2:
+            await ws2.send_str(json.dumps({"type": "join", "room": "file-room"}))
+            await ws1.receive_json(timeout=2)  # system broadcast
+            await ws2.receive_json(timeout=2)  # system broadcast
+
+            file_msg = {
+                "type": "file",
+                "iv": "aGVsbG93b3JsZA==",
+                "ciphertext": "c2VjcmV0",
+                "filename": "test.png",
+                "mime": "image/png",
+                "sender": "Alice",
+            }
+            await ws1.send_str(json.dumps(file_msg))
+
+            relay = await asyncio.wait_for(ws2.receive_json(), timeout=2)
+            assert relay["type"] == "file"
+            assert relay["filename"] == "test.png"
+            assert relay["mime"] == "image/png"
+            assert relay["ciphertext"] == "c2VjcmV0"
+            assert relay["sender"] == "Alice"
+
+
+@pytest.mark.asyncio
+async def test_ws_file_not_echoed_to_sender(ws_client) -> None:
+    """The sender must not receive its own file relay."""
+    import asyncio
+    async with ws_client.ws_connect("/ws") as ws1:
+        await ws1.send_str(json.dumps({"type": "join", "room": "file-echo"}))
+        await ws1.receive_json(timeout=2)
+
+        await ws1.send_str(json.dumps({
+            "type": "file",
+            "iv": "aGVsbG93b3JsZA==",
+            "ciphertext": "c2VjcmV0",
+            "filename": "test.png",
+            "mime": "image/png",
+            "sender": "Bob",
+        }))
+
+        try:
+            extra = await asyncio.wait_for(ws1.receive_json(), timeout=0.3)
+            assert extra["type"] != "file", "Sender should not receive its own file relay"
+        except asyncio.TimeoutError:
+            pass  # expected
+
+
+@pytest.mark.asyncio
+async def test_ws_file_oversized_is_dropped(ws_client) -> None:
+    """A file message whose ciphertext exceeds MAX_FILE_CIPHERTEXT_LEN is silently dropped."""
+    import asyncio
+    async with ws_client.ws_connect("/ws") as ws1:
+        await ws1.send_str(json.dumps({"type": "join", "room": "file-big"}))
+        await ws1.receive_json(timeout=2)
+
+        async with ws_client.ws_connect("/ws") as ws2:
+            await ws2.send_str(json.dumps({"type": "join", "room": "file-big"}))
+            await ws1.receive_json(timeout=2)
+            await ws2.receive_json(timeout=2)
+
+            # Send an oversized payload
+            await ws1.send_str(json.dumps({
+                "type": "file",
+                "iv": "aGVsbG93b3JsZA==",
+                "ciphertext": "x" * (MAX_FILE_CIPHERTEXT_LEN + 1),
+                "filename": "huge.bin",
+                "mime": "application/octet-stream",
+                "sender": "Eve",
+            }))
+
+            try:
+                msg = await asyncio.wait_for(ws2.receive_json(), timeout=0.4)
+                assert msg["type"] != "file", "Oversized file should not be relayed"
+            except asyncio.TimeoutError:
+                pass  # expected — nothing relayed
+
+
+@pytest.mark.asyncio
+async def test_ws_file_not_persisted_even_with_passcode(ws_client) -> None:
+    """File messages must never be stored in the database."""
+    _room_meta["file-persist-test"] = {
+        "passcode_hash": _hash_passcode("pass"),
+        "expires_at": None,
+    }
+    async with ws_client.ws_connect("/ws") as ws1:
+        await ws1.send_str(json.dumps({
+            "type": "join", "room": "file-persist-test", "passcode": "pass",
+        }))
+        await ws1.receive_json(timeout=2)  # system
+
+        await ws1.send_str(json.dumps({
+            "type": "file",
+            "iv": "aGVsbG93b3JsZA==",
+            "ciphertext": "c2VjcmV0",
+            "filename": "img.png",
+            "mime": "image/png",
+            "sender": "Alice",
+        }))
+
+    # A second client joining should NOT receive any history containing file data
+    import asyncio
+    async with ws_client.ws_connect("/ws") as ws2:
+        await ws2.send_str(json.dumps({
+            "type": "join", "room": "file-persist-test", "passcode": "pass",
+        }))
+        messages = []
+        for _ in range(3):
+            try:
+                m = await asyncio.wait_for(ws2.receive_json(), timeout=0.4)
+                messages.append(m)
+            except asyncio.TimeoutError:
+                break
+
+        for m in messages:
+            if m["type"] == "history":
+                for stored in m.get("messages", []):
+                    assert stored.get("type") != "file", "File messages must not be persisted"

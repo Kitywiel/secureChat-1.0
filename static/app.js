@@ -111,6 +111,134 @@ function base64ToBuf(b64) {
   return Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
 }
 
+// ─── File encryption helpers ─────────────────────────────────────────────────
+
+/**
+ * Encrypt raw bytes with AES-GCM.
+ * @param {CryptoKey} key
+ * @param {Uint8Array} bytes
+ * @returns {Promise<{iv: string, ciphertext: string}>} Base64-encoded pair.
+ */
+async function encryptFile(key, bytes) {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const cipherBuf = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, bytes);
+  return {
+    iv: bufToBase64(iv),
+    ciphertext: bufToBase64(new Uint8Array(cipherBuf)),
+  };
+}
+
+/**
+ * Decrypt a base64 AES-GCM ciphertext back to raw bytes.
+ * Returns null on failure.
+ * @param {CryptoKey} key
+ * @param {string} ivB64
+ * @param {string} ciphertextB64
+ * @returns {Promise<Uint8Array|null>}
+ */
+async function decryptFile(key, ivB64, ciphertextB64) {
+  try {
+    const iv = base64ToBuf(ivB64);
+    const ciphertext = base64ToBuf(ciphertextB64);
+    const plainBuf = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, ciphertext);
+    return new Uint8Array(plainBuf);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Append a file or image bubble to the chat log.
+ * Images (png/jpeg/gif/webp) are shown inline; all other types as a download link.
+ *
+ * @param {string}     sender
+ * @param {string}     filename
+ * @param {string}     mime
+ * @param {Uint8Array} bytes     Decrypted file bytes
+ * @param {'outgoing'|'incoming'} kind
+ * @param {number|null} [timestamp]
+ */
+function appendFileMessage(sender, filename, mime, bytes, kind, timestamp = null) {
+  const log = document.getElementById('messages');
+  const el  = document.createElement('div');
+  el.className = 'message ' + kind;
+
+  // Header row (sender + timestamp)
+  const headerEl = document.createElement('div');
+  headerEl.className = 'msg-header';
+  const senderEl = document.createElement('span');
+  senderEl.className = 'sender';
+  senderEl.textContent = sender;
+  const timeEl = document.createElement('time');
+  timeEl.className = 'timestamp';
+  const d = timestamp !== null ? new Date(timestamp * 1000) : new Date();
+  timeEl.dateTime = d.toISOString();
+  timeEl.textContent = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  headerEl.appendChild(senderEl);
+  headerEl.appendChild(timeEl);
+  el.appendChild(headerEl);
+
+  // Only render as <img> for well-known safe image formats to avoid SVG scripts etc.
+  const blob = new Blob([bytes], { type: mime });
+  const url  = URL.createObjectURL(blob);
+
+  if (SAFE_IMAGE_MIMES.has(mime)) {
+    const img = document.createElement('img');
+    img.className = 'message-img';
+    img.src   = url;
+    img.alt   = filename;
+    img.title = filename;
+    img.addEventListener('click', () => window.open(url, '_blank'));
+    el.appendChild(img);
+  } else {
+    const a = document.createElement('a');
+    a.className  = 'message-file';
+    a.href       = url;
+    a.download   = filename;
+    a.textContent = `📎 ${filename}`;
+    el.appendChild(a);
+  }
+
+  log.appendChild(el);
+  log.scrollTop = log.scrollHeight;
+}
+
+/** Maximum in-chat attachment size in bytes (1 MiB = 1 048 576 bytes). */
+const MAX_CHAT_FILE_BYTES = 1_048_576;
+
+/**
+ * Safe image MIME types rendered inline as <img>.
+ * Other formats (SVG, HTML, etc.) are shown as download links to prevent
+ * script execution from embedded content.
+ */
+const SAFE_IMAGE_MIMES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp']);
+
+/**
+ * Encrypt and send a file over the current WebSocket connection.
+ * Shows the file locally (outgoing) immediately without waiting for relay echo.
+ *
+ * @param {File} file
+ */
+async function sendFile(file) {
+  if (!roomKey || !ws || ws.readyState !== WebSocket.OPEN) return;
+
+  if (file.size > MAX_CHAT_FILE_BYTES) {
+    appendMessage('⚠️', `File too large — max 1 MB per attachment (${file.name})`, 'error');
+    return;
+  }
+
+  const mime     = file.type || 'application/octet-stream';
+  const filename = file.name || 'file';
+  const bytes    = new Uint8Array(await file.arrayBuffer());
+
+  const { iv, ciphertext } = await encryptFile(roomKey, bytes);
+
+  ws.send(JSON.stringify({ type: 'file', iv, ciphertext, filename, mime, sender: displayName }));
+
+  // Render own attachment immediately
+  appendFileMessage(displayName, filename, mime, bytes, 'outgoing');
+}
+
 // ─── UI helpers ───────────────────────────────────────────────────────────────
 
 /** Show one screen, hide the rest. */
@@ -325,6 +453,20 @@ function connectWs(roomId) {
         );
       }
 
+    } else if (data.type === 'file') {
+      const bytes = await decryptFile(roomKey, data.iv, data.ciphertext);
+      if (bytes !== null) {
+        appendFileMessage(
+          data.sender || 'Unknown',
+          data.filename || 'file',
+          data.mime || 'application/octet-stream',
+          bytes,
+          'incoming',
+        );
+      } else {
+        appendMessage('⚠️', '[File could not be decrypted — wrong passphrase?]', 'error');
+      }
+
     } else if (data.type === 'destruct_info') {
       // Server told us this room has a self-destruct deadline
       startDestructTimer(data.expires_at);
@@ -337,6 +479,7 @@ function connectWs(roomId) {
       appendMessage('', '💣 Room has self-destructed. All messages have been deleted.', 'system');
       document.getElementById('message-input').disabled = true;
       document.getElementById('send-btn').disabled = true;
+      document.getElementById('attach-btn').disabled = true;
 
     } else if (data.type === 'error') {
       const reason = data.reason || 'unknown';
@@ -353,6 +496,7 @@ function connectWs(roomId) {
     appendMessage('', 'Disconnected from room.', 'system');
     document.getElementById('message-input').disabled = true;
     document.getElementById('send-btn').disabled = true;
+    document.getElementById('attach-btn').disabled = true;
   });
 
   ws.addEventListener('error', () => {
@@ -378,6 +522,7 @@ function enterRoom(roomId, key, name, passcode) {
   document.getElementById('room-label').textContent = `🔒 ${roomId}`;
   document.getElementById('message-input').disabled = false;
   document.getElementById('send-btn').disabled = false;
+  document.getElementById('attach-btn').disabled = false;
   showScreen('chat');
   document.getElementById('message-input').focus();
   connectWs(roomId);
@@ -478,6 +623,45 @@ document.getElementById('leave-btn').addEventListener('click', () => {
   document.getElementById('messages').innerHTML = '';
   document.getElementById('join-form').reset();
   document.getElementById('join-error').textContent = '';
+  document.getElementById('attach-btn').disabled = true;
+});
+
+// ─── In-chat file / image attachments ────────────────────────────────────────
+
+// Clicking the 📎 button opens the hidden file picker.
+document.getElementById('attach-btn').addEventListener('click', () => {
+  document.getElementById('chat-file-input').click();
+});
+
+// File chosen via the picker — send each selected file.
+document.getElementById('chat-file-input').addEventListener('change', async (e) => {
+  const input = /** @type {HTMLInputElement} */ (e.target);
+  if (!input.files?.length) return;
+  for (const file of input.files) {
+    await sendFile(file);
+  }
+  input.value = ''; // reset so the same file can be re-selected
+});
+
+// Paste from clipboard — intercept image/file items and send them as attachments
+// without inserting anything into the textarea.
+document.getElementById('message-input').addEventListener('paste', async (e) => {
+  const items = e.clipboardData?.items;
+  if (!items) return;
+  /** @type {File[]} */
+  const files = [];
+  for (const item of items) {
+    if (item.kind === 'file') {
+      const file = item.getAsFile();
+      if (file) files.push(file);
+    }
+  }
+  if (files.length > 0) {
+    e.preventDefault(); // don't paste binary data as text
+    for (const file of files) {
+      await sendFile(file);
+    }
+  }
 });
 
 // ─── Share Files ──────────────────────────────────────────────────────────────

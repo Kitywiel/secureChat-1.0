@@ -102,6 +102,8 @@
       <main id="messages" class="messages" role="log" aria-live="polite"></main>
 
       <form id="message-form" class="message-bar">
+        <input type="file" id="chat-file-input" multiple style="display:none" aria-hidden="true" />
+        <button type="button" id="attach-btn" class="btn-attach" aria-label="Attach file" disabled>📎</button>
         <textarea
           id="message-input"
           placeholder="Type a message… (Enter to send, Shift+Enter for new line)"
