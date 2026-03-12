@@ -24,7 +24,10 @@ Browser A                    Server (relay)                 Browser B
 * **The server never has your key** — it only routes `{iv, ciphertext,
   displayName}` tuples.  Even if the server is compromised, message content
   remains private.
-* **No persistence** — messages are never written to disk.
+* **Persistent history** — the server stores encrypted messages in a local
+  SQLite database.  When you (re)join a room, the last 100 messages are
+  replayed and decrypted in your browser — so you can catch up after a server
+  restart or after closing the tab.
 
 ---
 
@@ -47,10 +50,12 @@ By default the server listens on `127.0.0.1:5000`.  Open
 
 Environment variables:
 
-| Variable | Default       | Description               |
-|----------|---------------|---------------------------|
-| `HOST`   | `127.0.0.1`   | Interface to bind          |
-| `PORT`   | `5000`        | TCP port                  |
+| Variable        | Default            | Description                                     |
+|-----------------|--------------------|-------------------------------------------------|
+| `HOST`          | `127.0.0.1`        | Interface to bind                               |
+| `PORT`          | `5000`             | TCP port                                        |
+| `DB_PATH`       | `./securechat.db`  | Path to the SQLite message store                |
+| `HISTORY_LIMIT` | `100`              | Max messages stored and replayed per room       |
 
 ---
 
@@ -115,7 +120,8 @@ pytest tests/
 | Threat                            | Mitigation                                          |
 |-----------------------------------|-----------------------------------------------------|
 | Server reads messages             | Server only sees ciphertext; key never leaves client|
-| Server logs traffic               | No message persistence; access log disabled         |
+| Server reads stored history       | SQLite stores only ciphertext; server cannot decrypt|
+| Server logs traffic               | Access log disabled                                 |
 | Weak passphrase                   | PBKDF2-SHA-256, 600 000 iterations                  |
 | IV reuse                          | Fresh `crypto.getRandomValues(12 bytes)` per message|
 | XSS via display names / messages  | All text set via `textContent`, never `innerHTML`   |

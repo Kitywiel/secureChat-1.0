@@ -2,10 +2,11 @@
 """
 secureChat — end-to-end encrypted chat relay server.
 
-The server acts as a dumb relay: it routes encrypted payloads between
-WebSocket peers inside the same room.  It never has access to plaintext;
-all encryption and decryption happens in the client browser using the
-Web Crypto API.
+The server acts as a relay: it routes encrypted payloads between WebSocket
+peers inside the same room and persists them in a local SQLite database so
+that the message history survives server restarts.  It never has access to
+plaintext; all encryption and decryption happens in the client browser using
+the Web Crypto API.
 
 Usage
 -----
@@ -13,6 +14,13 @@ Usage
     python server.py                        # listens on 127.0.0.1:5000
     PORT=8080 python server.py              # custom port
     HOST=0.0.0.0 PORT=8080 python server.py # bind all interfaces
+
+Environment variables
+---------------------
+    DB_PATH        Path to the SQLite database file (default: securechat.db
+                   next to server.py)
+    HISTORY_LIMIT  Number of messages to store and replay per room
+                   (default: 100)
 
 OnionShare
 ----------
@@ -22,10 +30,13 @@ or a manual Tor hidden service.  See README.md for details.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 import re
+import sqlite3
+import time
 from pathlib import Path
 
 from aiohttp import web, WSMsgType
@@ -45,6 +56,13 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 STATIC_DIR = Path(__file__).parent / "static"
 
+# Database — path defaults to the same directory as server.py
+DB_PATH = Path(os.environ.get("DB_PATH", str(Path(__file__).parent / "securechat.db")))
+
+# Maximum messages stored *and* replayed per room.  Oldest messages are
+# pruned automatically when the limit is exceeded.
+HISTORY_LIMIT = int(os.environ.get("HISTORY_LIMIT", "100"))
+
 # Maximum lengths enforced server-side (defence-in-depth; client also limits)
 MAX_ROOM_ID_LEN = 64
 MAX_DISPLAY_NAME_LEN = 32
@@ -55,8 +73,127 @@ MAX_CIPHERTEXT_LEN = 8192  # ~6 KiB plaintext after base64 expansion
 _ROOM_RE = re.compile(r"^[A-Za-z0-9_\-]{1,64}$")
 
 # In-memory room registry: room_id → {websocket, ...}
-# No message persistence.
 rooms: dict[str, set[web.WebSocketResponse]] = {}
+
+# ---------------------------------------------------------------------------
+# Database helpers — synchronous, executed in a thread-pool via asyncio.to_thread
+# ---------------------------------------------------------------------------
+
+
+def _init_db_sync(path: Path) -> None:
+    """Create the messages table and index if they do not exist."""
+    con = sqlite3.connect(path)
+    try:
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS messages (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                room       TEXT    NOT NULL,
+                ts         REAL    NOT NULL,
+                sender     TEXT    NOT NULL,
+                iv         TEXT    NOT NULL,
+                ciphertext TEXT    NOT NULL
+            )
+            """
+        )
+        con.execute(
+            "CREATE INDEX IF NOT EXISTS idx_messages_room_id ON messages(room, id)"
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def _save_message_sync(
+    path: Path,
+    room_id: str,
+    sender: str,
+    iv: str,
+    ciphertext: str,
+    limit: int,
+) -> None:
+    """Insert a message and prune old rows so the room stays within *limit*."""
+    con = sqlite3.connect(path)
+    try:
+        con.execute(
+            "INSERT INTO messages (room, ts, sender, iv, ciphertext) VALUES (?, ?, ?, ?, ?)",
+            (room_id, time.time(), sender, iv, ciphertext),
+        )
+        # Keep only the latest `limit` messages per room
+        con.execute(
+            """
+            DELETE FROM messages
+             WHERE room = ?
+               AND id NOT IN (
+                     SELECT id FROM messages
+                      WHERE room = ?
+                      ORDER BY id DESC
+                      LIMIT ?
+                   )
+            """,
+            (room_id, room_id, limit),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def _get_history_sync(path: Path, room_id: str, limit: int) -> list[dict]:
+    """Return up to *limit* stored messages for *room_id* in chronological order."""
+    con = sqlite3.connect(path)
+    con.row_factory = sqlite3.Row
+    try:
+        rows = con.execute(
+            """
+            SELECT ts, sender, iv, ciphertext
+              FROM messages
+             WHERE room = ?
+             ORDER BY id DESC
+             LIMIT ?
+            """,
+            (room_id, limit),
+        ).fetchall()
+    finally:
+        con.close()
+    # Reverse so oldest message comes first
+    return [
+        {
+            "ts": r["ts"],
+            "sender": r["sender"],
+            "iv": r["iv"],
+            "ciphertext": r["ciphertext"],
+        }
+        for r in reversed(rows)
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Async wrappers around the synchronous DB helpers
+# ---------------------------------------------------------------------------
+
+
+async def init_db(path: Path) -> None:
+    await asyncio.to_thread(_init_db_sync, path)
+
+
+async def save_message(
+    path: Path,
+    room_id: str,
+    sender: str,
+    iv: str,
+    ciphertext: str,
+    limit: int = HISTORY_LIMIT,
+) -> None:
+    await asyncio.to_thread(_save_message_sync, path, room_id, sender, iv, ciphertext, limit)
+
+
+async def get_history(
+    path: Path,
+    room_id: str,
+    limit: int = HISTORY_LIMIT,
+) -> list[dict]:
+    return await asyncio.to_thread(_get_history_sync, path, room_id, limit)
+
 
 # ---------------------------------------------------------------------------
 # WebSocket handler
@@ -68,6 +205,7 @@ async def ws_handler(request: web.Request) -> web.WebSocketResponse:
     ws = web.WebSocketResponse(heartbeat=30)
     await ws.prepare(request)
 
+    db_path: Path = request.app["db_path"]
     room_id: str | None = None
 
     try:
@@ -100,6 +238,17 @@ async def ws_handler(request: web.Request) -> web.WebSocketResponse:
                     room_id,
                     len(rooms[room_id]),
                 )
+
+                # Send stored history to the newly joined peer only
+                try:
+                    history = await get_history(db_path, room_id)
+                    if history:
+                        await ws.send_str(
+                            json.dumps({"type": "history", "messages": history})
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("failed to load history  room=%s  error=%s", room_id, exc)
+
                 await _broadcast_system(room_id)
 
             # ── message ───────────────────────────────────────────────────
@@ -112,6 +261,14 @@ async def ws_handler(request: web.Request) -> web.WebSocketResponse:
                 if len(iv) > MAX_IV_LEN or len(ciphertext) > MAX_CIPHERTEXT_LEN:
                     continue
 
+                # Persist before relaying (best-effort; relay still happens on error)
+                try:
+                    await save_message(db_path, room_id, sender, iv, ciphertext)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "failed to save message  room=%s  error=%s", room_id, exc
+                    )
+
                 relay = json.dumps(
                     {
                         "type": "message",
@@ -120,9 +277,7 @@ async def ws_handler(request: web.Request) -> web.WebSocketResponse:
                         "sender": sender,
                     }
                 )
-                # Relay to *all* peers including sender so sender's own
-                # message is acknowledged; the client de-dupes by tracking
-                # locally sent messages instead of echoing them here.
+                # Relay to all other peers; sender renders its own message locally.
                 await _broadcast_to_room(room_id, relay, exclude=ws)
 
     finally:
@@ -179,8 +334,17 @@ async def index_handler(request: web.Request) -> web.FileResponse:
 # ---------------------------------------------------------------------------
 
 
-def build_app() -> web.Application:
+def build_app(db_path: Path | None = None) -> web.Application:
+    resolved_db = db_path if db_path is not None else DB_PATH
+
     app = web.Application()
+    app["db_path"] = resolved_db
+
+    async def on_startup(app: web.Application) -> None:
+        await init_db(app["db_path"])
+        logger.info("database ready  path=%s", app["db_path"])
+
+    app.on_startup.append(on_startup)
     app.router.add_get("/ws", ws_handler)
     app.router.add_get("/", index_handler)
     app.router.add_static("/static", STATIC_DIR, show_index=False)

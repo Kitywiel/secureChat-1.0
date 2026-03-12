@@ -12,6 +12,8 @@
  *  3. Every outgoing message is encrypted with a fresh random 12-byte IV.
  *     The IV is sent alongside the ciphertext (base64-encoded).
  *  4. The server only routes {iv, ciphertext, sender}; it never has the key.
+ *  5. Past messages are stored (encrypted) on the server and replayed on join
+ *     so history survives server restarts.
  *
  * All cryptographic operations use the browser's built-in Web Crypto API
  * (window.crypto.subtle), which is available in all modern browsers.
@@ -123,17 +125,30 @@ function showScreen(id) {
  * @param {string} sender
  * @param {string} text
  * @param {'outgoing'|'incoming'|'system'|'error'} kind
+ * @param {number|null} [timestamp]  Unix epoch seconds (from server). Omit for current time.
  */
-function appendMessage(sender, text, kind) {
+function appendMessage(sender, text, kind, timestamp = null) {
   const log = document.getElementById('messages');
   const el = document.createElement('div');
   el.className = 'message ' + kind;
 
-  if (kind !== 'system') {
+  if (kind !== 'system' && kind !== 'error') {
+    const headerEl = document.createElement('div');
+    headerEl.className = 'msg-header';
+
     const senderEl = document.createElement('span');
     senderEl.className = 'sender';
-    senderEl.textContent = sender;
-    el.appendChild(senderEl);
+    senderEl.textContent = sender; // textContent prevents XSS
+
+    const timeEl = document.createElement('time');
+    timeEl.className = 'timestamp';
+    const d = timestamp !== null ? new Date(timestamp * 1000) : new Date();
+    timeEl.dateTime = d.toISOString();
+    timeEl.textContent = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+
+    headerEl.appendChild(senderEl);
+    headerEl.appendChild(timeEl);
+    el.appendChild(headerEl);
   }
 
   const textEl = document.createElement('span');
@@ -182,6 +197,29 @@ function connectWs(roomId) {
       const n = Number(data.users);
       document.getElementById('user-count').textContent = `👤 ${n}`;
       appendMessage('', `${n} user${n !== 1 ? 's' : ''} in room`, 'system');
+
+    } else if (data.type === 'history') {
+      // Replay stored messages sent by the server on join
+      const msgs = Array.isArray(data.messages) ? data.messages : [];
+      if (msgs.length > 0) {
+        appendMessage(
+          '',
+          `── ${msgs.length} stored message${msgs.length !== 1 ? 's' : ''} ──`,
+          'system',
+        );
+        for (const msg of msgs) {
+          const plain = await decryptMessage(roomKey, msg.iv, msg.ciphertext);
+          // Show as outgoing if the stored sender name matches the current display name
+          const kind = msg.sender === displayName ? 'outgoing' : 'incoming';
+          if (plain !== null) {
+            appendMessage(msg.sender || 'Unknown', plain, kind, msg.ts);
+          } else {
+            appendMessage('⚠️', '[Stored message could not be decrypted — wrong passphrase?]', 'error');
+          }
+        }
+        appendMessage('', '── live ──', 'system');
+      }
+
     } else if (data.type === 'message') {
       const plain = await decryptMessage(roomKey, data.iv, data.ciphertext);
       if (plain !== null) {
@@ -296,3 +334,4 @@ document.getElementById('leave-btn').addEventListener('click', () => {
   document.getElementById('join-form').reset();
   document.getElementById('join-error').textContent = '';
 });
+
