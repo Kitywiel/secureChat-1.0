@@ -7,17 +7,20 @@ Covers:
 - SQLite persistence helpers (_init_db_sync, _save_message_sync, _get_history_sync)
 - WebSocket handler join / message / leave lifecycle (via aiohttp test client)
 - History replay: messages persisted before a new client joins are sent back
+- File-share endpoints: upload, one-time download, expiry, cleanup
 """
 
 from __future__ import annotations
 
 import json
 import re
+import time
 import pytest
 import pytest_asyncio
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
+import aiohttp
 import server as srv
 from server import (
     _ROOM_RE,
@@ -25,7 +28,9 @@ from server import (
     _broadcast_to_room,
     _get_history_sync,
     _init_db_sync,
+    _sanitize_filename,
     _save_message_sync,
+    _share_slots,
     build_app,
     get_history,
     rooms,
@@ -364,3 +369,156 @@ async def test_ws_no_history_for_empty_room(ws_client) -> None:
             assert extra["type"] != "history", "Unexpected history message for empty room"
         except asyncio.TimeoutError:
             pass  # expected — no extra messages
+
+
+# ─── File-share helpers ───────────────────────────────────────────────────────
+
+_EXPIRY_TOLERANCE_S = 5   # seconds of slack for expiry timestamp assertions
+
+
+@pytest.fixture(autouse=True)
+def clear_share_slots():
+    """Clear share slots before and after each test."""
+    import shutil
+    _share_slots.clear()
+    yield
+    for slot in list(_share_slots.values()):
+        shutil.rmtree(slot["tmp_dir"], ignore_errors=True)
+    _share_slots.clear()
+
+
+@pytest.mark.parametrize(
+    "name,expected",
+    [
+        ("report.pdf", "report.pdf"),
+        ("../../../etc/passwd", "passwd"),
+        ("C:\\Windows\\System32\\evil.exe", "evil.exe"),
+        ("hello world.txt", "hello world.txt"),
+        ("file<>|.txt", "file___.txt"),
+        ("", "file"),
+        (".....", "file"),
+    ],
+)
+def test_sanitize_filename(name: str, expected: str) -> None:
+    assert _sanitize_filename(name) == expected
+
+
+# ─── File-share integration tests ────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_share_upload_returns_download_url(ws_client) -> None:
+    data = aiohttp.FormData()
+    data.add_field("file", b"hello file content", filename="test.txt",
+                   content_type="text/plain")
+    resp = await ws_client.post("/share/upload?ttl=1", data=data)
+    assert resp.status == 200
+    body = await resp.json()
+    assert "download_url" in body
+    assert body["download_url"].startswith("/share/download/")
+    assert body["filename"] == "test.txt"
+    assert body["size"] == len(b"hello file content")
+    assert body["expires_at"] > time.time()
+
+
+@pytest.mark.asyncio
+async def test_share_download_delivers_file(ws_client) -> None:
+    content = b"secret data"
+    data = aiohttp.FormData()
+    data.add_field("file", content, filename="secret.bin",
+                   content_type="application/octet-stream")
+    upload_resp = await ws_client.post("/share/upload?ttl=2", data=data)
+    assert upload_resp.status == 200
+    body = await upload_resp.json()
+
+    download_resp = await ws_client.get(body["download_url"])
+    assert download_resp.status == 200
+    downloaded = await download_resp.read()
+    assert downloaded == content
+
+
+@pytest.mark.asyncio
+async def test_share_download_is_one_time(ws_client) -> None:
+    """After the first download the slot is gone; a second attempt returns 404."""
+    data = aiohttp.FormData()
+    data.add_field("file", b"once", filename="once.txt", content_type="text/plain")
+    upload_resp = await ws_client.post("/share/upload?ttl=1", data=data)
+    body = await upload_resp.json()
+    url = body["download_url"]
+
+    resp1 = await ws_client.get(url)
+    assert resp1.status == 200
+    await resp1.read()  # consume body
+
+    resp2 = await ws_client.get(url)
+    assert resp2.status == 404
+
+
+@pytest.mark.asyncio
+async def test_share_download_expired_returns_410(ws_client) -> None:
+    """Expired slots return HTTP 410 Gone."""
+    data = aiohttp.FormData()
+    data.add_field("file", b"exp", filename="expired.txt", content_type="text/plain")
+    upload_resp = await ws_client.post("/share/upload?ttl=1", data=data)
+    body = await upload_resp.json()
+    url = body["download_url"]
+
+    # Manually expire the slot
+    token = url.rsplit("/", 1)[-1]
+    _share_slots[token]["expires_at"] = time.time() - 1
+
+    resp = await ws_client.get(url)
+    assert resp.status == 410
+
+
+@pytest.mark.asyncio
+async def test_share_download_invalid_token(ws_client) -> None:
+    resp = await ws_client.get("/share/download/no-such-token")
+    assert resp.status == 404
+
+
+@pytest.mark.asyncio
+async def test_share_upload_no_file_returns_400(ws_client) -> None:
+    data = aiohttp.FormData()
+    data.add_field("other", "value")
+    resp = await ws_client.post("/share/upload?ttl=1", data=data)
+    assert resp.status == 400
+
+
+@pytest.mark.asyncio
+async def test_share_cleans_up_temp_dir_after_download(ws_client) -> None:
+    """The temp directory must not exist after a successful download."""
+    data = aiohttp.FormData()
+    data.add_field("file", b"cleanup check", filename="cleanup.txt",
+                   content_type="text/plain")
+    upload_resp = await ws_client.post("/share/upload?ttl=1", data=data)
+    body = await upload_resp.json()
+    url = body["download_url"]
+    token = url.rsplit("/", 1)[-1]
+    tmp_dir = _share_slots[token]["tmp_dir"]
+
+    resp = await ws_client.get(url)
+    assert resp.status == 200
+    await resp.read()
+
+    import asyncio
+    await asyncio.sleep(0.05)  # allow the server's finally-block to complete
+    assert not tmp_dir.exists()
+
+
+@pytest.mark.asyncio
+async def test_share_ttl_clamped(ws_client) -> None:
+    """TTL below 1 is raised to 1; TTL above 24 is clamped to 24."""
+    data = aiohttp.FormData()
+    data.add_field("file", b"x", filename="x.txt", content_type="text/plain")
+
+    resp_low = await ws_client.post("/share/upload?ttl=0", data=data)
+    assert resp_low.status == 200
+    body_low = await resp_low.json()
+    assert body_low["expires_at"] <= time.time() + 3600 + _EXPIRY_TOLERANCE_S
+
+    data2 = aiohttp.FormData()
+    data2.add_field("file", b"x", filename="x.txt", content_type="text/plain")
+    resp_high = await ws_client.post("/share/upload?ttl=99", data=data2)
+    assert resp_high.status == 200
+    body_high = await resp_high.json()
+    assert body_high["expires_at"] <= time.time() + 24 * 3600 + _EXPIRY_TOLERANCE_S

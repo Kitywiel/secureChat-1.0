@@ -36,8 +36,11 @@ import json
 import logging
 import os
 import re
+import secrets
+import shutil
 import sqlite3
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -86,11 +89,20 @@ MAX_DISPLAY_NAME_LEN = 32
 MAX_IV_LEN = 24          # 12 raw bytes → 16 base64 chars; 24 allows padding variants
 MAX_CIPHERTEXT_LEN = 8192  # ~6 KiB plaintext after base64 expansion
 
+# File-share constants
+MAX_UPLOAD_BYTES = 100 * 1024 * 1024   # 100 MB per file
+MAX_FILENAME_LEN = 200                 # characters in the sanitised filename
+_SHARE_TOKEN_BYTES = 32                # 256-bit token → 43-char URL-safe base64
+
 # Room ID: allow alphanumeric, hyphens, underscores only
 _ROOM_RE = re.compile(r"^[A-Za-z0-9_\-]{1,64}$")
 
 # In-memory room registry: room_id → {websocket, ...}
 rooms: dict[str, set[web.WebSocketResponse]] = {}
+
+# In-memory file-share slot registry
+# token → {"tmp_dir": Path, "filename": str, "size": int, "expires_at": float}
+_share_slots: dict[str, dict] = {}
 
 # ---------------------------------------------------------------------------
 # Database helpers — synchronous, executed in a thread-pool via asyncio.to_thread
@@ -347,6 +359,151 @@ async def index_handler(request: web.Request) -> web.FileResponse:
 
 
 # ---------------------------------------------------------------------------
+# File-share helpers and handlers
+# ---------------------------------------------------------------------------
+
+
+def _sanitize_filename(name: str) -> str:
+    """Return a safe filename with path components and dangerous chars removed."""
+    # Strip directory separators (handles both UNIX and Windows paths)
+    name = os.path.basename(name.replace("\\", "/"))
+    # Allow alphanumeric, dots, hyphens, underscores, spaces; replace the rest
+    name = re.sub(r"[^\w.\- ]", "_", name)
+    # Strip leading/trailing dots and spaces (avoids hidden-files and whitespace names)
+    name = name.strip(". ")
+    return (name or "file")[:MAX_FILENAME_LEN]
+
+
+def _rmtree(path: Path) -> None:
+    """Remove a directory tree, ignoring errors."""
+    shutil.rmtree(path, ignore_errors=True)
+
+
+async def share_upload_handler(request: web.Request) -> web.Response:
+    """POST /share/upload?ttl=<hours> — receive a file, return a one-time download URL."""
+    # ── TTL ──────────────────────────────────────────────────────────────
+    try:
+        ttl_hours = int(request.query.get("ttl", "1"))
+    except ValueError:
+        ttl_hours = 1
+    ttl_hours = max(1, min(24, ttl_hours))
+
+    # ── Early size rejection ──────────────────────────────────────────────
+    cl = request.content_length
+    if cl is not None and cl > MAX_UPLOAD_BYTES:
+        raise web.HTTPRequestEntityTooLarge()
+
+    if not request.content_type.startswith("multipart/"):
+        raise web.HTTPBadRequest(reason="Expected multipart/form-data")
+
+    reader = await request.multipart()
+    tmp_dir = Path(tempfile.mkdtemp(prefix="sc_share_"))
+    try:
+        # Find the "file" part
+        file_part = await reader.next()
+        if file_part is None or file_part.name != "file":
+            raise web.HTTPBadRequest(reason="Expected a 'file' field")
+
+        filename = _sanitize_filename(file_part.filename or "file")
+        dest = tmp_dir / filename
+
+        # Stream into memory (enforcing limit), then write to disk
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = await file_part.read_chunk(65536)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > MAX_UPLOAD_BYTES:
+                raise web.HTTPRequestEntityTooLarge()
+            chunks.append(chunk)
+
+        await asyncio.to_thread(dest.write_bytes, b"".join(chunks))
+
+        token = secrets.token_urlsafe(_SHARE_TOKEN_BYTES)
+        expires_at = time.time() + ttl_hours * 3600
+        _share_slots[token] = {
+            "tmp_dir": tmp_dir,
+            "filename": filename,
+            "size": total,
+            "expires_at": expires_at,
+        }
+        logger.info("share upload  file=%s  size=%d  ttl=%dh", filename, total, ttl_hours)
+        return web.json_response(
+            {
+                "download_url": f"/share/download/{token}",
+                "filename": filename,
+                "size": total,
+                "expires_at": expires_at,
+            }
+        )
+    except web.HTTPException:
+        await asyncio.to_thread(_rmtree, tmp_dir)
+        raise
+    except Exception as exc:  # noqa: BLE001
+        await asyncio.to_thread(_rmtree, tmp_dir)
+        logger.error("share upload error: %s", exc)
+        raise web.HTTPInternalServerError()
+
+
+async def share_download_handler(request: web.Request) -> web.StreamResponse:
+    """GET /share/download/{token} — one-time download; temp files destroyed afterwards."""
+    token = request.match_info["token"]
+    slot = _share_slots.get(token)
+
+    if slot is None:
+        raise web.HTTPNotFound(reason="Link not found or already used")
+
+    if time.time() > slot["expires_at"]:
+        _share_slots.pop(token, None)
+        await asyncio.to_thread(_rmtree, slot["tmp_dir"])
+        raise web.HTTPGone(reason="Download link has expired")
+
+    # Remove slot before streaming — one-time use
+    _share_slots.pop(token)
+    tmp_dir: Path = slot["tmp_dir"]
+    filename: str = slot["filename"]
+    size: int = slot["size"]
+    filepath = tmp_dir / filename
+
+    if not filepath.is_file():
+        await asyncio.to_thread(_rmtree, tmp_dir)
+        raise web.HTTPNotFound(reason="File not found")
+
+    try:
+        file_content = await asyncio.to_thread(filepath.read_bytes)
+        response = web.StreamResponse(
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                "Content-Type": "application/octet-stream",
+                "Content-Length": str(size),
+            }
+        )
+        await response.prepare(request)
+        await response.write(file_content)
+        await response.write_eof()
+        logger.info("share download complete  file=%s  size=%d", filename, size)
+        return response
+    finally:
+        await asyncio.to_thread(_rmtree, tmp_dir)
+
+
+async def _cleanup_expired_share_slots() -> None:
+    """Background task: sweep expired share slots every 5 minutes."""
+    while True:
+        await asyncio.sleep(300)
+        now = time.time()
+        expired = [t for t, s in list(_share_slots.items()) if now > s["expires_at"]]
+        for t in expired:
+            slot = _share_slots.pop(t, None)
+            if slot:
+                await asyncio.to_thread(_rmtree, slot["tmp_dir"])
+        if expired:
+            logger.info("cleaned up %d expired share slot(s)", len(expired))
+
+
+# ---------------------------------------------------------------------------
 # App factory
 # ---------------------------------------------------------------------------
 
@@ -360,10 +517,23 @@ def build_app(db_path: Path | None = None) -> web.Application:
     async def on_startup(app: web.Application) -> None:
         await init_db(app["db_path"])
         logger.info("database ready  path=%s", app["db_path"])
+        app["_cleanup_task"] = asyncio.create_task(_cleanup_expired_share_slots())
+
+    async def on_cleanup(app: web.Application) -> None:
+        task = app.get("_cleanup_task")
+        if task:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
     app.on_startup.append(on_startup)
+    app.on_cleanup.append(on_cleanup)
     app.router.add_get("/ws", ws_handler)
     app.router.add_get("/", index_handler)
+    app.router.add_post("/share/upload", share_upload_handler)
+    app.router.add_get("/share/download/{token}", share_download_handler)
     app.router.add_static("/static", STATIC_DIR, show_index=False)
     return app
 

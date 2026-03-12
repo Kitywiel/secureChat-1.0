@@ -352,3 +352,106 @@ document.getElementById('leave-btn').addEventListener('click', () => {
   document.getElementById('join-form').reset();
   document.getElementById('join-error').textContent = '';
 });
+
+// ─── Share Files ──────────────────────────────────────────────────────────────
+
+/** Reset the share screen to its initial (upload) state. */
+function resetShareScreen() {
+  document.getElementById('share-form').reset();
+  document.getElementById('share-error').textContent = '';
+  document.getElementById('share-result').classList.add('hidden');
+  document.getElementById('share-upload-area').classList.remove('hidden');
+}
+
+document.getElementById('share-files-btn').addEventListener('click', () => {
+  resetShareScreen();
+  showScreen('share');
+});
+
+document.getElementById('share-back-btn').addEventListener('click', () => {
+  resetShareScreen();
+  showScreen('lobby');
+});
+
+document.getElementById('share-again-btn').addEventListener('click', () => {
+  resetShareScreen();
+});
+
+document.getElementById('share-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+
+  const fileInput = /** @type {HTMLInputElement} */ (document.getElementById('share-file'));
+  const ttlSelect = /** @type {HTMLSelectElement} */ (document.getElementById('share-ttl'));
+  const errEl = document.getElementById('share-error');
+  const btn = document.getElementById('share-btn');
+
+  errEl.textContent = '';
+
+  const file = fileInput.files && fileInput.files[0];
+  if (!file) {
+    errEl.textContent = 'Please select a file.';
+    return;
+  }
+
+  const MAX_BYTES = 100 * 1024 * 1024; // 100 MB
+  if (file.size > MAX_BYTES) {
+    errEl.textContent = 'File is too large (100 MB maximum).';
+    return;
+  }
+
+  const ttl = ttlSelect.value;
+  btn.disabled = true;
+  btn.textContent = 'Uploading…';
+
+  const formData = new FormData();
+  formData.append('file', file);
+
+  try {
+    const resp = await fetch(`/share/upload?ttl=${encodeURIComponent(ttl)}`, {
+      method: 'POST',
+      body: formData,
+    });
+
+    if (!resp.ok) {
+      const text = await resp.text();
+      errEl.textContent = `Upload failed (${resp.status}): ${text}`;
+      return;
+    }
+
+    const data = await resp.json();
+    const downloadUrl = new URL(data.download_url, window.location.href).href;
+    const expiresAt = new Date(data.expires_at * 1000);
+
+    document.getElementById('share-link').textContent = downloadUrl;
+    document.getElementById('share-expiry').textContent =
+      `⚠️ One-time link — expires ${expiresAt.toLocaleString()}`;
+    document.getElementById('share-result').classList.remove('hidden');
+    document.getElementById('share-upload-area').classList.add('hidden');
+  } catch (err) {
+    errEl.textContent = 'Upload failed: ' + (err instanceof Error ? err.message : String(err));
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Upload & Generate Link';
+  }
+});
+
+document.getElementById('share-copy-btn').addEventListener('click', () => {
+  const linkEl = document.getElementById('share-link');
+  const url = linkEl.textContent;
+  if (!url) return;
+
+  navigator.clipboard.writeText(url).then(() => {
+    const btn = document.getElementById('share-copy-btn');
+    btn.textContent = 'Copied!';
+    setTimeout(() => { btn.textContent = 'Copy'; }, 2000);
+  }).catch(() => {
+    // Fallback: select the text so the user can copy manually
+    const range = document.createRange();
+    range.selectNodeContents(linkEl);
+    const sel = window.getSelection();
+    if (sel) {
+      sel.removeAllRanges();
+      sel.addRange(range);
+    }
+  });
+});
