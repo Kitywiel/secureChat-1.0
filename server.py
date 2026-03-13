@@ -1892,7 +1892,12 @@ async def _admin_login_handler(request: web.Request) -> web.Response:
         # No max_age → session cookie: expires when the browser is closed.
         # This prevents auto-login on any device after a browser restart.
         httponly=True,
-        secure=False,   # set True if TLS is terminated upstream (e.g. nginx)
+        # Set the Secure flag only when the login request itself arrived over
+        # HTTPS (request.secure is True).  HTTP and .onion connections are
+        # plaintext at the TCP layer but .onion is end-to-end encrypted by
+        # Tor, so we don't force Secure=True there — doing so would break
+        # .onion-only deployments.
+        secure=request.secure,
         samesite="Strict",
     )
     _add_admin_security_headers(resp)
@@ -2139,8 +2144,7 @@ def _init_admin_credentials() -> tuple[str, str]:
     print(f"  Admin passcode : {pc}", flush=True)
     print("=" * 72, flush=True)
     print("", flush=True)
-    logger.info("admin panel path   : /%s/", path)
-    logger.info("admin passcode     : %s", pc)
+    logger.info("admin panel ready  (path printed to console at startup)")
 
     return path, pc
 
@@ -2273,8 +2277,7 @@ def build_admin_app() -> web.Application:
     if not _ADMIN_PASSCODE:
         _ADMIN_PATH, _ADMIN_PASSCODE = _init_admin_credentials()
     _ADMIN_WEBHOOK_TOKEN = secrets.token_urlsafe(32)
-    logger.info("admin webhook token (incoming): /%s/webhook/%s",
-                _ADMIN_PATH, _ADMIN_WEBHOOK_TOKEN)
+    print(f"  Admin webhook  : /{_ADMIN_PATH}/webhook/{_ADMIN_WEBHOOK_TOKEN}", flush=True)
 
     app = web.Application()
 
@@ -2287,7 +2290,7 @@ def build_admin_app() -> web.Application:
             datefmt="%Y-%m-%dT%H:%M:%SZ",
         ))
         logging.root.addHandler(handler)
-        logger.info("admin panel ready  path=/%s/", _ADMIN_PATH)
+        logger.info("admin panel ready  (credentials printed to console at startup)")
 
     app.on_startup.append(on_startup)
     # Register admin routes under the generated path
@@ -2474,7 +2477,7 @@ def build_app(db_path: Path | None = None) -> web.Application:
         )
         app["_lockdown_broadcast_task"] = asyncio.create_task(_lockdown_broadcast_task())
         app["_mailtm_poll_task"] = asyncio.create_task(_mailtm_poll_all_inboxes())
-        logger.info("admin panel ready  path=/%s/", _ADMIN_PATH)
+        logger.info("admin panel ready  (credentials printed to console at startup)")
 
         # Start the inbound SMTP server when a mail domain is configured
         if MAIL_DOMAIN:
@@ -2553,7 +2556,7 @@ if __name__ == "__main__":
     # fresh (empty) globals, causing credentials to be printed twice.
     _ADMIN_PATH, _ADMIN_PASSCODE = _init_admin_credentials()
     _ADMIN_WEBHOOK_TOKEN = secrets.token_urlsafe(32)
-    logger.info("admin webhook token: /%s/webhook/%s", _ADMIN_PATH, _ADMIN_WEBHOOK_TOKEN)
+    print(f"  Admin webhook  : /{_ADMIN_PATH}/webhook/{_ADMIN_WEBHOOK_TOKEN}", flush=True)
 
     logger.info("secureChat starting  host=%s  port=%d", host, port)
     logger.info(
