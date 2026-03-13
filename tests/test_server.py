@@ -2219,3 +2219,37 @@ async def test_inbox_create_returns_mailtm_enabled_field(ws_client) -> None:
         assert data["mailtm_enabled"] is False
     finally:
         _s.MAILTM_ENABLED = original
+
+
+# ---------------------------------------------------------------------------
+# Outbound proxy helper tests
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_build_session_direct_returns_session() -> None:
+    """_build_session with empty proxy_url returns a plain aiohttp session."""
+    import server as _s
+    sess = _s._build_session("", 5.0)
+    assert sess is not None
+    await sess.close()
+
+
+@pytest.mark.asyncio
+async def test_build_session_with_socks5_url() -> None:
+    """_build_session with a socks5:// URL returns a session (may fail on connect later)."""
+    import server as _s
+    sess = _s._build_session("socks5://127.0.0.1:9050", 5.0)
+    assert sess is not None
+    await sess.close()
+
+
+@pytest.mark.asyncio
+async def test_make_proxied_session_returns_session() -> None:
+    """_make_proxied_session() always returns a usable aiohttp ClientSession."""
+    import server as _s
+    # Force re-probe on this call by expiring the cache
+    _s._proxy_cache_ts = 0.0
+    _s._proxy_cache = ""
+    sess = await _s._make_proxied_session(timeout=3.0)
+    assert sess is not None
+    await sess.close()

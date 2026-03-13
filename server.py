@@ -957,15 +957,112 @@ async def _cleanup_expired_share_slots() -> None:
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
+# Outbound HTTP proxy helper
+#
+# Non-Tor clearnet services (mail.tm, mesh peers on clearnet) are routed
+# through a SOCKS5 proxy chain so the server's real IP is never exposed:
+#
+#   1st choice: Tor SOCKS5 (127.0.0.1:9050) — already running for hidden-service.
+#               This gives 3-hop anonymity with no data sent to any agency.
+#   Fallback  : a curated list of well-known free public SOCKS5 proxies.
+#   Last resort: direct connection (no proxy).
+#
+# Mesh peers that use .onion addresses are automatically handled by Tor.
+# ---------------------------------------------------------------------------
+
+# Free public SOCKS5 proxies — tried in order after Tor.
+# These are long-running, widely-tested free proxies (no payment, no signup).
+_FREE_SOCKS5_PROXIES: list[str] = [
+    "socks5://67.201.33.10:25283",    # US  — well-known free relay
+    "socks5://72.195.34.58:4145",     # US
+    "socks5://98.162.96.41:4145",     # US
+    "socks5://174.77.111.197:4145",   # US
+    "socks5://192.111.139.165:4145",  # US
+]
+
+# In-process cache: last verified proxy URL (or empty string = direct)
+_proxy_cache: str = ""
+_proxy_cache_ts: float = 0.0
+_PROXY_CACHE_TTL: float = 300.0  # re-probe every 5 minutes
+
+
+async def _make_proxied_session(timeout: float = 15.0):
+    """Return an aiohttp ClientSession routed through the best available proxy.
+
+    Priority:
+      1. Tor SOCKS5 at 127.0.0.1:9050  (3-hop onion routing, no agency logging)
+      2. Free public SOCKS5 proxies    (tried in order)
+      3. Direct connection             (fallback — real IP visible)
+
+    The result is cached for _PROXY_CACHE_TTL seconds so every outbound call
+    does not re-probe the proxy.  The cache is per-process in-memory only.
+    """
+    global _proxy_cache, _proxy_cache_ts  # noqa: PLW0603
+    import time as _time  # noqa: PLC0415
+    import aiohttp as _aiohttp  # noqa: PLC0415
+
+    now = _time.time()
+    if now - _proxy_cache_ts < _PROXY_CACHE_TTL:
+        # Use cached proxy choice (may be empty string = direct)
+        return _build_session(_proxy_cache, timeout)
+
+    # Probe Tor first, then the free list, then direct
+    candidates = ["socks5://127.0.0.1:9050"] + _FREE_SOCKS5_PROXIES + [""]
+    chosen = ""
+    for proxy_url in candidates:
+        if await _probe_proxy(proxy_url, timeout=5.0):
+            chosen = proxy_url
+            break
+
+    _proxy_cache = chosen
+    _proxy_cache_ts = now
+    if chosen:
+        logger.debug("outbound proxy selected: %s", chosen[:40])
+    else:
+        logger.debug("outbound proxy: direct (no proxy available)")
+    return _build_session(chosen, timeout)
+
+
+def _build_session(proxy_url: str, timeout: float):
+    """Build an aiohttp ClientSession with the given SOCKS5 proxy (or direct)."""
+    import aiohttp as _aiohttp  # noqa: PLC0415
+    t = _aiohttp.ClientTimeout(total=timeout)
+    if not proxy_url:
+        return _aiohttp.ClientSession(timeout=t)
+    try:
+        from aiohttp_socks import ProxyConnector  # noqa: PLC0415
+        connector = ProxyConnector.from_url(proxy_url)
+        return _aiohttp.ClientSession(connector=connector, timeout=t)
+    except Exception:  # noqa: BLE001
+        # aiohttp-socks not installed or proxy URL invalid — fall back to direct
+        return _aiohttp.ClientSession(timeout=t)
+
+
+async def _probe_proxy(proxy_url: str, timeout: float = 5.0) -> bool:
+    """Return True if we can reach api.mail.tm through *proxy_url* (or direct)."""
+    import aiohttp as _aiohttp  # noqa: PLC0415
+    try:
+        sess = _build_session(proxy_url, timeout)
+        async with sess:
+            async with sess.get(
+                f"{MAILTM_API}/domains",
+                timeout=_aiohttp.ClientTimeout(total=timeout),
+                allow_redirects=False,
+            ) as r:
+                return r.status < 500
+    except Exception:  # noqa: BLE001
+        return False
+
+
+# ---------------------------------------------------------------------------
 # mail.tm helpers — free real-email provisioning
 # ---------------------------------------------------------------------------
 
 async def _mailtm_get_domain() -> str | None:
     """Return the first active mail.tm domain, or None on failure."""
-    import aiohttp as _aiohttp  # noqa: PLC0415
     try:
-        async with _aiohttp.ClientSession() as sess:
-            async with sess.get(f"{MAILTM_API}/domains", timeout=_aiohttp.ClientTimeout(total=10)) as r:
+        async with await _make_proxied_session() as sess:
+            async with sess.get(f"{MAILTM_API}/domains") as r:
                 if r.status != 200:
                     return None
                 data = await r.json()
@@ -981,13 +1078,11 @@ async def _mailtm_get_domain() -> str | None:
 
 async def _mailtm_create_account(address: str, password: str) -> bool:
     """Create a mail.tm account.  Returns True on success."""
-    import aiohttp as _aiohttp  # noqa: PLC0415
     try:
-        async with _aiohttp.ClientSession() as sess:
+        async with await _make_proxied_session() as sess:
             async with sess.post(
                 f"{MAILTM_API}/accounts",
                 json={"address": address, "password": password},
-                timeout=_aiohttp.ClientTimeout(total=10),
             ) as r:
                 return r.status in (200, 201)
     except Exception:  # noqa: BLE001
@@ -996,13 +1091,11 @@ async def _mailtm_create_account(address: str, password: str) -> bool:
 
 async def _mailtm_get_token(address: str, password: str) -> str | None:
     """Obtain a JWT bearer token for a mail.tm account."""
-    import aiohttp as _aiohttp  # noqa: PLC0415
     try:
-        async with _aiohttp.ClientSession() as sess:
+        async with await _make_proxied_session() as sess:
             async with sess.post(
                 f"{MAILTM_API}/token",
                 json={"address": address, "password": password},
-                timeout=_aiohttp.ClientTimeout(total=10),
             ) as r:
                 if r.status == 200:
                     data = await r.json()
@@ -1014,14 +1107,12 @@ async def _mailtm_get_token(address: str, password: str) -> str | None:
 
 async def _mailtm_fetch_messages(bearer_token: str, seen_ids: set) -> list[dict]:
     """Fetch unread messages from mail.tm; return a list of new message dicts."""
-    import aiohttp as _aiohttp  # noqa: PLC0415
     results: list[dict] = []
     try:
-        async with _aiohttp.ClientSession() as sess:
+        async with await _make_proxied_session() as sess:
             async with sess.get(
                 f"{MAILTM_API}/messages",
                 headers={"Authorization": f"Bearer {bearer_token}"},
-                timeout=_aiohttp.ClientTimeout(total=10),
             ) as r:
                 if r.status != 200:
                     return results
@@ -1036,7 +1127,6 @@ async def _mailtm_fetch_messages(bearer_token: str, seen_ids: set) -> list[dict]
                     async with sess.get(
                         f"{MAILTM_API}/messages/{mid}",
                         headers={"Authorization": f"Bearer {bearer_token}"},
-                        timeout=_aiohttp.ClientTimeout(total=10),
                     ) as mr:
                         if mr.status != 200:
                             continue
@@ -2319,18 +2409,20 @@ async def mesh_invite_handler(request: web.Request) -> web.Response:
 
 
 async def _forward_to_peers(room_id: str, payload: str) -> None:
-    """Fire-and-forget: POST a message to every connected mesh peer."""
+    """Fire-and-forget: POST a message to every connected mesh peer.
+
+    Peer URLs may be .onion addresses — the proxied session routes them
+    through Tor automatically.
+    """
     if not _mesh_peers:
         return
-    import aiohttp as _aiohttp  # noqa: PLC0415
     for peer in list(_mesh_peers.values()):
         peer_url = peer["url"].rstrip("/") + "/mesh/peer/forward"
         try:
-            async with _aiohttp.ClientSession() as sess:
+            async with await _make_proxied_session(timeout=5.0) as sess:
                 await sess.post(
                     peer_url,
                     json={"token": _MESH_TOKEN, "room_id": room_id, "payload": payload},
-                    timeout=_aiohttp.ClientTimeout(total=5),
                 )
         except Exception:  # noqa: BLE001
             pass

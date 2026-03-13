@@ -340,6 +340,11 @@ def _print_summary(
     print("        Uses Tor (.onion) when available — no IP exposed.")
 
     print()
+    print("  🛡️   Outbound proxy routing:")
+    print("        Mail & mesh calls route through: Tor SOCKS5 → free SOCKS5 → direct")
+    print("        (chat traffic goes over Tor hidden service — no proxy needed)")
+
+    print()
     print("  Press Ctrl+C to stop.")
     print(sep)
     print()
