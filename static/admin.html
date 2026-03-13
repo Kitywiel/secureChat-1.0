@@ -145,7 +145,7 @@ function resCard(icon, title, pct, valLabel, subLabel){
 /** Build the HTML for the System Resources section from a stats object. */
 function renderSysResources(s){
   if(s.sys_cpu_percent===undefined&&s.sys_ram_percent===undefined&&!s.sys_gpus){
-    return '<p class="res-na">System metrics unavailable (psutil not installed).</p>';
+    return '<p class="res-na">Server process metrics unavailable (psutil not installed).</p>';
   }
   let html='<div class="res-grid">';
   if(s.sys_cpu_percent!==undefined){
@@ -205,7 +205,7 @@ async function renderDashboard(){
         <div class="val">${stats.chat_files_shared}</div></div>
     </div>
     <section>
-      <h2>System Resources</h2>
+      <h2>Server Process Resources</h2>
     </section>
     <div id="sys-res-area">${renderSysResources(stats)}</div>
     <section>

@@ -918,14 +918,18 @@ document.getElementById('delete-room-btn').addEventListener('click', async () =>
   if (!currentRoomId) return;
   if (!confirm(`Delete room "${currentRoomId}" and all its messages? This cannot be undone.`)) return;
 
-  // If we have a delete code (room was created by this client), verify it.
-  // For rooms joined without a delete code, we attempt deletion anyway.
+  // Use the stored delete code (available when this client created the room),
+  // otherwise prompt the user to enter it manually.
   let deleteCodeToSend = roomDeleteCode;
   if (!deleteCodeToSend) {
     // Prompt user for the delete code if we don't have it stored locally
     const entered = prompt('Enter the room delete code (required to delete this room):');
     if (entered === null) return; // user cancelled
     deleteCodeToSend = entered.trim();
+    if (!deleteCodeToSend) {
+      alert('A delete code is required to delete this room.');
+      return;
+    }
   }
 
   try {

@@ -32,6 +32,7 @@ start_server.bat (Windows) for fully automatic setup.
 from __future__ import annotations
 
 import asyncio
+import collections
 import hashlib
 import io
 import json
@@ -54,9 +55,10 @@ from aiohttp import web, WSMsgType
 try:
     import psutil as _psutil  # type: ignore[import-untyped]
     _PSUTIL_AVAILABLE = True
-    # Prime the CPU percent sampler so that subsequent interval=None calls
-    # immediately return meaningful (non-zero) usage rather than 0.0.
+    # Prime both the system-wide and per-process CPU samplers so that
+    # subsequent interval=None calls return meaningful values rather than 0.0.
     _psutil.cpu_percent(interval=None)
+    _psutil.Process().cpu_percent(interval=None)
 except ImportError:  # pragma: no cover
     _psutil = None  # type: ignore[assignment]
     _PSUTIL_AVAILABLE = False
@@ -276,14 +278,19 @@ _stats: dict[str, int | float] = {
 # Each connected SSE client gets its own Queue; the handler fans out to all of them.
 _log_sse_clients: list[asyncio.Queue] = []
 _admin_event_loop: asyncio.AbstractEventLoop | None = None  # set in on_startup callback within build_admin_app
+# Ring buffer of the last 200 formatted log lines — replayed to new SSE clients
+# so the Live Logs panel shows recent history even before they connected.
+_log_recent: collections.deque = collections.deque(maxlen=200)
 
 class _SseLogHandler(logging.Handler):
     """Forward log records to every connected SSE client (non-blocking, fan-out)."""
 
     def emit(self, record: logging.LogRecord) -> None:
+        msg = self.format(record)
+        # Always store in the ring buffer (no event-loop dependency needed).
+        _log_recent.append(msg)
         if not _log_sse_clients or _admin_event_loop is None:
             return
-        msg = self.format(record)
         try:
             if _admin_event_loop.is_running():
                 for q in list(_log_sse_clients):
@@ -937,9 +944,14 @@ async def room_delete_handler(request: web.Request) -> web.Response:
         body = {}
 
     meta = _room_meta.get(room_id)
-    if meta and meta.get("delete_code_hash"):
+    # Always require the delete code for any registered room.
+    # Using `is not None` (rather than truthiness) means an empty-but-present
+    # meta dict is also guarded.  If delete_code_hash is somehow absent from
+    # the metadata we deny the request rather than allowing a silent bypass.
+    if meta is not None:
+        expected_hash = meta.get("delete_code_hash")
         provided_code = str(body.get("delete_code", "")).strip()
-        if not provided_code or _hash_passcode(provided_code) != meta["delete_code_hash"]:
+        if not expected_hash or not provided_code or _hash_passcode(provided_code) != expected_hash:
             raise web.HTTPForbidden(reason="Wrong or missing delete code")
 
     # Remove room metadata
@@ -1126,13 +1138,17 @@ async def _admin_login_handler(request: web.Request) -> web.Response:
         raise web.HTTPForbidden(reason="Wrong passcode")
     # Success — clear failure record
     _ADMIN_LOGIN_FAILURES.pop(ip, None)
+    # Single-session: invalidate all previous sessions so that any other
+    # browser or device that held an old token is automatically logged out.
+    _ADMIN_SESSIONS.clear()
     token = _make_admin_session()
     _ADMIN_SESSIONS[token] = time.time() + ADMIN_SESSION_TTL
     resp = web.json_response({"ok": True})
     resp.set_cookie(
         "admin_session",
         token,
-        max_age=ADMIN_SESSION_TTL,
+        # No max_age → session cookie: expires when the browser is closed.
+        # This prevents auto-login on any device after a browser restart.
         httponly=True,
         secure=False,   # set True if TLS is terminated upstream (e.g. nginx)
         samesite="Strict",
@@ -1160,6 +1176,11 @@ async def _admin_index_handler(request: web.Request) -> web.Response:
 def _get_sys_metrics() -> dict:
     """Return CPU, RAM, disk, and (if available) GPU metrics as a dict.
 
+    CPU and RAM figures reflect the server *process* only so that the admin
+    panel shows what secureChat itself is consuming rather than the total load
+    of the host machine.  Disk usage remains system-wide because the process
+    does not have its own filesystem.
+
     All values that cannot be collected are omitted from the returned dict so
     the caller can check their presence before rendering them.
     """
@@ -1167,11 +1188,17 @@ def _get_sys_metrics() -> dict:
 
     if _PSUTIL_AVAILABLE:
         try:
-            metrics["sys_cpu_percent"] = _psutil.cpu_percent(interval=None)
-            vm = _psutil.virtual_memory()
-            metrics["sys_ram_percent"]  = vm.percent
-            metrics["sys_ram_total"]    = vm.total
-            metrics["sys_ram_used"]     = vm.used
+            proc = _psutil.Process()
+            cpu_count = _psutil.cpu_count(logical=True) or 1
+            # proc.cpu_percent() can exceed 100 on multi-core systems; normalise
+            # to 0-100 so the progress bar and colour thresholds work correctly.
+            raw_cpu = proc.cpu_percent(interval=None)
+            metrics["sys_cpu_percent"] = min(round(raw_cpu / cpu_count, 1), 100.0)
+            mem = proc.memory_info()
+            total_ram = _psutil.virtual_memory().total
+            metrics["sys_ram_used"]     = mem.rss
+            metrics["sys_ram_total"]    = total_ram
+            metrics["sys_ram_percent"]  = round(mem.rss / total_ram * 100, 1) if total_ram else 0.0
             du = _psutil.disk_usage("/")
             metrics["sys_disk_percent"] = du.percent
             metrics["sys_disk_total"]   = du.total
@@ -1270,6 +1297,10 @@ async def _admin_logs_sse_handler(request: web.Request) -> web.StreamResponse:
     """GET /{path}/api/logs — SSE stream of live log records (requires auth)."""
     if not _valid_admin_session(request):
         raise web.HTTPUnauthorized()
+    # Snapshot the ring buffer BEFORE registering the per-client queue so
+    # there is no gap: the snapshot covers history up to this moment and the
+    # queue captures every message from this moment forward.
+    recent_snapshot = list(_log_recent)
     # Each client gets its own queue so that all connected clients receive every message.
     q: asyncio.Queue = asyncio.Queue(maxsize=1000)
     _log_sse_clients.append(q)
@@ -1280,6 +1311,10 @@ async def _admin_logs_sse_handler(request: web.Request) -> web.StreamResponse:
     response.headers["X-Content-Type-Options"] = "nosniff"
     await response.prepare(request)
     await response.write(b"retry: 3000\n\n")
+    # Replay recent log history so the Live Logs panel is not empty on first connect.
+    for msg in recent_snapshot:
+        safe = msg.replace("\n", " ").replace("\r", " ")
+        await response.write(f"event: log\ndata: {safe}\n\n".encode())
     try:
         while True:
             try:
@@ -1496,11 +1531,13 @@ if __name__ == "__main__":
     host = os.environ.get("HOST", "127.0.0.1")
     port = int(os.environ.get("PORT", "5000"))
 
-    # Initialise admin credentials before building the app so routes can use _ADMIN_PATH
-    import server as _self  # noqa: PLC0415 — only needed at startup
-    _self._ADMIN_PATH, _self._ADMIN_PASSCODE = _init_admin_credentials()
-    _self._ADMIN_WEBHOOK_TOKEN = secrets.token_urlsafe(32)
-    logger.info("admin webhook token: /%s/webhook/%s", _self._ADMIN_PATH, _self._ADMIN_WEBHOOK_TOKEN)
+    # Initialise admin credentials in the current module's global namespace so
+    # that build_app() sees them as already set and does NOT re-initialise.
+    # Using `import server as _self` would create a second module copy with
+    # fresh (empty) globals, causing credentials to be printed twice.
+    _ADMIN_PATH, _ADMIN_PASSCODE = _init_admin_credentials()
+    _ADMIN_WEBHOOK_TOKEN = secrets.token_urlsafe(32)
+    logger.info("admin webhook token: /%s/webhook/%s", _ADMIN_PATH, _ADMIN_WEBHOOK_TOKEN)
 
     logger.info("secureChat starting  host=%s  port=%d", host, port)
     logger.info(

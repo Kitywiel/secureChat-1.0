@@ -1422,3 +1422,126 @@ async def test_admin_security_headers_on_login_response(admin_client) -> None:
     assert resp.status == 200
     assert resp.headers.get("X-Frame-Options") == "DENY"
     assert resp.headers.get("X-Content-Type-Options") == "nosniff"
+
+
+# ─── Fix 4: room deletion without key ────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_room_delete_no_code_returns_403(ws_client) -> None:
+    """POST /room/{room_id}/delete without supplying delete_code returns 403.
+
+    A registered room must always require its delete code; omitting the field
+    entirely must not allow silent deletion.
+    """
+    resp = await ws_client.post("/room/create", json={"passcode": "no-code-test"})
+    body = await resp.json()
+    room_id = body["room_id"]
+
+    # Send request with no delete_code field at all
+    del_resp = await ws_client.post(f"/room/{room_id}/delete", json={})
+    assert del_resp.status == 403
+    # Room must still exist
+    assert room_id in _room_meta
+    # Cleanup
+    _room_meta.pop(room_id, None)
+
+
+@pytest.mark.asyncio
+async def test_room_delete_empty_code_returns_403(ws_client) -> None:
+    """POST /room/{room_id}/delete with an empty delete_code string returns 403."""
+    resp = await ws_client.post("/room/create", json={"passcode": "empty-code-test"})
+    body = await resp.json()
+    room_id = body["room_id"]
+
+    del_resp = await ws_client.post(
+        f"/room/{room_id}/delete",
+        json={"delete_code": ""},
+    )
+    assert del_resp.status == 403
+    assert room_id in _room_meta
+    _room_meta.pop(room_id, None)
+
+
+# ─── Fix 3: admin session is a browser-session cookie ────────────────────────
+
+@pytest.mark.asyncio
+async def test_admin_login_cookie_has_no_max_age(admin_client) -> None:
+    """Session cookie set on successful login must NOT carry a max-age attribute.
+
+    Without max-age the cookie expires when the browser closes, preventing
+    auto-login across browser restarts or on synced browser profiles.
+    """
+    path = _srv_mod._ADMIN_PATH
+    resp = await admin_client.post(
+        f"/{path}/login",
+        json={"passcode": _srv_mod._ADMIN_PASSCODE},
+    )
+    assert resp.status == 200
+    cookie = resp.cookies.get("admin_session")
+    assert cookie is not None
+    # A session cookie must not expose a Max-Age (or Expires) attribute.
+    cookie_str = str(cookie)
+    assert "Max-Age" not in cookie_str and "max-age" not in cookie_str.lower()
+
+
+@pytest.mark.asyncio
+async def test_admin_login_clears_previous_sessions(admin_client) -> None:
+    """A new login must invalidate all previous admin session tokens (single-session)."""
+    import server as _s
+    path = _s._ADMIN_PATH
+
+    # Login once; grab the first token
+    await admin_client.post(f"/{path}/login", json={"passcode": _s._ADMIN_PASSCODE})
+    first_tokens = set(_s._ADMIN_SESSIONS.keys())
+    assert len(first_tokens) == 1
+
+    # Login again; the first token must no longer be valid
+    await admin_client.post(f"/{path}/login", json={"passcode": _s._ADMIN_PASSCODE})
+    second_tokens = set(_s._ADMIN_SESSIONS.keys())
+    assert len(second_tokens) == 1
+    # The old token must have been invalidated
+    assert not first_tokens & second_tokens, "Old session was not cleared on new login"
+
+
+# ─── Fix 1: system-resource metrics are per-process ──────────────────────────
+
+@pytest.mark.asyncio
+async def test_admin_stats_cpu_percent_within_normalised_range(admin_client) -> None:
+    """sys_cpu_percent in /api/stats must be in [0, 100] (normalised per-process)."""
+    await _login(admin_client)
+    resp = await admin_client.get("/admin/api/stats")
+    assert resp.status == 200
+    body = await resp.json()
+    assert "sys_cpu_percent" in body, "sys_cpu_percent missing — is psutil installed?"
+    pct = body["sys_cpu_percent"]
+    assert isinstance(pct, (int, float))
+    assert 0 <= pct <= 100, f"sys_cpu_percent {pct} is outside the normalised 0-100 range"
+
+
+# ─── Fix 2: SSE log stream replays recent history ────────────────────────────
+
+@pytest.mark.asyncio
+async def test_log_recent_ring_buffer_populated() -> None:
+    """_log_recent is populated when log records are emitted via _SseLogHandler."""
+    import logging
+    import server as _s
+
+    # Attach a temporary handler using the same formatter the real startup uses
+    handler = _s._SseLogHandler()
+    handler.setFormatter(logging.Formatter(
+        fmt="%(asctime)s  %(levelname)-8s  %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%SZ",
+    ))
+    root = logging.getLogger()
+    root.addHandler(handler)
+    # Use a unique sentinel so we can find it even if the buffer is already full.
+    import secrets as _sec
+    marker = f"ring-buffer-probe-{_sec.token_hex(8)}"
+    try:
+        logging.getLogger("test.ring_buffer").info("%s", marker)
+    finally:
+        root.removeHandler(handler)
+
+    assert any(marker in m for m in _s._log_recent), (
+        "_log_recent does not contain the emitted log line"
+    )
