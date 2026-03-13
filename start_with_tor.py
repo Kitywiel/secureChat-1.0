@@ -201,17 +201,42 @@ def _find_geoip_files(tor_exe: Path) -> dict[str, str]:
     alongside *tor_exe*.  Returns an empty dict when the files are absent
     (e.g. system Tor that ships geoip data elsewhere).
 
+    The Tor Expert Bundle for Windows lays out files as::
+
+        tor/
+          Tor/
+            tor.exe          ← tor_exe
+          Data/
+            Tor/
+              geoip
+              geoip6
+
+    Older or manually-extracted bundles sometimes place the files directly
+    next to tor.exe.  Both locations are checked.
+
     Return value: ``{"GeoIPFile": "/path/geoip", "GeoIPv6File": "/path/geoip6"}``
     — either key may be absent if the corresponding file is not found.
     """
     tor_dir = tor_exe.parent
+    # Candidate directories, in preference order:
+    #   1. tor/Data/Tor/  — standard Expert Bundle layout
+    #   2. tor_exe.parent — manually extracted / system Tor
+    candidates = [
+        tor_dir.parent / "Data" / "Tor",
+        tor_dir,
+    ]
     entries: dict[str, str] = {}
-    geoip = tor_dir / "geoip"
-    geoip6 = tor_dir / "geoip6"
-    if geoip.is_file():
-        entries["GeoIPFile"] = str(geoip)
-    if geoip6.is_file():
-        entries["GeoIPv6File"] = str(geoip6)
+    for base in candidates:
+        if not entries.get("GeoIPFile"):
+            geoip = base / "geoip"
+            if geoip.is_file():
+                entries["GeoIPFile"] = str(geoip)
+        if not entries.get("GeoIPv6File"):
+            geoip6 = base / "geoip6"
+            if geoip6.is_file():
+                entries["GeoIPv6File"] = str(geoip6)
+        if len(entries) == 2:
+            break
     return entries
 
 

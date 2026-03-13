@@ -1430,6 +1430,12 @@ def build_admin_app() -> web.Application:
 
 
 def build_app(db_path: Path | None = None) -> web.Application:
+    global _ADMIN_PASSCODE, _ADMIN_PATH, _ADMIN_WEBHOOK_TOKEN  # noqa: PLW0603
+    if not _ADMIN_PASSCODE:
+        _ADMIN_PATH, _ADMIN_PASSCODE = _init_admin_credentials()
+    if not _ADMIN_WEBHOOK_TOKEN:
+        _ADMIN_WEBHOOK_TOKEN = secrets.token_urlsafe(32)
+
     resolved_db = db_path if db_path is not None else DB_PATH
 
     # Allow up to MAX_UPLOAD_BYTES for multipart uploads
