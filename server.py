@@ -2217,14 +2217,57 @@ def _init_clearnet_path() -> str:
     print("=" * 72, flush=True)
     print("  CLEARNET ACCESS URL — share only over a secure channel", flush=True)
     print("=" * 72, flush=True)
-    print(f"  Clearnet path  : /{path}/", flush=True)
-    print(f"  Full URL hint  : http://<your-public-ip>:<port>/{path}/", flush=True)
-    print(f"  Outbound chain : 6 SOCKS5 proxies (server.py _FREE_SOCKS5_PROXIES)", flush=True)
+    print(f"  Secret path    : /{path}/", flush=True)
+    print(f"  Proxy chain    : 6 SOCKS5 hops  (exit IP printed below at startup)", flush=True)
     print("=" * 72, flush=True)
     print("", flush=True)
     logger.info("clearnet access path ready  (printed to console at startup)")
 
     return path
+
+
+async def _probe_clearnet_exit_ip() -> None:
+    """Fetch and print the public exit IP seen through the last SOCKS5 proxy.
+
+    Uses the final entry in _FREE_SOCKS5_PROXIES (proxy #6) to route a
+    request to a well-known IP-reflection service, then prints the returned
+    IP to the console so the operator can verify which exit address is in use.
+
+    This runs as a background task from on_startup so it does not delay server
+    boot.  If the probe fails (proxy down, network error) a warning is printed
+    instead of the IP.
+    """
+    last_proxy = _FREE_SOCKS5_PROXIES[-1] if _FREE_SOCKS5_PROXIES else ""
+    # ip-reflection services that return just the raw IP text
+    ip_services = [
+        "https://api.ipify.org",
+        "https://checkip.amazonaws.com",
+        "https://icanhazip.com",
+    ]
+    exit_ip: str | None = None
+    for url in ip_services:
+        try:
+            sess = _build_session(last_proxy, timeout=10.0)
+            async with sess:
+                async with sess.get(url) as resp:
+                    if resp.status == 200:
+                        exit_ip = (await resp.text()).strip()
+                        break
+        except Exception:  # noqa: BLE001
+            continue
+
+    print("", flush=True)
+    print("=" * 72, flush=True)
+    print("  CLEARNET EXIT IP (via last proxy)", flush=True)
+    print("=" * 72, flush=True)
+    if exit_ip:
+        print(f"  Exit IP        : {exit_ip}", flush=True)
+        print(f"  Via proxy      : {last_proxy}", flush=True)
+    else:
+        print(f"  Exit IP        : (could not reach IP service via {last_proxy})", flush=True)
+        print(f"                   Check that the last proxy is reachable.", flush=True)
+    print("=" * 72, flush=True)
+    print("", flush=True)
 
 
 async def _lockdown_broadcast_task() -> None:
@@ -2561,6 +2604,8 @@ def build_app(db_path: Path | None = None) -> web.Application:
         app["_lockdown_broadcast_task"] = asyncio.create_task(_lockdown_broadcast_task())
         app["_mailtm_poll_task"] = asyncio.create_task(_mailtm_poll_all_inboxes())
         logger.info("admin panel ready  (credentials printed to console at startup)")
+        # Probe and print the clearnet exit IP through the last SOCKS5 proxy
+        asyncio.create_task(_probe_clearnet_exit_ip())
 
         # Start the inbound SMTP server when a mail domain is configured
         if MAIL_DOMAIN:

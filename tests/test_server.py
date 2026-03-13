@@ -2390,3 +2390,102 @@ def test_free_socks5_proxies_all_valid_urls() -> None:
     import server as _s
     for url in _s._FREE_SOCKS5_PROXIES:
         assert url.startswith("socks5://"), f"Not a socks5:// URL: {url}"
+
+
+@pytest.mark.asyncio
+async def test_probe_clearnet_exit_ip_prints_ip(capsys) -> None:
+    """_probe_clearnet_exit_ip() prints the exit IP when the proxy responds."""
+    import server as _s
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    mock_resp = AsyncMock()
+    mock_resp.status = 200
+    mock_resp.text = AsyncMock(return_value="1.2.3.4\n")
+    mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+    mock_resp.__aexit__ = AsyncMock(return_value=False)
+
+    mock_sess = MagicMock()
+    mock_sess.get = MagicMock(return_value=mock_resp)
+    mock_sess.__aenter__ = AsyncMock(return_value=mock_sess)
+    mock_sess.__aexit__ = AsyncMock(return_value=False)
+
+    with patch.object(_s, "_build_session", return_value=mock_sess):
+        await _s._probe_clearnet_exit_ip()
+
+    captured = capsys.readouterr()
+    assert "1.2.3.4" in captured.out
+    assert "Exit IP" in captured.out
+
+
+@pytest.mark.asyncio
+async def test_probe_clearnet_exit_ip_handles_failure(capsys) -> None:
+    """_probe_clearnet_exit_ip() prints a warning when all services fail."""
+    import server as _s
+    from unittest.mock import patch
+
+    def _bad_session(*_a, **_kw):
+        raise RuntimeError("no network")
+
+    with patch.object(_s, "_build_session", side_effect=_bad_session):
+        await _s._probe_clearnet_exit_ip()
+
+    captured = capsys.readouterr()
+    assert "Exit IP" in captured.out
+    assert "could not reach" in captured.out.lower() or "Could not reach" in captured.out
+
+
+def test_init_clearnet_path_console_no_full_url_hint(capsys) -> None:
+    """_init_clearnet_path() must NOT print the old 'Full URL hint' placeholder line."""
+    import server as _s
+    import os
+
+    # Use a fixed path so we can inspect output without randomness
+    orig = os.environ.get("CLEARNET_PATH", "")
+    os.environ["CLEARNET_PATH"] = "x" * 100
+    try:
+        _s._init_clearnet_path()
+    finally:
+        if orig:
+            os.environ["CLEARNET_PATH"] = orig
+        else:
+            os.environ.pop("CLEARNET_PATH", None)
+
+    captured = capsys.readouterr()
+    # Old broken line must be gone
+    assert "Full URL hint" not in captured.out
+    assert "http://<your-public-ip>" not in captured.out
+    # New clean lines must be present
+    assert "Secret path" in captured.out
+    assert "Proxy chain" in captured.out
+
+
+@pytest.mark.asyncio
+async def test_probe_clearnet_exit_ip_uses_last_proxy(capsys) -> None:
+    """_probe_clearnet_exit_ip passes _FREE_SOCKS5_PROXIES[-1] to _build_session."""
+    import server as _s
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    called_with: list = []
+
+    mock_resp = AsyncMock()
+    mock_resp.status = 200
+    mock_resp.text = AsyncMock(return_value="9.8.7.6")
+    mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+    mock_resp.__aexit__ = AsyncMock(return_value=False)
+
+    mock_sess = MagicMock()
+    mock_sess.get = MagicMock(return_value=mock_resp)
+    mock_sess.__aenter__ = AsyncMock(return_value=mock_sess)
+    mock_sess.__aexit__ = AsyncMock(return_value=False)
+
+    def _capture_build_session(proxy_url: str, timeout: float):
+        called_with.append(proxy_url)
+        return mock_sess
+
+    with patch.object(_s, "_build_session", side_effect=_capture_build_session):
+        await _s._probe_clearnet_exit_ip()
+
+    expected = _s._FREE_SOCKS5_PROXIES[-1]
+    assert called_with, "_build_session was never called"
+    assert called_with[0] == expected, (
+    )
