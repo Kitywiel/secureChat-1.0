@@ -2489,3 +2489,152 @@ async def test_probe_clearnet_exit_ip_uses_last_proxy(capsys) -> None:
     assert called_with, "_build_session was never called"
     assert called_with[0] == expected, (
     )
+
+
+# ---------------------------------------------------------------------------
+# Proxy watchdog and health-check tests
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_proxy_watchdog_marks_offline_and_invalidates_cache(capsys) -> None:
+    """_proxy_watchdog_task marks a proxy offline and clears the proxy cache."""
+    import server as _s
+    from unittest.mock import patch, AsyncMock
+    import asyncio as _asyncio
+
+    # Simulate all free proxies failing
+    probe_calls: list[str] = []
+
+    async def _always_offline(proxy_url: str, timeout: float = 5.0) -> bool:
+        probe_calls.append(proxy_url)
+        return False
+
+    # Initialise health as all online so we see the state change
+    original_health = dict(_s._proxy_health)
+    original_cache = _s._proxy_cache
+    original_cache_ts = _s._proxy_cache_ts
+    for p in _s._FREE_SOCKS5_PROXIES:
+        _s._proxy_health[p] = True
+    _s._proxy_cache = _s._FREE_SOCKS5_PROXIES[0]
+    _s._proxy_cache_ts = 9e18  # far in the future
+
+    try:
+        # Patch sleep: first call returns normally (runs the loop body),
+        # second call raises CancelledError to stop the loop.
+        call_count = 0
+
+        async def _sleep_once(_secs):
+            nonlocal call_count
+            call_count += 1
+            if call_count > 1:
+                raise _asyncio.CancelledError
+
+        with patch("server.asyncio.sleep", side_effect=_sleep_once), \
+             patch.object(_s, "_probe_proxy", side_effect=_always_offline):
+            try:
+                await _s._proxy_watchdog_task()
+            except _asyncio.CancelledError:
+                pass
+
+        # _probe_proxy must have been called once per proxy in _FREE_SOCKS5_PROXIES
+        assert len(probe_calls) == len(_s._FREE_SOCKS5_PROXIES), (
+            f"Expected {len(_s._FREE_SOCKS5_PROXIES)} probe calls, got {len(probe_calls)}"
+        )
+        for p in _s._FREE_SOCKS5_PROXIES:
+            assert p in probe_calls, f"_probe_proxy was not called for {p}"
+
+        # All proxies should now be marked offline
+        for p in _s._FREE_SOCKS5_PROXIES:
+            assert _s._proxy_health.get(p) is False, f"Expected {p} to be offline"
+        # Cache should have been invalidated
+        assert _s._proxy_cache == ""
+        assert _s._proxy_cache_ts == 0.0
+
+        captured = capsys.readouterr()
+        assert "OFFLINE" in captured.out
+    finally:
+        _s._proxy_health.clear()
+        _s._proxy_health.update(original_health)
+        _s._proxy_cache = original_cache
+        _s._proxy_cache_ts = original_cache_ts
+
+
+@pytest.mark.asyncio
+async def test_make_proxied_session_skips_offline_proxy() -> None:
+    """_make_proxied_session skips proxies marked offline in _proxy_health."""
+    import server as _s
+    from unittest.mock import patch
+
+    original_health = dict(_s._proxy_health)
+    original_cache = _s._proxy_cache
+    original_cache_ts = _s._proxy_cache_ts
+    try:
+        # Mark all free proxies offline
+        for p in _s._FREE_SOCKS5_PROXIES:
+            _s._proxy_health[p] = False
+        # Invalidate the proxy cache so _make_proxied_session re-probes
+        _s._proxy_cache = ""
+        _s._proxy_cache_ts = 0.0
+
+        probed: list[str] = []
+
+        async def _track_probe(proxy_url: str, timeout: float = 5.0) -> bool:
+            probed.append(proxy_url)
+            return proxy_url == ""  # only direct succeeds
+
+        with patch.object(_s, "_probe_proxy", side_effect=_track_probe):
+            sess = await _s._make_proxied_session(timeout=5.0)
+            await sess.close()
+
+        # No offline proxy should have been probed
+        for p in _s._FREE_SOCKS5_PROXIES:
+            assert p not in probed, f"Offline proxy {p} was probed — should have been skipped"
+        # Direct (empty string) should have been chosen
+        assert _s._proxy_cache == ""
+    finally:
+        _s._proxy_health.clear()
+        _s._proxy_health.update(original_health)
+        _s._proxy_cache = original_cache
+        _s._proxy_cache_ts = original_cache_ts
+
+
+@pytest.mark.asyncio
+async def test_probe_clearnet_exit_ip_skips_offline_uses_online(capsys) -> None:
+    """_probe_clearnet_exit_ip skips offline proxies and uses the first online one."""
+    import server as _s
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    original_health = dict(_s._proxy_health)
+    try:
+        # Mark all but the first proxy offline
+        for p in _s._FREE_SOCKS5_PROXIES:
+            _s._proxy_health[p] = False
+        _s._proxy_health[_s._FREE_SOCKS5_PROXIES[0]] = True
+
+        mock_resp = AsyncMock()
+        mock_resp.status = 200
+        mock_resp.text = AsyncMock(return_value="5.6.7.8")
+        mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+        mock_resp.__aexit__ = AsyncMock(return_value=False)
+
+        mock_sess = MagicMock()
+        mock_sess.get = MagicMock(return_value=mock_resp)
+        mock_sess.__aenter__ = AsyncMock(return_value=mock_sess)
+        mock_sess.__aexit__ = AsyncMock(return_value=False)
+
+        with patch.object(_s, "_build_session", return_value=mock_sess):
+            await _s._probe_clearnet_exit_ip()
+
+        captured = capsys.readouterr()
+        assert "5.6.7.8" in captured.out
+        assert "Exit IP" in captured.out
+    finally:
+        _s._proxy_health.clear()
+        _s._proxy_health.update(original_health)
+
+
+def test_proxy_health_dict_exists() -> None:
+    """_proxy_health and _proxy_watchdog_task must be defined in server.py."""
+    import server as _s
+    assert isinstance(_s._proxy_health, dict)
+    assert callable(_s._proxy_watchdog_task)

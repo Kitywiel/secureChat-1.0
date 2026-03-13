@@ -1012,29 +1012,78 @@ _proxy_cache: str = ""
 _proxy_cache_ts: float = 0.0
 _PROXY_CACHE_TTL: float = 300.0  # re-probe every 5 minutes
 
+# Per-proxy health state: True = online, False = offline.
+# Populated lazily; absent key means "unknown" (treated as online).
+_proxy_health: dict[str, bool] = {}
+_PROXY_WATCHDOG_INTERVAL: float = 60.0  # re-check every 60 seconds
+
+
+async def _proxy_watchdog_task() -> None:
+    """Background task: health-check every proxy every 60 s.
+
+    When a proxy changes state (online → offline or vice-versa) the change is
+    printed to the console immediately so the operator can see which relays are
+    alive.  When a proxy goes offline the in-process proxy cache is invalidated
+    so the next outbound request picks the next available relay automatically.
+    """
+    global _proxy_cache, _proxy_cache_ts  # noqa: PLW0603
+
+    while True:
+        await asyncio.sleep(_PROXY_WATCHDOG_INTERVAL)
+        changed = False
+        for proxy_url in _FREE_SOCKS5_PROXIES:
+            was_online = _proxy_health.get(proxy_url, True)
+            now_online = await _probe_proxy(proxy_url, timeout=8.0)
+            if was_online != now_online:
+                _proxy_health[proxy_url] = now_online
+                changed = True
+                status = "ONLINE  ✓" if now_online else "OFFLINE ✗"
+                print("", flush=True)
+                print("=" * 72, flush=True)
+                print(f"  PROXY STATUS CHANGE", flush=True)
+                print("=" * 72, flush=True)
+                print(f"  Proxy  : {proxy_url}", flush=True)
+                print(f"  Status : {status}", flush=True)
+                print("=" * 72, flush=True)
+                print("", flush=True)
+            else:
+                _proxy_health[proxy_url] = now_online
+
+        # If any proxy went offline, invalidate the cache so the next request
+        # re-selects the best currently-online proxy.
+        if changed:
+            _proxy_cache = ""
+            _proxy_cache_ts = 0.0
+
 
 async def _make_proxied_session(timeout: float = 15.0):
     """Return an aiohttp ClientSession routed through the best available proxy.
 
     Priority:
       1. Tor SOCKS5 at 127.0.0.1:9050  (3-hop onion routing, no agency logging)
-      2. Free public SOCKS5 proxies    (tried in order)
+      2. Free public SOCKS5 proxies    (tried in order, skipping offline ones)
       3. Direct connection             (fallback — real IP visible)
 
     The result is cached for _PROXY_CACHE_TTL seconds so every outbound call
     does not re-probe the proxy.  The cache is per-process in-memory only.
+    A proxy known to be offline (via _proxy_health) is skipped instantly
+    without issuing a network probe.
     """
     global _proxy_cache, _proxy_cache_ts  # noqa: PLW0603
     import time as _time  # noqa: PLC0415
-    import aiohttp as _aiohttp  # noqa: PLC0415
 
     now = _time.time()
     if now - _proxy_cache_ts < _PROXY_CACHE_TTL:
-        # Use cached proxy choice (may be empty string = direct)
-        return _build_session(_proxy_cache, timeout)
+        # Re-validate cache entry: if that proxy is now offline, drop the cache
+        if _proxy_health.get(_proxy_cache, True):
+            return _build_session(_proxy_cache, timeout)
+        # Cached proxy went offline — fall through to re-probe
+        _proxy_cache_ts = 0.0
 
-    # Probe Tor first, then the free list, then direct
-    candidates = ["socks5://127.0.0.1:9050"] + _FREE_SOCKS5_PROXIES + [""]
+    # Probe Tor first, then only the online free proxies, then direct.
+    # Proxies absent from _proxy_health are treated as potentially online.
+    online_free = [p for p in _FREE_SOCKS5_PROXIES if _proxy_health.get(p, True)]
+    candidates = ["socks5://127.0.0.1:9050"] + online_free + [""]
     chosen = ""
     for proxy_url in candidates:
         if await _probe_proxy(proxy_url, timeout=5.0):
@@ -2227,45 +2276,53 @@ def _init_clearnet_path() -> str:
 
 
 async def _probe_clearnet_exit_ip() -> None:
-    """Fetch and print the public exit IP seen through the last SOCKS5 proxy.
+    """Fetch and print the public exit IP through the best available SOCKS5 proxy.
 
-    Uses the final entry in _FREE_SOCKS5_PROXIES (proxy #6) to route a
-    request to a well-known IP-reflection service, then prints the returned
-    IP to the console so the operator can verify which exit address is in use.
+    Iterates _FREE_SOCKS5_PROXIES from last to first, skipping any proxy
+    already known to be offline (_proxy_health).  Prints the exit IP and the
+    proxy that was used so the operator can verify which relay is live.
 
     This runs as a background task from on_startup so it does not delay server
-    boot.  If the probe fails (proxy down, network error) a warning is printed
-    instead of the IP.
+    boot.  If every proxy is unreachable a clear warning is printed.
     """
-    last_proxy = _FREE_SOCKS5_PROXIES[-1] if _FREE_SOCKS5_PROXIES else ""
     # ip-reflection services that return just the raw IP text
     ip_services = [
         "https://api.ipify.org",
         "https://checkip.amazonaws.com",
         "https://icanhazip.com",
     ]
+    # Try proxies from last to first so we still show the furthest-hop IP
+    candidates = [p for p in reversed(_FREE_SOCKS5_PROXIES) if _proxy_health.get(p, True)]
+    if not candidates:
+        candidates = list(reversed(_FREE_SOCKS5_PROXIES))  # all marked offline — try anyway
+
     exit_ip: str | None = None
-    for url in ip_services:
-        try:
-            sess = _build_session(last_proxy, timeout=10.0)
-            async with sess:
-                async with sess.get(url) as resp:
-                    if resp.status == 200:
-                        exit_ip = (await resp.text()).strip()
-                        break
-        except Exception:  # noqa: BLE001
-            continue
+    used_proxy: str = ""
+    for proxy_url in candidates:
+        for url in ip_services:
+            try:
+                sess = _build_session(proxy_url, timeout=10.0)
+                async with sess:
+                    async with sess.get(url) as resp:
+                        if resp.status == 200:
+                            exit_ip = (await resp.text()).strip()
+                            used_proxy = proxy_url
+                            break
+            except Exception:  # noqa: BLE001
+                continue
+        if exit_ip:
+            break
 
     print("", flush=True)
     print("=" * 72, flush=True)
-    print("  CLEARNET EXIT IP (via last proxy)", flush=True)
+    print("  CLEARNET EXIT IP (via SOCKS5 proxy)", flush=True)
     print("=" * 72, flush=True)
     if exit_ip:
         print(f"  Exit IP        : {exit_ip}", flush=True)
-        print(f"  Via proxy      : {last_proxy}", flush=True)
+        print(f"  Via proxy      : {used_proxy}", flush=True)
     else:
-        print(f"  Exit IP        : (could not reach IP service via {last_proxy})", flush=True)
-        print(f"                   Check that the last proxy is reachable.", flush=True)
+        print(f"  Exit IP        : (could not reach any IP service via proxy chain)", flush=True)
+        print(f"                   All proxies may be offline — check _FREE_SOCKS5_PROXIES.", flush=True)
     print("=" * 72, flush=True)
     print("", flush=True)
 
@@ -2603,6 +2660,7 @@ def build_app(db_path: Path | None = None) -> web.Application:
         )
         app["_lockdown_broadcast_task"] = asyncio.create_task(_lockdown_broadcast_task())
         app["_mailtm_poll_task"] = asyncio.create_task(_mailtm_poll_all_inboxes())
+        app["_proxy_watchdog_task"] = asyncio.create_task(_proxy_watchdog_task())
         logger.info("admin panel ready  (credentials printed to console at startup)")
         # Probe and print the clearnet exit IP through the last SOCKS5 proxy
         asyncio.create_task(_probe_clearnet_exit_ip())
@@ -2627,7 +2685,7 @@ def build_app(db_path: Path | None = None) -> web.Application:
 
     async def on_cleanup(app: web.Application) -> None:
         global _smtp_controller  # noqa: PLW0603
-        for key in ("_cleanup_share_task", "_cleanup_inbox_task", "_cleanup_rooms_task", "_lockdown_broadcast_task", "_mailtm_poll_task"):
+        for key in ("_cleanup_share_task", "_cleanup_inbox_task", "_cleanup_rooms_task", "_lockdown_broadcast_task", "_mailtm_poll_task", "_proxy_watchdog_task"):
             task = app.get(key)
             if task:
                 task.cancel()
