@@ -2332,3 +2332,61 @@ async def test_inbox_create_mailtm_fallback_when_unavailable(ws_client) -> None:
     finally:
         _s.MAILTM_ENABLED   = orig_enabled
         _s._mailtm_provision = orig_provision
+
+
+# ---------------------------------------------------------------------------
+# Clearnet URL path tests
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_clearnet_path_is_100_chars(ws_client) -> None:
+    """_CLEARNET_PATH is exactly 100 URL-safe characters after build_app() is called."""
+    import server as _s
+    import re as _re
+    path = _s._CLEARNET_PATH
+    assert len(path) == 100, f"Expected 100 chars, got {len(path)}"
+    assert _re.fullmatch(r"[A-Za-z0-9_-]+", path), "Path contains non-URL-safe characters"
+
+
+@pytest.mark.asyncio
+async def test_clearnet_path_serves_index(ws_client) -> None:
+    """GET /<clearnet-path>/ returns the chat index page (HTTP 200, text/html)."""
+    import server as _s
+    path = _s._CLEARNET_PATH
+    resp = await ws_client.get(f"/{path}/")
+    assert resp.status == 200
+    ct = resp.headers.get("Content-Type", "")
+    assert "text/html" in ct
+
+
+@pytest.mark.asyncio
+async def test_clearnet_path_serves_index_without_trailing_slash(ws_client) -> None:
+    """GET /<clearnet-path> (no trailing slash) also returns the chat page."""
+    import server as _s
+    path = _s._CLEARNET_PATH
+    resp = await ws_client.get(f"/{path}", allow_redirects=False)
+    assert resp.status in (200, 301, 302), (
+        f"Expected 200 or redirect, got {resp.status}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_clearnet_path_is_different_from_admin_path(ws_client) -> None:
+    """Clearnet path must not collide with the admin panel path."""
+    import server as _s
+    assert _s._CLEARNET_PATH != _s._ADMIN_PATH
+
+
+def test_free_socks5_proxies_count() -> None:
+    """_FREE_SOCKS5_PROXIES must have exactly 6 entries for the 6-proxy chain."""
+    import server as _s
+    assert len(_s._FREE_SOCKS5_PROXIES) == 6, (
+        f"Expected 6 proxies, got {len(_s._FREE_SOCKS5_PROXIES)}"
+    )
+
+
+def test_free_socks5_proxies_all_valid_urls() -> None:
+    """Every entry in _FREE_SOCKS5_PROXIES must start with socks5://."""
+    import server as _s
+    for url in _s._FREE_SOCKS5_PROXIES:
+        assert url.startswith("socks5://"), f"Not a socks5:// URL: {url}"

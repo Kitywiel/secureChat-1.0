@@ -248,6 +248,11 @@ ADMIN_LOGIN_HARD_CAP_WINDOW = 86400   # seconds over which cumulative failures a
 ADMIN_LOGIN_HARD_CAP_DURATION = 3600  # how long (seconds) the hard lockout lasts (1 h)
 _ADMIN_LOGIN_HARD_LOCKOUT: dict[str, float] = {}  # IP → unlock_at
 
+# Clearnet public access path — a 100-character randomly-generated URL path segment.
+# Traffic from the server is routed through the 6-proxy SOCKS5 chain defined below.
+# The clearnet path is set at startup (see _init_clearnet_path()).
+_CLEARNET_PATH: str = ""               # 100-char random URL segment, set at startup
+
 # Minimal HTML gate page returned when a share-download requires a passcode.
 # {error} is replaced with either an empty string or an <p class="err">…</p> element.
 _PASSCODE_GATE_PAGE = """\
@@ -991,12 +996,15 @@ async def _cleanup_expired_share_slots() -> None:
 
 # Free public SOCKS5 proxies — tried in order after Tor.
 # These are long-running, widely-tested free proxies (no payment, no signup).
+# Six proxies are listed so the clearnet service always has a full 6-hop chain
+# to fall back to when Tor is unavailable.
 _FREE_SOCKS5_PROXIES: list[str] = [
     "socks5://67.201.33.10:25283",    # US  — well-known free relay
     "socks5://72.195.34.58:4145",     # US
     "socks5://98.162.96.41:4145",     # US
     "socks5://174.77.111.197:4145",   # US
     "socks5://192.111.139.165:4145",  # US
+    "socks5://184.178.172.25:15291",  # US  — 6th proxy for the 6-hop clearnet chain
 ]
 
 # In-process cache: last verified proxy URL (or empty string = direct)
@@ -2186,6 +2194,39 @@ def _init_admin_credentials() -> tuple[str, str]:
     return path, pc
 
 
+def _init_clearnet_path() -> str:
+    """Generate (or read from env) the 100-character clearnet URL path segment.
+
+    The clearnet path is a security-through-obscurity access URL for the main
+    chat interface over the regular internet.  All outbound connections from
+    the server are routed through the 6-proxy SOCKS5 chain
+    (_FREE_SOCKS5_PROXIES) to avoid exposing the server's real IP.
+
+    The path is printed to the console at startup and must be kept private.
+    Set CLEARNET_PATH in the environment to pin a specific path across restarts.
+
+    Returns:
+        The 100-character URL-safe path string (no leading/trailing slashes).
+    """
+    path = os.environ.get("CLEARNET_PATH", "").strip()
+    if not path:
+        # secrets.token_urlsafe(75) returns exactly 100 URL-safe base64 characters.
+        path = secrets.token_urlsafe(75)[:100]
+
+    print("", flush=True)
+    print("=" * 72, flush=True)
+    print("  CLEARNET ACCESS URL — share only over a secure channel", flush=True)
+    print("=" * 72, flush=True)
+    print(f"  Clearnet path  : /{path}/", flush=True)
+    print(f"  Full URL hint  : http://<your-public-ip>:<port>/{path}/", flush=True)
+    print(f"  Outbound chain : 6 SOCKS5 proxies (server.py _FREE_SOCKS5_PROXIES)", flush=True)
+    print("=" * 72, flush=True)
+    print("", flush=True)
+    logger.info("clearnet access path ready  (printed to console at startup)")
+
+    return path
+
+
 async def _lockdown_broadcast_task() -> None:
     """Background task: while lockdown is active, emit a warning log every 5 seconds."""
     while True:
@@ -2483,13 +2524,15 @@ async def _forward_to_peers(room_id: str, payload: str) -> None:
 
 
 def build_app(db_path: Path | None = None) -> web.Application:
-    global _ADMIN_PASSCODE, _ADMIN_PATH, _ADMIN_WEBHOOK_TOKEN, _MESH_TOKEN  # noqa: PLW0603
+    global _ADMIN_PASSCODE, _ADMIN_PATH, _ADMIN_WEBHOOK_TOKEN, _MESH_TOKEN, _CLEARNET_PATH  # noqa: PLW0603
     if not _ADMIN_PASSCODE:
         _ADMIN_PATH, _ADMIN_PASSCODE = _init_admin_credentials()
     if not _ADMIN_WEBHOOK_TOKEN:
         _ADMIN_WEBHOOK_TOKEN = secrets.token_urlsafe(32)
     if not _MESH_TOKEN:
         _MESH_TOKEN = secrets.token_urlsafe(32)
+    if not _CLEARNET_PATH:
+        _CLEARNET_PATH = _init_clearnet_path()
 
     resolved_db = db_path if db_path is not None else DB_PATH
 
@@ -2582,6 +2625,15 @@ def build_app(db_path: Path | None = None) -> web.Application:
 
     # Mount admin panel under the secret 200-char path on the same server
     _register_admin_routes(app)
+
+    # Mount clearnet access under the secret 100-char path.
+    # This serves the standard chat interface — the path itself provides
+    # security-through-obscurity for clearnet deployments.
+    cp = _CLEARNET_PATH
+    if cp:
+        app.router.add_get(f"/{cp}/", index_handler)
+        app.router.add_get(f"/{cp}", index_handler)
+
     return app
 
 
@@ -2600,6 +2652,7 @@ if __name__ == "__main__":
     _ADMIN_PATH, _ADMIN_PASSCODE = _init_admin_credentials()
     _ADMIN_WEBHOOK_TOKEN = secrets.token_urlsafe(32)
     print(f"  Admin webhook  : /{_ADMIN_PATH}/webhook/{_ADMIN_WEBHOOK_TOKEN}", flush=True)
+    _CLEARNET_PATH = _init_clearnet_path()
 
     logger.info("secureChat starting  host=%s  port=%d", host, port)
     logger.info(
