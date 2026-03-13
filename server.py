@@ -239,8 +239,14 @@ _ADMIN_PASSCODE: str = ""              # set at startup (see _init_admin_credent
 _ADMIN_PATH: str = ""                  # 200-char random URL segment, set at startup
 _ADMIN_SESSIONS: dict[str, float] = {}  # token → expires_at
 _ADMIN_WEBHOOK_TOKEN: str = ""         # set at startup (incoming webhook secret token)
-# Brute-force rate-limiter: IP → list of failure timestamps
+# Brute-force rate-limiter: IP → list of failure timestamps (sliding window)
 _ADMIN_LOGIN_FAILURES: dict[str, list[float]] = {}
+# Hard-cap lockout: IP → unlock_timestamp.  Set after ADMIN_LOGIN_HARD_CAP cumulative
+# failures within ADMIN_LOGIN_HARD_CAP_WINDOW seconds; prevents indefinite retry loops.
+ADMIN_LOGIN_HARD_CAP = 30             # cumulative failures that trigger the hard lockout
+ADMIN_LOGIN_HARD_CAP_WINDOW = 86400   # seconds over which cumulative failures are counted (24 h)
+ADMIN_LOGIN_HARD_CAP_DURATION = 3600  # how long (seconds) the hard lockout lasts (1 h)
+_ADMIN_LOGIN_HARD_LOCKOUT: dict[str, float] = {}  # IP → unlock_at
 
 # Minimal HTML gate page returned when a share-download requires a passcode.
 # {error} is replaced with either an empty string or an <p class="err">…</p> element.
@@ -716,6 +722,17 @@ async def _broadcast_to_room(
 
 async def index_handler(request: web.Request) -> web.FileResponse:
     return web.FileResponse(STATIC_DIR / "index.html")
+
+
+async def _blocked_static_handler(request: web.Request) -> web.Response:  # noqa: ARG001
+    """Return 404 for static files that must never be served directly.
+
+    admin.html contains the admin-panel template and must only be served
+    through _admin_index_handler (which injects the secret path and adds
+    security headers).  Serving the raw file via /static/ would disclose
+    the admin panel's existence and all its API endpoints to any visitor.
+    """
+    raise web.HTTPNotFound()
 
 
 # ---------------------------------------------------------------------------
@@ -1860,8 +1877,17 @@ async def _admin_login_handler(request: web.Request) -> web.Response:
     # ── Rate-limiting ─────────────────────────────────────────────────────────
     ip = request.remote or "unknown"
     now = time.time()
+
+    # Hard-cap lockout: once an IP accumulates ADMIN_LOGIN_HARD_CAP failures
+    # within the hard-cap window, it is blocked for ADMIN_LOGIN_HARD_CAP_DURATION
+    # seconds.  This prevents indefinite 60-second retry loops.
+    unlock_at = _ADMIN_LOGIN_HARD_LOCKOUT.get(ip, 0.0)
+    if now < unlock_at:
+        logger.warning("admin login hard-locked  ip=%s  unlock_in=%.0fs", ip, unlock_at - now)
+        raise web.HTTPTooManyRequests(reason="Too many failed attempts — try again later")
+
     failures = _ADMIN_LOGIN_FAILURES.get(ip, [])
-    # Purge timestamps outside the window
+    # Purge timestamps outside the sliding window
     failures = [t for t in failures if now - t < ADMIN_LOGIN_RATE_WINDOW]
     if len(failures) >= ADMIN_LOGIN_MAX_ATTEMPTS:
         logger.warning("admin login rate-limited  ip=%s", ip)
@@ -1876,10 +1902,21 @@ async def _admin_login_handler(request: web.Request) -> web.Response:
     if not secrets.compare_digest(provided, _ADMIN_PASSCODE):
         failures.append(now)
         _ADMIN_LOGIN_FAILURES[ip] = failures
-        logger.warning("admin login failed  ip=%s  attempts=%d", ip, len(failures))
+        # Check if the cumulative failure count over the hard-cap window has been exceeded
+        recent_all = [t for t in failures if now - t < ADMIN_LOGIN_HARD_CAP_WINDOW]
+        if len(recent_all) >= ADMIN_LOGIN_HARD_CAP:
+            _ADMIN_LOGIN_HARD_LOCKOUT[ip] = now + ADMIN_LOGIN_HARD_CAP_DURATION
+            _ADMIN_LOGIN_FAILURES.pop(ip, None)
+            logger.warning(
+                "admin login hard-locked  ip=%s  failures=%d  locked_for=%ds",
+                ip, len(recent_all), ADMIN_LOGIN_HARD_CAP_DURATION,
+            )
+        else:
+            logger.warning("admin login failed  ip=%s  attempts=%d", ip, len(failures))
         raise web.HTTPForbidden(reason="Wrong passcode")
-    # Success — clear failure record
+    # Success — clear failure and lockout records for this IP
     _ADMIN_LOGIN_FAILURES.pop(ip, None)
+    _ADMIN_LOGIN_HARD_LOCKOUT.pop(ip, None)
     # Single-session: invalidate all previous sessions so that any other
     # browser or device that held an old token is automatically logged out.
     _ADMIN_SESSIONS.clear()
@@ -2214,6 +2251,9 @@ async def _admin_lockdown_handler(request: web.Request) -> web.Response:
         _inbox_logged_tokens.clear()
         _share_slots.clear()
         _room_meta.clear()
+        # Also clear login failure tracking so the admin can log back in after lockdown
+        _ADMIN_LOGIN_FAILURES.clear()
+        _ADMIN_LOGIN_HARD_LOCKOUT.clear()
 
         # 4. Close all open WebSocket connections
         for ws_set in list(rooms.values()):
@@ -2530,6 +2570,9 @@ def build_app(db_path: Path | None = None) -> web.Application:
     app.router.add_get("/inbox/{token}/drop", inbox_drop_page_handler)
     app.router.add_post("/inbox/{token}/drop", inbox_drop_handler)
     app.router.add_get("/inbox/{token}/read", inbox_read_handler)
+    # Block admin.html from the public static file handler — it must only be
+    # served via _admin_index_handler which injects the secret path.
+    app.router.add_get("/static/admin.html", _blocked_static_handler)
     app.router.add_static("/static", STATIC_DIR, show_index=False)
 
     # Mesh peer federation routes
