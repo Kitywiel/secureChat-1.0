@@ -1,0 +1,457 @@
+#!/usr/bin/env python3
+"""
+run.py — secureChat zero-config launcher
+=========================================
+Run this single file.  It handles everything automatically:
+
+  1. Installs missing Python dependencies.
+  2. Starts Tor and creates a public .onion hidden service
+     (downloads the Tor Expert Bundle on Windows if needed).
+  3. Generates a random RELAY_SECRET for the IP-private SMTP relay endpoint.
+  4. Starts the secureChat server.
+  5. Prints a startup summary with every URL you need.
+
+Usage
+-----
+    python run.py                 # default port 5000
+    python run.py --port 8080     # custom port
+
+Environment overrides (all optional — every default works out-of-the-box)
+--------------------------------------------------------------------------
+    PORT           TCP port for the server        (default: 5000)
+    HOST           Bind interface                 (default: 127.0.0.1 with Tor, 0.0.0.0 without)
+    DB_PATH        Path to SQLite database        (default: securechat.db next to run.py)
+    RELAY_SECRET   SMTP relay webhook secret      (auto-generated when not set)
+    MAIL_DOMAIN    Your real mail domain for SMTP (optional; needed for port-25 SMTP)
+    SMTP_PORT      SMTP listen port               (default: 25)
+
+No other configuration is needed.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import os
+import platform
+import secrets
+import shutil
+import socket
+import subprocess
+import sys
+import tarfile
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# Resolve paths
+# ---------------------------------------------------------------------------
+_HERE = Path(__file__).resolve().parent
+_REQUIREMENTS = _HERE / "requirements.txt"
+
+# Tor paths (mirrors start_with_tor.py so they share the same downloaded bundle)
+_TOR_DIR      = _HERE / "tor"
+_HS_DIR       = _HERE / "tor_hs"
+_TOR_DATA_DIR = _HERE / "tor_data"
+
+# Tor Expert Bundle download (Windows auto-download)
+_TOR_VERSION    = "14.0.9"
+_TOR_BUNDLE_URL = (
+    f"https://dist.torproject.org/torbrowser/{_TOR_VERSION}/"
+    f"tor-expert-bundle-windows-x86_64-{_TOR_VERSION}.tar.gz"
+)
+
+# ---------------------------------------------------------------------------
+# Step 1 — Auto-install dependencies
+# ---------------------------------------------------------------------------
+
+def _ensure_dependencies() -> None:
+    """Install any missing packages listed in requirements.txt."""
+    if not _REQUIREMENTS.is_file():
+        return
+
+    print("  Checking Python dependencies …")
+    result = subprocess.run(
+        [
+            sys.executable, "-m", "pip", "install",
+            "--quiet", "--disable-pip-version-check",
+            "-r", str(_REQUIREMENTS),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        print(
+            "\n  WARNING: pip install reported errors.  The server may still work "
+            "if all packages are already installed.\n"
+        )
+        print(result.stderr[:1000])
+    else:
+        print("  Dependencies OK.")
+
+
+# ---------------------------------------------------------------------------
+# Step 2 — Tor helpers (adapted from start_with_tor.py)
+# ---------------------------------------------------------------------------
+
+def _find_tor() -> Path | None:
+    """Return the path to a usable tor executable, or None."""
+    for rel in ["tor/Tor/tor.exe", "tor/tor.exe", "tor/tor"]:
+        p = _HERE / rel
+        if p.is_file():
+            return p
+    found = shutil.which("tor")
+    if found:
+        return Path(found)
+    if platform.system() == "Windows":
+        home = Path.home()
+        username = os.environ.get("USERNAME", "")
+        for c in [
+            home / "Desktop" / "Tor Browser" / "Browser" / "TorBrowser" / "Tor" / "tor.exe",
+            Path(f"C:/Users/{username}/Desktop/Tor Browser/Browser/TorBrowser/Tor/tor.exe"),
+            Path("C:/Program Files/Tor Browser/Browser/TorBrowser/Tor/tor.exe"),
+        ]:
+            try:
+                if c.is_file():
+                    return c
+            except (OSError, ValueError):
+                pass
+    return None
+
+
+def _download_tor_windows() -> Path | None:
+    """Download the Tor Expert Bundle on Windows.  Returns path to tor.exe."""
+    if platform.system() != "Windows":
+        return None
+    _TOR_DIR.mkdir(parents=True, exist_ok=True)
+    archive = _TOR_DIR / "tor-expert-bundle.tar.gz"
+    print(f"  Downloading Tor Expert Bundle from torproject.org …")
+    try:
+        urllib.request.urlretrieve(_TOR_BUNDLE_URL, archive)
+    except urllib.error.URLError as exc:
+        print(f"  Download failed: {exc}")
+        return None
+
+    # SHA-256 verification
+    sha256_url  = _TOR_BUNDLE_URL + ".sha256sum"
+    sha256_file = _TOR_DIR / "tor-expert-bundle.tar.gz.sha256sum"
+    try:
+        urllib.request.urlretrieve(sha256_url, sha256_file)
+        expected = sha256_file.read_text(encoding="utf-8").split()[0].lower()
+        actual   = hashlib.sha256(archive.read_bytes()).hexdigest().lower()
+        if actual != expected:
+            print("  SHA-256 mismatch — aborting for your safety.")
+            archive.unlink(missing_ok=True)
+            return None
+        print("  SHA-256 verified.")
+    except urllib.error.URLError as exc:
+        print(f"  Warning: could not verify checksum ({exc}).")
+    finally:
+        sha256_file.unlink(missing_ok=True)
+
+    print("  Extracting …")
+    try:
+        with tarfile.open(archive) as tf:
+            safe = [
+                m for m in tf.getmembers()
+                if not os.path.isabs(m.name) and ".." not in m.name.split("/")
+            ]
+            tf.extractall(_TOR_DIR, members=safe)
+    except Exception as exc:
+        print(f"  Extraction failed: {exc}")
+        return None
+    finally:
+        archive.unlink(missing_ok=True)
+
+    for rel in ["Tor/tor.exe", "tor.exe"]:
+        p = _TOR_DIR / rel
+        if p.is_file():
+            return p
+    return None
+
+
+def _find_geoip_files(tor_exe: Path) -> dict:
+    tor_dir = tor_exe.parent
+    entries: dict[str, str] = {}
+    for base in [tor_dir.parent / "Data" / "Tor", tor_dir]:
+        if "GeoIPFile" not in entries:
+            geoip = base / "geoip"
+            if geoip.is_file():
+                entries["GeoIPFile"] = str(geoip)
+        if "GeoIPv6File" not in entries:
+            geoip6 = base / "geoip6"
+            if geoip6.is_file():
+                entries["GeoIPv6File"] = str(geoip6)
+        if len(entries) == 2:
+            break
+    return entries
+
+
+def _free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def _tor_log(line: str) -> None:
+    if "Bootstrapped" in line or "[err]" in line.lower() or "[warn]" in line.lower():
+        print(f"  [Tor] {line.rstrip()}")
+
+
+def _start_tor(tor_exe: Path, server_port: int) -> tuple[str, object] | None:
+    """Launch Tor with a hidden service on *server_port*.
+
+    Returns ``(onion_address, tor_process)`` or ``None``.
+    """
+    try:
+        import stem.process  # noqa: PLC0415
+    except ImportError:
+        print("  stem not installed — skipping Tor.")
+        return None
+
+    _HS_DIR.mkdir(parents=True, exist_ok=True)
+    _TOR_DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    print("\n  Starting Tor …  (may take up to 90 s on first run)")
+
+    config: dict = {
+        "SocksPort":        "0",
+        "ControlPort":      str(_free_port()),
+        "DataDirectory":    str(_TOR_DATA_DIR),
+        "HiddenServiceDir": str(_HS_DIR),
+        "HiddenServicePort": f"80 127.0.0.1:{server_port}",
+    }
+    config.update(_find_geoip_files(tor_exe))
+
+    tor_process = None
+    for attempt in range(3):
+        if attempt > 0:
+            config["ControlPort"] = str(_free_port())
+        try:
+            tor_process = stem.process.launch_tor_with_config(
+                tor_cmd=str(tor_exe),
+                config=config,
+                timeout=90,
+                init_msg_handler=_tor_log,
+            )
+            break
+        except OSError:
+            continue
+        except Exception as exc:  # noqa: BLE001
+            print(f"  Tor error: {exc}")
+            return None
+
+    if tor_process is None:
+        print("  Tor failed to start.")
+        return None
+
+    hostname_file = _HS_DIR / "hostname"
+    for _ in range(60):
+        if hostname_file.is_file():
+            onion = hostname_file.read_text(encoding="utf-8").strip()
+            return onion, tor_process
+        time.sleep(1)
+
+    print("  Timed out waiting for .onion hostname.")
+    tor_process.terminate()
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Step 3 — Detect LAN IP for fallback URL
+# ---------------------------------------------------------------------------
+
+def _lan_ip() -> str:
+    """Best-effort detection of the machine's LAN IP address."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            return s.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
+
+
+# ---------------------------------------------------------------------------
+# Step 4 — Print startup summary
+# ---------------------------------------------------------------------------
+
+def _print_summary(
+    *,
+    server_port: int,
+    onion: str | None,
+    admin_path: str,
+    admin_passcode: str,
+    relay_secret: str,
+    relay_enabled: bool,
+    smtp_enabled: bool,
+    mail_domain: str,
+) -> None:
+    lan = _lan_ip()
+    sep = "=" * 66
+
+    print()
+    print(sep)
+    print("  🔒  secureChat is running!")
+    print(sep)
+
+    if onion:
+        print()
+        print("  🧅  Public .onion URL  (open in Tor Browser):")
+        print()
+        print(f"        http://{onion}")
+        print()
+        print("  Share this with the other party — it works from anywhere.")
+    else:
+        print()
+        print("  🌐  Local / LAN access:")
+        print()
+        print(f"        http://{lan}:{server_port}")
+        print()
+        print("  Tip: install Tor (https://torproject.org) and re-run for a")
+        print("       public .onion address that works from anywhere.")
+
+    print()
+    print(f"  🔐  Admin panel  (keep secret):")
+    print(f"        http://127.0.0.1:{server_port}/{admin_path}/")
+    print(f"        Passcode: {admin_passcode}")
+
+    print()
+    print("  📬  Inbox:")
+    print(f"        Open http://{'<onion>' if onion else f'{lan}:{server_port}'}  and click 'Inbox'")
+    if smtp_enabled:
+        print(f"        Real SMTP:  <token>@{mail_domain}  (direct port-25 SMTP, exposes server IP)")
+    if relay_enabled:
+        print()
+        print("  📡  IP-private relay webhook  (your IP stays hidden):")
+        print(f"        POST https://<your-domain>/inbox/relay")
+        print(f"        X-Relay-Secret: {relay_secret}")
+        print()
+        print("        Point Mailgun / SendGrid / Cloudflare Email Workers at")
+        print("        this URL to receive email without exposing your IP.")
+        print("        See  static/mail_read.html  for setup instructions.")
+    else:
+        print()
+        print("        IP-private relay webhook is available automatically.")
+        print(f"        Relay secret: {relay_secret}")
+        print("        To use it, set  RELAY_SECRET=<above>  when you restart,")
+        print("        then configure your relay service to POST to /inbox/relay.")
+
+    print()
+    print("  Press Ctrl+C to stop.")
+    print(sep)
+    print()
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="secureChat zero-config launcher")
+    parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", "5000")))
+    parser.add_argument("--no-tor", action="store_true", help="Skip Tor even if installed")
+    args = parser.parse_args()
+
+    server_port: int = args.port
+
+    print()
+    print("=" * 66)
+    print("  secureChat — zero-config launcher")
+    print("=" * 66)
+    print()
+
+    # ── 1. Dependencies ──────────────────────────────────────────────
+    _ensure_dependencies()
+
+    # ── 2. Set environment variables before importing server ─────────
+    os.environ.setdefault("PORT", str(server_port))
+
+    # Auto-generate RELAY_SECRET if not already set
+    relay_secret = os.environ.get("RELAY_SECRET", "")
+    relay_was_set = bool(relay_secret)
+    if not relay_secret:
+        relay_secret = secrets.token_urlsafe(32)
+        # We print the generated secret in the summary but do NOT auto-enable
+        # the endpoint (user must consciously set it in their relay service).
+        # Setting it here activates the /inbox/relay route for this session.
+        os.environ["RELAY_SECRET"] = relay_secret
+    relay_enabled = True  # always enabled once we've set the env var
+
+    # ── 3. Tor ───────────────────────────────────────────────────────
+    onion: str | None = None
+    tor_process = None
+
+    if not args.no_tor:
+        print()
+        tor_exe = _find_tor()
+        if not tor_exe:
+            print("  Tor not found — trying to download (Windows only) …")
+            tor_exe = _download_tor_windows()
+
+        if tor_exe:
+            result = _start_tor(tor_exe, server_port)
+            if result:
+                onion, tor_process = result
+                os.environ.setdefault("HOST", "127.0.0.1")
+                print(f"\n  ✅  .onion address ready: {onion}")
+            else:
+                print("  ⚠️  Tor hidden service failed — falling back to LAN access.")
+        else:
+            print("  Tor not available — using LAN access.")
+            print("  Install Tor from https://torproject.org for a public .onion address.")
+
+    if not onion:
+        # No Tor — bind to all interfaces so LAN devices can connect
+        os.environ.setdefault("HOST", "0.0.0.0")
+
+    # ── 4. Import server (now dependencies are guaranteed to be present) ──
+    # We must import AFTER pip-installing, and AFTER setting env vars.
+    try:
+        import server as srv  # noqa: PLC0415
+    except ImportError as exc:
+        print(f"\n  ERROR: could not import server.py — {exc}")
+        sys.exit(1)
+
+    from aiohttp import web  # noqa: PLC0415
+
+    # ── 5. Initialise admin credentials in this process ──────────────
+    import secrets as _secrets  # noqa: PLC0415
+
+    # Initialise credentials in the server module's globals directly so
+    # build_app() picks them up without a second initialisation.
+    srv._ADMIN_PATH, srv._ADMIN_PASSCODE = srv._init_admin_credentials()
+    srv._ADMIN_WEBHOOK_TOKEN = _secrets.token_urlsafe(32)
+
+    mail_domain: str = srv.MAIL_DOMAIN
+    smtp_enabled: bool = bool(mail_domain)
+
+    # ── 6. Print startup summary ─────────────────────────────────────
+    _print_summary(
+        server_port=server_port,
+        onion=onion,
+        admin_path=srv._ADMIN_PATH,
+        admin_passcode=srv._ADMIN_PASSCODE,
+        relay_secret=relay_secret,
+        relay_enabled=True,
+        smtp_enabled=smtp_enabled,
+        mail_domain=mail_domain,
+    )
+
+    # ── 7. Run the server ─────────────────────────────────────────────
+    host = os.environ.get("HOST", "127.0.0.1")
+    try:
+        web.run_app(srv.build_app(), host=host, port=server_port, access_log=None)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if tor_process is not None:
+            try:
+                tor_process.terminate()
+            except Exception:  # noqa: BLE001
+                pass
+        print("\n  Server stopped.  Goodbye!")
+
+
+if __name__ == "__main__":
+    main()

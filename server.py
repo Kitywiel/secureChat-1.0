@@ -1296,6 +1296,9 @@ async def inbox_relay_handler(request: web.Request) -> web.Response:
         subject[:60],
     )
     return web.json_response({"ok": True})
+
+
+async def _cleanup_expired_inbox_slots() -> None:
     """Background task: sweep expired inbox slots every 5 minutes."""
     while True:
         await asyncio.sleep(300)
@@ -2012,7 +2015,7 @@ if __name__ == "__main__":
     logger.info("secureChat starting  host=%s  port=%d", host, port)
     logger.info(
         "Expose via a Tor hidden service for anonymous access — "
-        "run start_server.bat for automatic setup (Windows)."
+        "run  python run.py  for automatic zero-config setup."
     )
 
     app = build_app()

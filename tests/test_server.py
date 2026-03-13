@@ -1860,3 +1860,184 @@ async def test_server_info_includes_mail_domain(ws_client) -> None:
     assert "mail_domain" in data
     # In test environment MAIL_DOMAIN is not set
     assert data["mail_domain"] is None
+
+
+# ---------------------------------------------------------------------------
+# Relay webhook endpoint tests
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_relay_disabled_without_secret(ws_client) -> None:
+    """POST /inbox/relay returns 404 when RELAY_SECRET is not configured."""
+    import server as _s
+    original = _s.RELAY_SECRET
+    try:
+        _s.RELAY_SECRET = ""
+        resp = await ws_client.post("/inbox/relay", json={"token": "x", "body": "hi"})
+        assert resp.status == 404
+    finally:
+        _s.RELAY_SECRET = original
+
+
+@pytest.mark.asyncio
+async def test_relay_rejects_wrong_secret(ws_client) -> None:
+    """POST /inbox/relay returns 403 when the secret is wrong."""
+    import server as _s
+    original = _s.RELAY_SECRET
+    try:
+        _s.RELAY_SECRET = "correct-secret"
+        resp = await ws_client.post(
+            "/inbox/relay",
+            json={"secret": "wrong-secret", "token": "x", "body": "hi"},
+        )
+        assert resp.status == 403
+    finally:
+        _s.RELAY_SECRET = original
+
+
+@pytest.mark.asyncio
+async def test_relay_json_deposits_message(ws_client) -> None:
+    """POST /inbox/relay (JSON) deposits a message into the matching inbox."""
+    import server as _s
+    original = _s.RELAY_SECRET
+    try:
+        _s.RELAY_SECRET = "test-relay-secret"
+        create = await ws_client.post("/inbox/create", json={"ttl_minutes": 10})
+        data   = await create.json()
+        token  = data["drop_url"].split("/")[2]
+
+        relay_resp = await ws_client.post(
+            "/inbox/relay",
+            json={
+                "secret":  "test-relay-secret",
+                "token":   token,
+                "from":    "relay@example.com",
+                "subject": "Relay test",
+                "body":    "Hello from relay",
+            },
+        )
+        assert relay_resp.status == 200
+        assert (await relay_resp.json())["ok"] is True
+
+        read_resp = await ws_client.get(f"/inbox/{token}/read")
+        body = await read_resp.json()
+        assert body["count"] == 1
+        msg = body["messages"][0]
+        assert msg["body"] == "Hello from relay"
+        assert msg["email_from"] == "relay@example.com"
+        assert msg["subject"] == "Relay test"
+    finally:
+        _s.RELAY_SECRET = original
+
+
+@pytest.mark.asyncio
+async def test_relay_json_html_content_type(ws_client) -> None:
+    """POST /inbox/relay sets content_type=text/html when html field is present."""
+    import server as _s
+    original = _s.RELAY_SECRET
+    try:
+        _s.RELAY_SECRET = "test-relay-secret"
+        create = await ws_client.post("/inbox/create", json={"ttl_minutes": 5})
+        token  = (await create.json())["drop_url"].split("/")[2]
+
+        await ws_client.post(
+            "/inbox/relay",
+            json={
+                "secret": "test-relay-secret",
+                "token":  token,
+                "html":   "<b>HTML email</b>",
+                "body":   "fallback plain",
+            },
+        )
+        read_resp = await ws_client.get(f"/inbox/{token}/read")
+        msg = (await read_resp.json())["messages"][0]
+        assert msg["content_type"] == "text/html"
+        assert msg["body"] == "<b>HTML email</b>"
+    finally:
+        _s.RELAY_SECRET = original
+
+
+@pytest.mark.asyncio
+async def test_relay_secret_via_header(ws_client) -> None:
+    """POST /inbox/relay accepts the secret in X-Relay-Secret header."""
+    import server as _s
+    original = _s.RELAY_SECRET
+    try:
+        _s.RELAY_SECRET = "header-secret"
+        create = await ws_client.post("/inbox/create", json={})
+        token  = (await create.json())["drop_url"].split("/")[2]
+
+        resp = await ws_client.post(
+            "/inbox/relay",
+            headers={"X-Relay-Secret": "header-secret"},
+            json={"token": token, "body": "from header auth"},
+        )
+        assert resp.status == 200
+    finally:
+        _s.RELAY_SECRET = original
+
+
+@pytest.mark.asyncio
+async def test_relay_mailgun_form_format(ws_client) -> None:
+    """POST /inbox/relay handles Mailgun-style form-encoded payload."""
+    import server as _s
+    original = _s.RELAY_SECRET
+    try:
+        _s.RELAY_SECRET = "mg-secret"
+        create = await ws_client.post("/inbox/create", json={})
+        token  = (await create.json())["drop_url"].split("/")[2]
+
+        resp = await ws_client.post(
+            "/inbox/relay",
+            headers={"X-Relay-Secret": "mg-secret"},
+            data={
+                "recipient":   f"{token}@mail.example.com",
+                "sender":      "user@gmail.com",
+                "subject":     "Mailgun test",
+                "body-plain":  "Mailgun body",
+            },
+        )
+        assert resp.status == 200
+        read = await ws_client.get(f"/inbox/{token}/read")
+        msgs = (await read.json())["messages"]
+        assert len(msgs) == 1
+        assert msgs[0]["email_from"] == "user@gmail.com"
+        assert msgs[0]["subject"] == "Mailgun test"
+    finally:
+        _s.RELAY_SECRET = original
+
+
+@pytest.mark.asyncio
+async def test_relay_unknown_token_returns_404(ws_client) -> None:
+    """POST /inbox/relay returns 404 for a token that doesn't exist."""
+    import server as _s
+    original = _s.RELAY_SECRET
+    try:
+        _s.RELAY_SECRET = "test-secret"
+        resp = await ws_client.post(
+            "/inbox/relay",
+            json={
+                "secret": "test-secret",
+                "token":  "doesnotexist",
+                "body":   "x",
+            },
+        )
+        assert resp.status == 404
+    finally:
+        _s.RELAY_SECRET = original
+
+
+@pytest.mark.asyncio
+async def test_relay_enabled_field_in_create_response(ws_client) -> None:
+    """POST /inbox/create always returns relay_enabled field."""
+    resp = await ws_client.post("/inbox/create", json={})
+    data = await resp.json()
+    assert "relay_enabled" in data
+
+
+@pytest.mark.asyncio
+async def test_server_info_includes_relay_enabled(ws_client) -> None:
+    """GET /api/server-info includes relay_enabled field."""
+    resp = await ws_client.get("/api/server-info")
+    data = await resp.json()
+    assert "relay_enabled" in data
