@@ -206,6 +206,12 @@ INBOX_DEFAULT_TTL_MINUTES = 60              # default lifetime in minutes
 MAIL_DOMAIN: str = os.environ.get("MAIL_DOMAIN", "")
 SMTP_PORT: int = int(os.environ.get("SMTP_PORT", "25"))
 
+# IP-privacy relay webhook support.
+# Set RELAY_SECRET to a shared secret you configure in Mailgun / SendGrid / Cloudflare.
+# When set, POST /inbox/relay only processes requests that include this secret.
+# Leave unset to disable the relay endpoint entirely.
+RELAY_SECRET: str = os.environ.get("RELAY_SECRET", "")
+
 # Room-create / passcode constants
 MAX_PASSCODE_LEN = 64                  # characters in a room or share passcode
 MAX_DESTRUCT_MINUTES = 1440            # 24 hours maximum
@@ -1052,6 +1058,7 @@ async def inbox_create_handler(request: web.Request) -> web.Response:
         "reader_url":   f"/inbox/{token}",
         "expires_at":   expires_at,
         "smtp_enabled": bool(MAIL_DOMAIN),
+        "relay_enabled": bool(RELAY_SECRET),
     })
 
 
@@ -1150,7 +1157,145 @@ async def inbox_drop_page_handler(request: web.Request) -> web.Response:
     return web.Response(text=html, content_type="text/html")
 
 
-async def _cleanup_expired_inbox_slots() -> None:
+async def inbox_relay_handler(request: web.Request) -> web.Response:
+    """POST /inbox/relay — IP-privacy relay webhook endpoint.
+
+    Instead of running a direct SMTP listener (which exposes this server's IP),
+    you can point your domain's MX records at a relay service (Mailgun, SendGrid,
+    Cloudflare Email Workers, ImprovMX, ForwardEmail, etc.) and have the relay
+    POST inbound emails here over HTTPS.  Your IP only needs to be reachable on
+    port 443 — it never appears in MX records.
+
+    Requires ``RELAY_SECRET`` environment variable to be set.  The secret must be
+    present in the request (checked against the ``X-Relay-Secret`` header, a
+    ``secret`` query-string parameter, or a ``secret`` JSON body field).
+
+    Supported relay payload formats
+    --------------------------------
+    **Generic JSON** (recommended — works with any relay via a custom worker)::
+
+        {
+            "secret":       "<RELAY_SECRET>",
+            "token":        "<inbox-token>",   # the local-part of the address
+            "from":         "alice@example.com",
+            "subject":      "Hello",
+            "body":         "Plain-text body",   # or "html": "<b>HTML body</b>"
+            "html":         "<b>HTML body</b>"   # optional; takes precedence over body
+        }
+
+    **Mailgun Inbound Routes** (application/x-www-form-urlencoded or multipart/form-data)::
+
+        recipient=<token>@mail.example.com
+        sender=alice@example.com
+        subject=Hello
+        body-plain=Plain text
+        body-html=<b>HTML</b>   # optional
+
+    **SendGrid Inbound Parse Webhook** (multipart/form-data)::
+
+        to=<token>@mail.example.com
+        from=alice@example.com
+        subject=Hello
+        text=Plain text
+        html=<b>HTML</b>   # optional
+
+    Returns 200 ``{"ok": true}`` on success.  Returns 403 if the secret is wrong,
+    404 if the inbox token is not found / expired, 400 for malformed payloads.
+    """
+    if not RELAY_SECRET:
+        raise web.HTTPNotFound()  # endpoint doesn't exist unless configured
+
+    # ── Authenticate ────────────────────────────────────────────────────────
+    # Accept the secret via header, query-string, or body field.
+    provided_secret = (
+        request.headers.get("X-Relay-Secret", "")
+        or request.rel_url.query.get("secret", "")
+    )
+
+    ct = request.content_type or ""
+    raw_body: bytes = await request.read()
+
+    # Parse body depending on content type
+    json_body: dict = {}
+    form_data: dict = {}
+
+    if "json" in ct:
+        try:
+            import json as _json
+            json_body = _json.loads(raw_body) if raw_body else {}
+        except Exception:
+            raise web.HTTPBadRequest(reason="Invalid JSON body")
+    elif "form" in ct or "multipart" in ct:
+        try:
+            post = await request.post()
+            form_data = dict(post)
+        except Exception:
+            raise web.HTTPBadRequest(reason="Could not parse form body")
+    # else: body may carry the secret in headers / query-string only
+
+    if not provided_secret:
+        # Fall back to body fields
+        provided_secret = (
+            json_body.get("secret", "")
+            or str(form_data.get("secret", ""))
+        )
+
+    # Constant-time comparison to prevent timing attacks
+    import hmac as _hmac
+    if not _hmac.compare_digest(
+        provided_secret.encode("utf-8"),
+        RELAY_SECRET.encode("utf-8"),
+    ):
+        logger.warning("inbox relay auth failed  remote=%s", request.remote)
+        raise web.HTTPForbidden(reason="Invalid relay secret")
+
+    # ── Extract fields ───────────────────────────────────────────────────────
+    if json_body:
+        # Generic JSON format
+        token      = str(json_body.get("token") or "").strip()
+        from_addr  = str(json_body.get("from") or json_body.get("sender") or "").strip()
+        subject    = str(json_body.get("subject") or "").strip()
+        body_html  = str(json_body.get("html") or "").strip()
+        body_text  = str(json_body.get("body") or json_body.get("text") or "").strip()
+    elif form_data:
+        # Mailgun: recipient=token@domain  sender=  subject=  body-plain=  body-html=
+        # SendGrid: to=token@domain  from=  subject=  text=  html=
+        raw_to     = str(form_data.get("recipient") or form_data.get("to") or "").strip()
+        token      = raw_to.split("@")[0] if "@" in raw_to else raw_to
+        from_addr  = str(form_data.get("sender") or form_data.get("from") or "").strip()
+        subject    = str(form_data.get("subject") or "").strip()
+        body_html  = str(form_data.get("body-html") or form_data.get("html") or "").strip()
+        body_text  = str(form_data.get("body-plain") or form_data.get("text") or "").strip()
+    else:
+        raise web.HTTPBadRequest(reason="Unsupported content type; send JSON or form data")
+
+    if not token:
+        raise web.HTTPBadRequest(reason="Missing inbox token (recipient/to/token field)")
+
+    # ── Deposit into inbox ───────────────────────────────────────────────────
+    slot = _inbox_slots.get(token)
+    if slot is None or time.time() > slot["expires_at"]:
+        _inbox_slots.pop(token, None)
+        raise web.HTTPNotFound(reason="Inbox not found or expired")
+
+    body = body_html or body_text or "(empty message)"
+    if len(body) > MAX_INBOX_MESSAGE_LEN:
+        body = body[:MAX_INBOX_MESSAGE_LEN]
+
+    slot["messages"].append({
+        "body":         body,
+        "email_from":   from_addr or None,
+        "subject":      subject or None,
+        "content_type": "text/html" if body_html else "text/plain",
+        "received_at":  time.time(),
+    })
+    logger.info(
+        "inbox relay received  token=…%s  from=%.40s  subject=%r",
+        token[-6:],
+        from_addr,
+        subject[:60],
+    )
+    return web.json_response({"ok": True})
     """Background task: sweep expired inbox slots every 5 minutes."""
     while True:
         await asyncio.sleep(300)
@@ -1290,7 +1435,7 @@ async def server_info_handler(request: web.Request) -> web.Response:
                 except Exception:  # noqa: BLE001
                     pass
                 break
-    return web.json_response({"onion": onion, "mail_domain": MAIL_DOMAIN or None})
+    return web.json_response({"onion": onion, "mail_domain": MAIL_DOMAIN or None, "relay_enabled": bool(RELAY_SECRET)})
 
 
 async def qrcode_handler(request: web.Request) -> web.Response:
@@ -1837,6 +1982,7 @@ def build_app(db_path: Path | None = None) -> web.Application:
     app.router.add_post("/share/download/{token}", share_download_post_handler)
     # One-time inbox routes
     app.router.add_post("/inbox/create", inbox_create_handler)
+    app.router.add_post("/inbox/relay", inbox_relay_handler)
     app.router.add_get("/inbox/{token}", inbox_read_page_handler)
     app.router.add_get("/inbox/{token}/drop", inbox_drop_page_handler)
     app.router.add_post("/inbox/{token}/drop", inbox_drop_handler)
