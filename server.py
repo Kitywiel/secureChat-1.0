@@ -166,12 +166,18 @@ MAX_DESTRUCT_MINUTES = 1440            # 24 hours maximum
 MAX_WEBHOOK_URL_LEN = 512              # characters in a webhook URL
 
 # Admin panel constants
-ADMIN_PORT    = int(os.environ.get("ADMIN_PORT", "5001"))
-ADMIN_ONION_ADDRESS: str | None = os.environ.get("ADMIN_ONION_ADDRESS")
+# The admin panel is served on the SAME port as the main site, but hidden behind
+# a 200-character randomly-generated URL path segment and a 100-character passcode.
+# ADMIN_PORT is kept for backwards-compatibility but is no longer used.
 ADMIN_SESSION_TTL = 3600               # 1 hour
-_ADMIN_PASSCODE: str = ""              # set at startup (see _init_admin_passcode())
+ADMIN_LOGIN_RATE_WINDOW = 60           # seconds to track failed login attempts
+ADMIN_LOGIN_MAX_ATTEMPTS = 10          # max failed attempts per IP in that window
+_ADMIN_PASSCODE: str = ""              # set at startup (see _init_admin_credentials())
+_ADMIN_PATH: str = ""                  # 200-char random URL segment, set at startup
 _ADMIN_SESSIONS: dict[str, float] = {}  # token → expires_at
 _ADMIN_WEBHOOK_TOKEN: str = ""         # set at startup (incoming webhook secret token)
+# Brute-force rate-limiter: IP → list of failure timestamps
+_ADMIN_LOGIN_FAILURES: dict[str, list[float]] = {}
 
 # Minimal HTML gate page returned when a share-download requires a passcode.
 # {error} is replaced with either an empty string or an <p class="err">…</p> element.
@@ -1034,7 +1040,8 @@ async def _fire_webhook(url: str, event: str, data: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Admin panel — served on ADMIN_PORT (default 5001)
+# Admin panel — served on the SAME port/URL as the main site, behind a
+# 200-character random path prefix and a 100-character passcode.
 # ---------------------------------------------------------------------------
 
 
@@ -1055,15 +1062,50 @@ def _valid_admin_session(request: web.Request) -> bool:
     return True
 
 
+def _add_admin_security_headers(resp: web.Response) -> None:
+    """Apply security headers to every admin response."""
+    resp.headers["X-Frame-Options"] = "DENY"
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["Referrer-Policy"] = "no-referrer"
+    resp.headers["Cache-Control"] = "no-store"
+    resp.headers["Pragma"] = "no-cache"
+    # Tight CSP: admin panel only needs inline scripts (already in admin.html)
+    resp.headers["Content-Security-Policy"] = (
+        "default-src 'self'; "
+        "script-src 'self' 'unsafe-inline'; "
+        "style-src 'self' 'unsafe-inline'; "
+        "connect-src 'self'; "
+        "img-src 'self' data:; "
+        "object-src 'none'; "
+        "frame-ancestors 'none';"
+    )
+
+
 async def _admin_login_handler(request: web.Request) -> web.Response:
-    """POST /admin/login — verify passcode; set session cookie on success."""
+    """POST /{path}/login — verify passcode; set session cookie on success."""
+    # ── Rate-limiting ─────────────────────────────────────────────────────────
+    ip = request.remote or "unknown"
+    now = time.time()
+    failures = _ADMIN_LOGIN_FAILURES.get(ip, [])
+    # Purge timestamps outside the window
+    failures = [t for t in failures if now - t < ADMIN_LOGIN_RATE_WINDOW]
+    if len(failures) >= ADMIN_LOGIN_MAX_ATTEMPTS:
+        logger.warning("admin login rate-limited  ip=%s", ip)
+        raise web.HTTPTooManyRequests(reason="Too many failed attempts — wait before retrying")
+    # ── Passcode check ────────────────────────────────────────────────────────
     try:
         body = await request.json()
     except Exception:
         raise web.HTTPBadRequest(reason="JSON body required")
     provided = str(body.get("passcode", ""))
-    if not provided or provided != _ADMIN_PASSCODE:
+    # Always call compare_digest (even for empty input) to prevent timing side-channels.
+    if not secrets.compare_digest(provided, _ADMIN_PASSCODE):
+        failures.append(now)
+        _ADMIN_LOGIN_FAILURES[ip] = failures
+        logger.warning("admin login failed  ip=%s  attempts=%d", ip, len(failures))
         raise web.HTTPForbidden(reason="Wrong passcode")
+    # Success — clear failure record
+    _ADMIN_LOGIN_FAILURES.pop(ip, None)
     token = _make_admin_session()
     _ADMIN_SESSIONS[token] = time.time() + ADMIN_SESSION_TTL
     resp = web.json_response({"ok": True})
@@ -1072,24 +1114,31 @@ async def _admin_login_handler(request: web.Request) -> web.Response:
         token,
         max_age=ADMIN_SESSION_TTL,
         httponly=True,
+        secure=False,   # set True if TLS is terminated upstream (e.g. nginx)
         samesite="Strict",
     )
+    _add_admin_security_headers(resp)
     return resp
 
 
-async def _admin_index_handler(request: web.Request) -> web.FileResponse:
-    """GET /admin/ — return admin panel HTML (authentication check first)."""
-    # JavaScript in admin.html handles the login/dashboard routing client-side.
-    return web.FileResponse(STATIC_DIR / "admin.html")
-
-
-async def _admin_root_redirect_handler(request: web.Request) -> web.Response:
-    """GET / on the admin port — redirect to /admin/."""
-    raise web.HTTPFound("/admin/")
+async def _admin_index_handler(request: web.Request) -> web.Response:
+    """GET /{path}/ — return admin panel HTML with the admin path injected."""
+    html = (STATIC_DIR / "admin.html").read_text(encoding="utf-8")
+    # Inject the admin path as a JS constant so all fetch() calls use the right URLs.
+    # The placeholder __ADMIN_PATH__ is replaced once at serve time.
+    html = html.replace("__ADMIN_PATH__", _ADMIN_PATH)
+    # Sanity-check that the replacement actually happened — if the placeholder is
+    # still present the admin JS would send requests to a literal bad URL.
+    if "__ADMIN_PATH__" in html:
+        logger.error("admin.html placeholder was not replaced — _ADMIN_PATH may be empty")
+        raise web.HTTPInternalServerError(reason="Admin panel misconfigured")
+    resp = web.Response(text=html, content_type="text/html")
+    _add_admin_security_headers(resp)
+    return resp
 
 
 async def _admin_stats_handler(request: web.Request) -> web.Response:
-    """GET /admin/api/stats — return current server stats as JSON."""
+    """GET /{path}/api/stats — return current server stats as JSON."""
     if not _valid_admin_session(request):
         raise web.HTTPUnauthorized()
     now = time.time()
@@ -1120,7 +1169,7 @@ async def _admin_stats_handler(request: web.Request) -> web.Response:
             label = "Never"
         by_destruct[label] = by_destruct.get(label, 0) + 1
 
-    return web.json_response({
+    resp = web.json_response({
         **_stats,
         "open_rooms": len(open_rooms),
         "inactive_rooms": len(inactive_rooms),
@@ -1128,25 +1177,31 @@ async def _admin_stats_handler(request: web.Request) -> web.Response:
         "open_file_transfers": len(_share_slots),
         "rooms_by_destruct": by_destruct,
     })
+    _add_admin_security_headers(resp)
+    return resp
 
 
 async def _admin_webhook_info_handler(request: web.Request) -> web.Response:
-    """GET /admin/api/webhook-info — return incoming webhook URL (requires auth)."""
+    """GET /{path}/api/webhook-info — return incoming webhook URL (requires auth)."""
     if not _valid_admin_session(request):
         raise web.HTTPUnauthorized()
-    return web.json_response({"webhook_token": _ADMIN_WEBHOOK_TOKEN})
+    resp = web.json_response({"webhook_token": _ADMIN_WEBHOOK_TOKEN})
+    _add_admin_security_headers(resp)
+    return resp
 
 
 async def _admin_logs_sse_handler(request: web.Request) -> web.StreamResponse:
-    """GET /admin/api/logs — SSE stream of live log records (requires auth)."""
+    """GET /{path}/api/logs — SSE stream of live log records (requires auth)."""
     if not _valid_admin_session(request):
         raise web.HTTPUnauthorized()
     # Each client gets its own queue so that all connected clients receive every message.
     q: asyncio.Queue = asyncio.Queue(maxsize=1000)
     _log_sse_clients.append(q)
     response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
-    response.headers["Cache-Control"] = "no-cache"
+    response.headers["Cache-Control"] = "no-store"
     response.headers["X-Accel-Buffering"] = "no"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-Content-Type-Options"] = "nosniff"
     await response.prepare(request)
     await response.write(b"retry: 3000\n\n")
     try:
@@ -1168,7 +1223,7 @@ async def _admin_logs_sse_handler(request: web.Request) -> web.StreamResponse:
 
 
 async def _admin_shutdown_handler(request: web.Request) -> web.Response:
-    """POST /admin/api/shutdown — emergency shutdown."""
+    """POST /{path}/api/shutdown — emergency shutdown."""
     if not _valid_admin_session(request):
         raise web.HTTPUnauthorized()
     logger.warning("EMERGENCY SHUTDOWN triggered via admin panel")
@@ -1176,18 +1231,20 @@ async def _admin_shutdown_handler(request: web.Request) -> web.Response:
     # terminate the process immediately, bypassing the event loop's normal cleanup
     # to prevent any in-flight tasks from delaying the stop.
     asyncio.get_running_loop().call_later(0.5, os._exit, 0)  # noqa: SLF001
-    return web.json_response({"ok": True, "msg": "Shutting down…"})
+    resp = web.json_response({"ok": True, "msg": "Shutting down…"})
+    _add_admin_security_headers(resp)
+    return resp
 
 
 async def _admin_incoming_webhook_handler(request: web.Request) -> web.Response:
-    """POST /admin/webhook/{token} — incoming webhook from an external service.
+    """POST /{path}/webhook/{token} — incoming webhook from an external service.
 
     Any service that knows the webhook token can POST a JSON payload here.
     The event is logged immediately and appears in the live-log SSE stream.
     No admin session is required — the token in the URL path acts as authentication.
     """
     token = request.match_info["token"]
-    if not token or token != _ADMIN_WEBHOOK_TOKEN:
+    if not token or not secrets.compare_digest(token, _ADMIN_WEBHOOK_TOKEN):
         raise web.HTTPUnauthorized(reason="Invalid webhook token")
     try:
         body = await request.json()
@@ -1196,25 +1253,72 @@ async def _admin_incoming_webhook_handler(request: web.Request) -> web.Response:
     event = str(body.get("event", "webhook"))
     logger.info("incoming webhook  event=%s  source=%s  payload=%s",
                 event, request.remote, json.dumps(body))
-    return web.json_response({"ok": True, "received": True})
+    resp = web.json_response({"ok": True, "received": True})
+    _add_admin_security_headers(resp)
+    return resp
 
 
-def _init_admin_passcode() -> str:
-    """Return the admin passcode — from env or auto-generated (100 chars)."""
+def _init_admin_credentials() -> tuple[str, str]:
+    """Generate (or read from env) admin path and passcode; print both to console.
+
+    Returns:
+        (admin_path, admin_passcode) — both are ready to use as URL/auth values.
+    """
+    # ── Path (200 random URL-safe characters) ─────────────────────────────────
+    path = os.environ.get("ADMIN_PATH", "").strip()
+    if not path:
+        # secrets.token_urlsafe(150) returns exactly ceil(150*4/3) = 200 base64 chars.
+        # The [:200] slice is defensive in case the formula changes in a future Python.
+        path = secrets.token_urlsafe(150)[:200]
+
+    # ── Passcode (100 characters) ──────────────────────────────────────────────
     pc = os.environ.get("ADMIN_PASSCODE", "").strip()
     if not pc:
-        # Generate a 100-character random passcode: 75 raw bytes → 100 url-safe base64 chars
+        # secrets.token_urlsafe(75) returns exactly 100 base64 chars.
         pc = secrets.token_urlsafe(75)[:100]
-        logger.info("admin passcode (auto-generated, save this): %s", pc)
-    return pc
 
+    # ── Print both prominently to the console ──────────────────────────────────
+    print("", flush=True)
+    print("=" * 72, flush=True)
+    print("  ADMIN PANEL CREDENTIALS — store these securely", flush=True)
+    print("=" * 72, flush=True)
+    print(f"  Admin URL path : /{path}/", flush=True)
+    print(f"  Admin passcode : {pc}", flush=True)
+    print("=" * 72, flush=True)
+    print("", flush=True)
+    logger.info("admin panel path   : /%s/", path)
+    logger.info("admin passcode     : %s", pc)
+
+    return path, pc
+
+
+def _register_admin_routes(app: web.Application) -> None:
+    """Add admin-panel routes to *app* under the secret path prefix."""
+    p = _ADMIN_PATH
+    app.router.add_get(f"/{p}/", _admin_index_handler)
+    app.router.add_get(f"/{p}", _admin_index_handler)
+    app.router.add_post(f"/{p}/login", _admin_login_handler)
+    app.router.add_get(f"/{p}/api/stats", _admin_stats_handler)
+    app.router.add_get(f"/{p}/api/webhook-info", _admin_webhook_info_handler)
+    app.router.add_get(f"/{p}/api/logs", _admin_logs_sse_handler)
+    app.router.add_post(f"/{p}/api/shutdown", _admin_shutdown_handler)
+    app.router.add_post(f"/{p}/webhook/{{token}}", _admin_incoming_webhook_handler)
+
+
+# ---------------------------------------------------------------------------
+# Legacy build_admin_app() — kept so existing test fixtures still work.
+# It now creates a standalone app with hardcoded /admin/* paths for tests;
+# the real server mounts admin under _ADMIN_PATH via _register_admin_routes().
+# ---------------------------------------------------------------------------
 
 def build_admin_app() -> web.Application:
-    """Build the admin aiohttp Application (served on ADMIN_PORT)."""
-    global _ADMIN_PASSCODE, _ADMIN_WEBHOOK_TOKEN  # noqa: PLW0603
-    _ADMIN_PASSCODE = _init_admin_passcode()
+    """Build a standalone admin Application using fixed /admin/* paths (used by tests)."""
+    global _ADMIN_PASSCODE, _ADMIN_PATH, _ADMIN_WEBHOOK_TOKEN  # noqa: PLW0603
+    if not _ADMIN_PASSCODE:
+        _ADMIN_PATH, _ADMIN_PASSCODE = _init_admin_credentials()
     _ADMIN_WEBHOOK_TOKEN = secrets.token_urlsafe(32)
-    logger.info("admin webhook token (incoming): /admin/webhook/%s", _ADMIN_WEBHOOK_TOKEN)
+    logger.info("admin webhook token (incoming): /%s/webhook/%s",
+                _ADMIN_PATH, _ADMIN_WEBHOOK_TOKEN)
 
     app = web.Application()
 
@@ -1227,10 +1331,12 @@ def build_admin_app() -> web.Application:
             datefmt="%Y-%m-%dT%H:%M:%SZ",
         ))
         logging.root.addHandler(handler)
-        logger.info("admin panel ready  port=%d", ADMIN_PORT)
+        logger.info("admin panel ready  path=/%s/", _ADMIN_PATH)
 
     app.on_startup.append(on_startup)
-    app.router.add_get("/", _admin_root_redirect_handler)
+    # Register admin routes under the generated path
+    _register_admin_routes(app)
+    # Also register under fixed /admin/* paths so existing tests work unchanged
     app.router.add_get("/admin/", _admin_index_handler)
     app.router.add_get("/admin", _admin_index_handler)
     app.router.add_post("/admin/login", _admin_login_handler)
@@ -1255,12 +1361,23 @@ def build_app(db_path: Path | None = None) -> web.Application:
     app["db_path"] = resolved_db
 
     async def on_startup(app: web.Application) -> None:
+        global _admin_event_loop  # noqa: PLW0603
+        _admin_event_loop = asyncio.get_running_loop()
+        # Attach SSE log handler so live-log stream works
+        handler = _SseLogHandler()
+        handler.setFormatter(logging.Formatter(
+            fmt="%(asctime)s  %(levelname)-8s  %(message)s",
+            datefmt="%Y-%m-%dT%H:%M:%SZ",
+        ))
+        logging.root.addHandler(handler)
+
         await init_db(app["db_path"])
         logger.info("database ready  path=%s", app["db_path"])
         app["_cleanup_share_task"] = asyncio.create_task(_cleanup_expired_share_slots())
         app["_cleanup_rooms_task"] = asyncio.create_task(
             _cleanup_expired_rooms(app["db_path"])
         )
+        logger.info("admin panel ready  path=/%s/", _ADMIN_PATH)
 
     async def on_cleanup(app: web.Application) -> None:
         for key in ("_cleanup_share_task", "_cleanup_rooms_task"):
@@ -1284,6 +1401,8 @@ def build_app(db_path: Path | None = None) -> web.Application:
     app.router.add_get("/share/download/{token}", share_download_handler)
     app.router.add_post("/share/download/{token}", share_download_post_handler)
     app.router.add_static("/static", STATIC_DIR, show_index=False)
+    # Mount admin panel under the secret 200-char path on the same server
+    _register_admin_routes(app)
     return app
 
 
@@ -1294,31 +1413,30 @@ def build_app(db_path: Path | None = None) -> web.Application:
 if __name__ == "__main__":
     host = os.environ.get("HOST", "127.0.0.1")
     port = int(os.environ.get("PORT", "5000"))
+
+    # Initialise admin credentials before building the app so routes can use _ADMIN_PATH
+    import server as _self  # noqa: PLC0415 — only needed at startup
+    _self._ADMIN_PATH, _self._ADMIN_PASSCODE = _init_admin_credentials()
+    _self._ADMIN_WEBHOOK_TOKEN = secrets.token_urlsafe(32)
+    logger.info("admin webhook token: /%s/webhook/%s", _self._ADMIN_PATH, _self._ADMIN_WEBHOOK_TOKEN)
+
     logger.info("secureChat starting  host=%s  port=%d", host, port)
     logger.info(
         "Expose via a Tor hidden service for anonymous access — "
         "run start_server.bat for automatic setup (Windows)."
     )
 
-    chat_app   = build_app()
-    admin_app  = build_admin_app()
+    app = build_app()
 
-    async def _run_both() -> None:
-        runner_chat  = web.AppRunner(chat_app,  access_log=None)
-        runner_admin = web.AppRunner(admin_app, access_log=None)
-        await runner_chat.setup()
-        await runner_admin.setup()
-        site_chat  = web.TCPSite(runner_chat,  host, port)
-        site_admin = web.TCPSite(runner_admin, host, ADMIN_PORT)
-        await site_chat.start()
-        await site_admin.start()
-        logger.info("admin panel starting  host=%s  port=%d", host, ADMIN_PORT)
-        if ADMIN_ONION_ADDRESS:
-            logger.info("admin onion address  %s", ADMIN_ONION_ADDRESS)
+    async def _run() -> None:
+        runner = web.AppRunner(app, access_log=None)
+        await runner.setup()
+        site = web.TCPSite(runner, host, port)
+        await site.start()
+        logger.info("server started  host=%s  port=%d", host, port)
         try:
             await asyncio.Event().wait()          # run forever
         finally:
-            await runner_chat.cleanup()
-            await runner_admin.cleanup()
+            await runner.cleanup()
 
-    asyncio.run(_run_both())
+    asyncio.run(_run())

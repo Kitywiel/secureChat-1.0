@@ -1165,6 +1165,8 @@ from server import (
     _ADMIN_SESSIONS,
     _make_admin_session,
     _valid_admin_session,
+    _ADMIN_LOGIN_FAILURES,
+    ADMIN_LOGIN_MAX_ATTEMPTS,
 )
 import server as _srv_mod
 
@@ -1295,12 +1297,12 @@ async def test_admin_incoming_webhook_non_json_body(admin_client) -> None:
 
 
 @pytest.mark.asyncio
-async def test_admin_root_redirects_to_admin(admin_client) -> None:
-    """GET / on the admin port redirects to /admin/."""
+async def test_admin_root_returns_404_or_not_found(admin_client) -> None:
+    """GET / on the admin app is not a valid route (admin is at the secret path)."""
     resp = await admin_client.get("/", allow_redirects=False)
-    assert resp.status in (301, 302, 303, 307, 308)
-    location = resp.headers.get("Location", "")
-    assert "/admin/" in location
+    # aiohttp returns 404 for unregistered routes
+    assert resp.status == 404
+
 
 
 @pytest.mark.asyncio
@@ -1312,3 +1314,104 @@ async def test_admin_html_pre_renders_login_form(admin_client) -> None:
     # The login form must be in the served HTML (not injected by JS after load)
     assert 'id="lf"' in body
     assert 'id="pc"' in body
+
+
+# ─── New-path admin tests (200-char secret path) ─────────────────────────────
+
+@pytest.mark.asyncio
+async def test_admin_path_is_200_chars() -> None:
+    """_ADMIN_PATH is exactly 200 URL-safe characters (or set via ADMIN_PATH env)."""
+    # After build_admin_app() has been called, _ADMIN_PATH must be populated
+    path = _srv_mod._ADMIN_PATH
+    assert len(path) == 200, f"Expected 200 chars, got {len(path)}"
+    # Must be URL-safe base64 characters (A-Z, a-z, 0-9, -, _)
+    import re as _re
+    assert _re.fullmatch(r"[A-Za-z0-9_-]+", path), "Path contains non-URL-safe characters"
+
+
+@pytest.mark.asyncio
+async def test_admin_passcode_is_100_chars() -> None:
+    """_ADMIN_PASSCODE is exactly 100 characters."""
+    pc = _srv_mod._ADMIN_PASSCODE
+    assert len(pc) == 100, f"Expected 100 chars, got {len(pc)}"
+
+
+@pytest.mark.asyncio
+async def test_admin_secret_path_returns_html(admin_client) -> None:
+    """GET /<secret-path>/ returns the admin HTML page."""
+    path = _srv_mod._ADMIN_PATH
+    resp = await admin_client.get(f"/{path}/")
+    assert resp.status == 200
+    ct = resp.headers.get("Content-Type", "")
+    assert "text/html" in ct
+
+
+@pytest.mark.asyncio
+async def test_admin_secret_path_has_security_headers(admin_client) -> None:
+    """Admin responses carry the required security headers."""
+    path = _srv_mod._ADMIN_PATH
+    resp = await admin_client.get(f"/{path}/")
+    assert resp.status == 200
+    assert resp.headers.get("X-Frame-Options") == "DENY"
+    assert resp.headers.get("X-Content-Type-Options") == "nosniff"
+    assert "no-store" in resp.headers.get("Cache-Control", "")
+    assert "frame-ancestors" in resp.headers.get("Content-Security-Policy", "")
+
+
+@pytest.mark.asyncio
+async def test_admin_html_injects_path(admin_client) -> None:
+    """Admin HTML must not contain the raw placeholder; the actual path is injected."""
+    path = _srv_mod._ADMIN_PATH
+    resp = await admin_client.get(f"/{path}/")
+    assert resp.status == 200
+    body = await resp.text()
+    assert "__ADMIN_PATH__" not in body, "Placeholder was not replaced by server"
+    # The injected path prefix must appear in the page
+    assert path in body
+
+
+@pytest.mark.asyncio
+async def test_admin_login_via_secret_path(admin_client) -> None:
+    """Login via the secret path works correctly."""
+    path = _srv_mod._ADMIN_PATH
+    resp = await admin_client.post(
+        f"/{path}/login",
+        json={"passcode": _srv_mod._ADMIN_PASSCODE},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["ok"] is True
+    assert "admin_session" in resp.cookies
+
+
+@pytest.mark.asyncio
+async def test_admin_login_rate_limited(admin_client) -> None:
+    """Too many wrong passcode attempts from the same IP triggers 429."""
+    import server as _srv_m
+    path = _srv_m._ADMIN_PATH
+    # Clear any existing failures first
+    _srv_m._ADMIN_LOGIN_FAILURES.clear()
+    for _ in range(_srv_m.ADMIN_LOGIN_MAX_ATTEMPTS):
+        await admin_client.post(
+            f"/{path}/login",
+            json={"passcode": "wrong"},
+        )
+    resp = await admin_client.post(
+        f"/{path}/login",
+        json={"passcode": "still-wrong"},
+    )
+    assert resp.status == 429
+    _srv_m._ADMIN_LOGIN_FAILURES.clear()
+
+
+@pytest.mark.asyncio
+async def test_admin_security_headers_on_login_response(admin_client) -> None:
+    """Successful login response includes security headers."""
+    path = _srv_mod._ADMIN_PATH
+    resp = await admin_client.post(
+        f"/{path}/login",
+        json={"passcode": _srv_mod._ADMIN_PASSCODE},
+    )
+    assert resp.status == 200
+    assert resp.headers.get("X-Frame-Options") == "DENY"
+    assert resp.headers.get("X-Content-Type-Options") == "nosniff"

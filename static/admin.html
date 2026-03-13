@@ -68,9 +68,11 @@ section h2{font-size:1rem;font-weight:700;margin-bottom:.75rem;padding-bottom:.4
 </div></div>
 </div>
 <script>
+// _AP is injected by the server at serve time — it is the 200-char secret path prefix.
+const _AP='/__ADMIN_PATH__';
 
 async function fetchStats(){
-  const r=await fetch('/admin/api/stats');
+  const r=await fetch(_AP+'/api/stats');
   if(!r.ok)return null;
   return r.json();
 }
@@ -95,19 +97,19 @@ function renderLogin(errMsg=''){
   document.getElementById('lf').addEventListener('submit',async e=>{
     e.preventDefault();
     const pc=document.getElementById('pc').value;
-    const r=await fetch('/admin/login',{method:'POST',headers:{'Content-Type':'application/json'},
-                                        body:JSON.stringify({passcode:pc})});
+    const r=await fetch(_AP+'/login',{method:'POST',headers:{'Content-Type':'application/json'},
+                                      body:JSON.stringify({passcode:pc})});
     if(r.ok){await renderDashboard().catch(()=>renderLogin('Load error. Please refresh.'));}
-    else{renderLogin('Wrong passcode.');}
+    else{renderLogin(r.status===429?'Too many attempts — wait before retrying.':'Wrong passcode.');}
   });
 }
 
 async function renderDashboard(){
   const stats=await fetchStats();
   if(!stats){renderLogin('Session expired.');return;}
-  const whInfo=await fetch('/admin/api/webhook-info').then(r=>r.ok?r.json():null).catch(()=>null);
+  const whInfo=await fetch(_AP+'/api/webhook-info').then(r=>r.ok?r.json():null).catch(()=>null);
   const webhookToken=whInfo?whInfo.webhook_token:'';
-  const webhookUrl=webhookToken?`${location.origin}/admin/webhook/${webhookToken}`:'(unavailable)';
+  const webhookUrl=webhookToken?`${location.origin}${_AP}/webhook/${webhookToken}`:'(unavailable)';
   const inactive=stats.inactive_rooms;
   const open=stats.open_rooms;
   document.getElementById('app').innerHTML=`
@@ -177,7 +179,7 @@ async function renderDashboard(){
 
   document.getElementById('shutdown-btn').addEventListener('click',async()=>{
     if(!confirm('Shutdown the secureChat server immediately?'))return;
-    const r=await fetch('/admin/api/shutdown',{method:'POST'});
+    const r=await fetch(_AP+'/api/shutdown',{method:'POST'});
     document.getElementById('shutdown-msg').textContent=r.ok?'Server is shutting down…':'Shutdown failed.';
   });
 
@@ -214,7 +216,7 @@ function renderTimerBreakdown(obj){
 function startLogStream(){
   const box=document.getElementById('log-box');
   if(!box)return;
-  const es=new EventSource('/admin/api/logs');
+  const es=new EventSource(_AP+'/api/logs');
   es.addEventListener('log',e=>{
     const line=document.createElement('div');
     const t=e.data||'';
@@ -233,12 +235,12 @@ function startLogStream(){
 document.getElementById('lf').addEventListener('submit',async e=>{
   e.preventDefault();
   const pc=document.getElementById('pc').value;
-  const r=await fetch('/admin/login',{method:'POST',headers:{'Content-Type':'application/json'},
-                                      body:JSON.stringify({passcode:pc})});
+  const r=await fetch(_AP+'/login',{method:'POST',headers:{'Content-Type':'application/json'},
+                                    body:JSON.stringify({passcode:pc})});
   if(r.ok){await renderDashboard().catch(()=>renderLogin('Load error. Please refresh.'));}
-  else{renderLogin('Wrong passcode.');}
+  else{renderLogin(r.status===429?'Too many attempts — wait before retrying.':'Wrong passcode.');}
 });
-fetch('/admin/api/stats').then(async r=>{
+fetch(_AP+'/api/stats').then(async r=>{
   if(r.ok)await renderDashboard().catch(()=>renderLogin());
   // else: leave the pre-rendered login form as-is
 }).catch(()=>{/* leave login form as-is on network error */});
