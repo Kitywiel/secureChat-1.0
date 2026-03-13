@@ -2152,3 +2152,70 @@ async def test_lockdown_bad_action_returns_400(ws_client) -> None:
 
     resp = await ws_client.post(f"/{ap}/api/lockdown", json={"action": "explode"})
     assert resp.status == 400
+
+
+# ---------------------------------------------------------------------------
+# Mesh peer federation tests
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_mesh_connect_rejects_wrong_token(ws_client) -> None:
+    """POST /mesh/peer/connect returns 403 with wrong token."""
+    import server as _s
+    _s._MESH_TOKEN = "correct-token"
+    resp = await ws_client.post(
+        "/mesh/peer/connect",
+        json={"token": "wrong", "peer_url": "http://peer.onion", "peer_token": "x"},
+    )
+    assert resp.status == 403
+
+
+@pytest.mark.asyncio
+async def test_mesh_connect_registers_peer(ws_client) -> None:
+    """POST /mesh/peer/connect registers a peer and returns peer_id."""
+    import server as _s
+    _s._MESH_TOKEN = "test-mesh-secret"
+    resp = await ws_client.post(
+        "/mesh/peer/connect",
+        json={"token": "test-mesh-secret", "peer_url": "http://peer.onion", "peer_token": "pt"},
+    )
+    assert resp.status == 200
+    data = await resp.json()
+    assert data["ok"] is True
+    assert "peer_id" in data
+    # Clean up
+    _s._mesh_peers.clear()
+
+
+@pytest.mark.asyncio
+async def test_mesh_forward_rejects_unknown_token(ws_client) -> None:
+    """POST /mesh/peer/forward returns 403 for unregistered peer token."""
+    import server as _s
+    _s._mesh_peers.clear()
+    resp = await ws_client.post(
+        "/mesh/peer/forward",
+        json={"token": "unknown", "room_id": "room1", "payload": "{}"},
+    )
+    assert resp.status == 403
+
+
+@pytest.mark.asyncio
+async def test_mesh_invite_requires_auth(ws_client) -> None:
+    """GET /mesh/invite returns 403 without admin session."""
+    resp = await ws_client.get("/mesh/invite")
+    assert resp.status == 403
+
+
+@pytest.mark.asyncio
+async def test_inbox_create_returns_mailtm_enabled_field(ws_client) -> None:
+    """POST /inbox/create returns mailtm_enabled field (False when MAILTM_ENABLED=False)."""
+    import server as _s
+    original = _s.MAILTM_ENABLED
+    try:
+        _s.MAILTM_ENABLED = False
+        resp = await ws_client.post("/inbox/create", json={})
+        data = await resp.json()
+        assert "mailtm_enabled" in data
+        assert data["mailtm_enabled"] is False
+    finally:
+        _s.MAILTM_ENABLED = original

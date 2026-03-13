@@ -286,9 +286,11 @@ def _print_summary(
     relay_enabled: bool,
     smtp_enabled: bool,
     mail_domain: str,
+    mesh_token: str,
 ) -> None:
     lan = _lan_ip()
     sep = "=" * 66
+    base_url = f"http://{onion}" if onion else f"http://{lan}:{server_port}"
 
     print()
     print(sep)
@@ -317,30 +319,77 @@ def _print_summary(
     print(f"        Passcode: {admin_passcode}")
 
     print()
-    print("  📬  Inbox:")
-    print(f"        Open http://{'<onion>' if onion else f'{lan}:{server_port}'}  and click 'Inbox'")
+    print("  📬  Inbox  (real email — any server can deliver here, no DNS needed):")
+    print(f"        Open {base_url}  and click 'Inbox'")
+    print("        A free @mail.tm address is auto-provisioned — share it anywhere.")
     if smtp_enabled:
-        print(f"        Real SMTP:  <token>@{mail_domain}  (direct port-25 SMTP, exposes server IP)")
+        print(f"        Local SMTP: <token>@{mail_domain}  (port-25, exposes server IP)")
     if relay_enabled:
         print()
-        print("  📡  IP-private relay webhook  (your IP stays hidden):")
-        print(f"        POST https://<your-domain>/inbox/relay")
+        print("  📡  IP-private relay webhook:")
+        print(f"        POST {base_url}/inbox/relay")
         print(f"        X-Relay-Secret: {relay_secret}")
-        print()
-        print("        Point Mailgun / SendGrid / Cloudflare Email Workers at")
-        print("        this URL to receive email without exposing your IP.")
-        print("        See  static/mail_read.html  for setup instructions.")
-    else:
-        print()
-        print("        IP-private relay webhook is available automatically.")
-        print(f"        Relay secret: {relay_secret}")
-        print("        To use it, set  RELAY_SECRET=<above>  when you restart,")
-        print("        then configure your relay service to POST to /inbox/relay.")
+
+    print()
+    print("  🕸️   Mesh / multi-device federation:")
+    print("        Run another instance anywhere in the world, then link them:")
+    print()
+    print(f"        python run.py --mesh-join {base_url}/mesh/peer/connect --mesh-token {mesh_token}")
+    print()
+    print("        Both instances will share room messages across the mesh.")
+    print("        Uses Tor (.onion) when available — no IP exposed.")
 
     print()
     print("  Press Ctrl+C to stop.")
     print(sep)
     print()
+
+
+# ---------------------------------------------------------------------------
+# Mesh join helper
+# ---------------------------------------------------------------------------
+
+def _join_mesh_peer(
+    *,
+    connect_url: str,
+    remote_token: str,
+    local_token: str,
+    onion: str | None,
+    server_port: int,
+) -> None:
+    """POST to the remote server's /mesh/peer/connect to register as a peer."""
+    import socket as _socket  # noqa: PLC0415
+    import urllib.request as _urllib_request  # noqa: PLC0415
+    import json as _json  # noqa: PLC0415
+
+    if not remote_token:
+        print("\n  ⚠️  --mesh-join requires --mesh-token <MESH_TOKEN of the remote server>")
+        return
+
+    lan = _lan_ip()
+    local_url = f"http://{onion}" if onion else f"http://{lan}:{server_port}"
+    payload = _json.dumps({
+        "token":      remote_token,
+        "peer_url":   local_url,
+        "peer_token": local_token,
+    }).encode()
+
+    print(f"\n  Joining mesh peer at {connect_url} …")
+    try:
+        req = _urllib_request.Request(
+            connect_url,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with _urllib_request.urlopen(req, timeout=10) as resp:
+            data = _json.loads(resp.read())
+            if data.get("ok"):
+                print(f"  ✅  Mesh peer connected  (peer_id: …{data.get('peer_id', '')[-6:]})")
+            else:
+                print(f"  ⚠️  Mesh join response: {data}")
+    except Exception as exc:  # noqa: BLE001
+        print(f"  ⚠️  Mesh join failed: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -351,6 +400,18 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="secureChat zero-config launcher")
     parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", "5000")))
     parser.add_argument("--no-tor", action="store_true", help="Skip Tor even if installed")
+    parser.add_argument(
+        "--mesh-join",
+        metavar="URL",
+        default="",
+        help="Connect to a remote peer's /mesh/peer/connect URL",
+    )
+    parser.add_argument(
+        "--mesh-token",
+        metavar="TOKEN",
+        default="",
+        help="MESH_TOKEN of the remote server (required with --mesh-join)",
+    )
     args = parser.parse_args()
 
     server_port: int = args.port
@@ -422,6 +483,7 @@ def main() -> None:
     # build_app() picks them up without a second initialisation.
     srv._ADMIN_PATH, srv._ADMIN_PASSCODE = srv._init_admin_credentials()
     srv._ADMIN_WEBHOOK_TOKEN = _secrets.token_urlsafe(32)
+    srv._MESH_TOKEN = _secrets.token_urlsafe(32)
 
     mail_domain: str = srv.MAIL_DOMAIN
     smtp_enabled: bool = bool(mail_domain)
@@ -436,10 +498,22 @@ def main() -> None:
         relay_enabled=True,
         smtp_enabled=smtp_enabled,
         mail_domain=mail_domain,
+        mesh_token=srv._MESH_TOKEN,
     )
 
     # ── 7. Run the server ─────────────────────────────────────────────
     host = os.environ.get("HOST", "127.0.0.1")
+
+    # ── 8. Join a remote mesh peer (optional) ─────────────────────────
+    if args.mesh_join:
+        _join_mesh_peer(
+            connect_url=args.mesh_join,
+            remote_token=args.mesh_token,
+            local_token=srv._MESH_TOKEN,
+            onion=onion,
+            server_port=server_port,
+        )
+
     try:
         web.run_app(srv.build_app(), host=host, port=server_port, access_log=None)
     except KeyboardInterrupt:

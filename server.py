@@ -212,6 +212,17 @@ SMTP_PORT: int = int(os.environ.get("SMTP_PORT", "25"))
 # Leave unset to disable the relay endpoint entirely.
 RELAY_SECRET: str = os.environ.get("RELAY_SECRET", "")
 
+# ---------------------------------------------------------------------------
+# mail.tm — free real-email integration (no DNS, no payment required).
+# mail.tm provides public disposable addresses (@mail.tm, @bugfoo.com, etc.)
+# that any server on the internet (Discord, Google, GitHub, …) can deliver to.
+# Enabled automatically when neither MAIL_DOMAIN nor RELAY_SECRET is set,
+# or force-disable with MAILTM_ENABLED=0.
+# ---------------------------------------------------------------------------
+MAILTM_API = "https://api.mail.tm"
+# Opt-out: set MAILTM_ENABLED=0 to disable the mail.tm integration.
+MAILTM_ENABLED: bool = os.environ.get("MAILTM_ENABLED", "1") not in ("0", "false", "no")
+
 # Room-create / passcode constants
 MAX_PASSCODE_LEN = 64                  # characters in a room or share passcode
 MAX_DESTRUCT_MINUTES = 1440            # 24 hours maximum
@@ -680,6 +691,7 @@ async def _broadcast_to_room(
     payload: str,
     *,
     exclude: web.WebSocketResponse | None = None,
+    _from_peer: bool = False,
 ) -> None:
     peers = list(rooms.get(room_id, set()))
     for peer in peers:
@@ -689,6 +701,10 @@ async def _broadcast_to_room(
             await peer.send_str(payload)
         except Exception:  # noqa: BLE001
             pass
+    # Forward to mesh peers (but not when the message already came from a peer,
+    # to avoid infinite forwarding loops)
+    if not _from_peer and _mesh_peers:
+        asyncio.ensure_future(_forward_to_peers(room_id, payload))
 
 
 # ---------------------------------------------------------------------------
@@ -934,9 +950,153 @@ async def _cleanup_expired_share_slots() -> None:
 #   2. Sender (HTTP):  POST /inbox/<token>/drop  {body: {"message": "…"}}
 #                      → 200 {"ok": true}  (only once — subsequent posts return 409)
 #      Sender (SMTP):  Send real email to <token>@MAIL_DOMAIN (if MAIL_DOMAIN is set)
+#      Sender (web):   POST /inbox/<token>/drop  (HTTP form, no email account needed)
+#      Sender (real):  Any email server can deliver to <address>@mail.tm (auto-provisioned)
 #   3. Recipient:      GET /inbox/<token>/read  → 200 {"message": "…", …} (one-time)
 #                      Returns 204 if nothing deposited yet, 410 if expired/used.
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# mail.tm helpers — free real-email provisioning
+# ---------------------------------------------------------------------------
+
+async def _mailtm_get_domain() -> str | None:
+    """Return the first active mail.tm domain, or None on failure."""
+    import aiohttp as _aiohttp  # noqa: PLC0415
+    try:
+        async with _aiohttp.ClientSession() as sess:
+            async with sess.get(f"{MAILTM_API}/domains", timeout=_aiohttp.ClientTimeout(total=10)) as r:
+                if r.status != 200:
+                    return None
+                data = await r.json()
+                # API returns {"hydra:member": [...], ...}
+                members = data.get("hydra:member") or data.get("member") or []
+                for item in members:
+                    if item.get("isActive"):
+                        return item["domain"]
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+async def _mailtm_create_account(address: str, password: str) -> bool:
+    """Create a mail.tm account.  Returns True on success."""
+    import aiohttp as _aiohttp  # noqa: PLC0415
+    try:
+        async with _aiohttp.ClientSession() as sess:
+            async with sess.post(
+                f"{MAILTM_API}/accounts",
+                json={"address": address, "password": password},
+                timeout=_aiohttp.ClientTimeout(total=10),
+            ) as r:
+                return r.status in (200, 201)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+async def _mailtm_get_token(address: str, password: str) -> str | None:
+    """Obtain a JWT bearer token for a mail.tm account."""
+    import aiohttp as _aiohttp  # noqa: PLC0415
+    try:
+        async with _aiohttp.ClientSession() as sess:
+            async with sess.post(
+                f"{MAILTM_API}/token",
+                json={"address": address, "password": password},
+                timeout=_aiohttp.ClientTimeout(total=10),
+            ) as r:
+                if r.status == 200:
+                    data = await r.json()
+                    return data.get("token")
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+async def _mailtm_fetch_messages(bearer_token: str, seen_ids: set) -> list[dict]:
+    """Fetch unread messages from mail.tm; return a list of new message dicts."""
+    import aiohttp as _aiohttp  # noqa: PLC0415
+    results: list[dict] = []
+    try:
+        async with _aiohttp.ClientSession() as sess:
+            async with sess.get(
+                f"{MAILTM_API}/messages",
+                headers={"Authorization": f"Bearer {bearer_token}"},
+                timeout=_aiohttp.ClientTimeout(total=10),
+            ) as r:
+                if r.status != 200:
+                    return results
+                data = await r.json()
+                members = data.get("hydra:member") or data.get("member") or []
+                for m in members:
+                    mid = m.get("id", "")
+                    if mid in seen_ids:
+                        continue
+                    seen_ids.add(mid)
+                    # Fetch full message for body
+                    async with sess.get(
+                        f"{MAILTM_API}/messages/{mid}",
+                        headers={"Authorization": f"Bearer {bearer_token}"},
+                        timeout=_aiohttp.ClientTimeout(total=10),
+                    ) as mr:
+                        if mr.status != 200:
+                            continue
+                        full = await mr.json()
+                    body_html = full.get("html", [""])[0] if full.get("html") else ""
+                    body_text = full.get("text") or ""
+                    body = body_html or body_text or "(empty)"
+                    results.append({
+                        "body":         body,
+                        "email_from":   (full.get("from") or {}).get("address") or None,
+                        "subject":      full.get("subject") or None,
+                        "content_type": "text/html" if body_html else "text/plain",
+                        "received_at":  time.time(),
+                    })
+    except Exception:  # noqa: BLE001
+        pass
+    return results
+
+
+async def _mailtm_provision(inbox_token_bytes: int) -> dict | None:
+    """Create a fresh mail.tm mailbox.  Returns slot extras or None on failure."""
+    domain = await _mailtm_get_domain()
+    if not domain:
+        return None
+    local = secrets.token_urlsafe(inbox_token_bytes)[:16].lower()
+    address = f"{local}@{domain}"
+    password = secrets.token_urlsafe(24)
+    ok = await _mailtm_create_account(address, password)
+    if not ok:
+        return None
+    bearer = await _mailtm_get_token(address, password)
+    if not bearer:
+        return None
+    return {
+        "mailtm_address": address,
+        "mailtm_bearer":  bearer,
+        "mailtm_seen":    set(),
+    }
+
+
+async def _mailtm_poll_all_inboxes() -> None:
+    """Background task: poll mail.tm for new messages every 30 seconds."""
+    while True:
+        await asyncio.sleep(30)
+        for slot in list(_inbox_slots.values()):
+            bearer = slot.get("mailtm_bearer")
+            if not bearer:
+                continue
+            if time.time() > slot.get("expires_at", 0):
+                continue
+            seen: set = slot.setdefault("mailtm_seen", set())
+            new_msgs = await _mailtm_fetch_messages(bearer, seen)
+            for msg in new_msgs:
+                slot["messages"].append(msg)
+                logger.info(
+                    "mail.tm message received  from=%.40s  subject=%r",
+                    msg.get("email_from") or "",
+                    (msg.get("subject") or "")[:60],
+                )
+
 
 class InboxSmtpHandler:
     """aiosmtpd message handler — receives inbound SMTP and stores messages in inbox slots.
@@ -1037,15 +1197,22 @@ async def inbox_create_handler(request: web.Request) -> web.Response:
 
         {"ttl_minutes": 60}   # 1–1440, default 60
 
+    When neither MAIL_DOMAIN nor RELAY_SECRET is configured, a real
+    mail.tm mailbox is provisioned automatically (free, no DNS needed).
+    Any server on the internet — Discord, Google, GitHub, etc. — can
+    send email directly to the returned address.
+
     Returns::
 
         {
-          "address":      "abc123@example.com",   # real email address (when MAIL_DOMAIN is set)
-          "drop_url":     "/inbox/<token>/drop",  # HTTP sender page
-          "read_url":     "/inbox/<token>/read",  # JSON messages API
-          "reader_url":   "/inbox/<token>",       # full HTML mail reader page
-          "expires_at":   <unix-timestamp>,
-          "smtp_enabled": true|false,
+          "address":       "abc123@mail.tm",   # real deliverable email address
+          "drop_url":      "/inbox/<token>/drop",
+          "read_url":      "/inbox/<token>/read",
+          "reader_url":    "/inbox/<token>",
+          "expires_at":    <unix-timestamp>,
+          "smtp_enabled":  true|false,
+          "relay_enabled": true|false,
+          "mailtm_enabled": true|false,
         }
     """
     try:
@@ -1057,22 +1224,46 @@ async def inbox_create_handler(request: web.Request) -> web.Response:
     ttl_seconds = ttl_minutes * 60
     token = secrets.token_urlsafe(_INBOX_TOKEN_BYTES)
     expires_at = time.time() + ttl_seconds
-    _inbox_slots[token] = {
+    slot: dict = {
         "messages":   [],
         "expires_at": expires_at,
     }
-    # Use the configured mail domain for a real working email address; fall back to request host.
-    mail_host = MAIL_DOMAIN or request.host or "localhost"
-    address = f"{token}@{mail_host}"
-    logger.info("inbox created  address=%.6s@%s  ttl=%dm", token, mail_host, ttl_minutes)
+    _inbox_slots[token] = slot
+
+    # ── Determine the real email address ──────────────────────────────────
+    mailtm_enabled = False
+    if MAIL_DOMAIN:
+        # Local SMTP — use the configured domain
+        address = f"{token}@{MAIL_DOMAIN}"
+    elif MAILTM_ENABLED:
+        # Auto-provision a free mail.tm mailbox so any server can deliver here
+        mailtm_extras = await _mailtm_provision(_INBOX_TOKEN_BYTES)
+        if mailtm_extras:
+            slot.update(mailtm_extras)
+            address = mailtm_extras["mailtm_address"]
+            mailtm_enabled = True
+            logger.info("mail.tm inbox provisioned  address=%s  ttl=%dm", address, ttl_minutes)
+        else:
+            # mail.tm unavailable — fall back to request host
+            mail_host = request.host or "localhost"
+            address = f"{token}@{mail_host}"
+            logger.warning("mail.tm provisioning failed — inbox will be HTTP-drop only")
+    else:
+        mail_host = request.host or "localhost"
+        address = f"{token}@{mail_host}"
+
+    if not mailtm_enabled:
+        logger.info("inbox created  address=%.6s@…  ttl=%dm", token, ttl_minutes)
+
     return web.json_response({
-        "address":      address,
-        "drop_url":     f"/inbox/{token}/drop",
-        "read_url":     f"/inbox/{token}/read",
-        "reader_url":   f"/inbox/{token}",
-        "expires_at":   expires_at,
-        "smtp_enabled": bool(MAIL_DOMAIN),
-        "relay_enabled": bool(RELAY_SECRET),
+        "address":        address,
+        "drop_url":       f"/inbox/{token}/drop",
+        "read_url":       f"/inbox/{token}/read",
+        "reader_url":     f"/inbox/{token}",
+        "expires_at":     expires_at,
+        "smtp_enabled":   bool(MAIL_DOMAIN),
+        "relay_enabled":  bool(RELAY_SECRET),
+        "mailtm_enabled": mailtm_enabled,
     })
 
 
@@ -2020,16 +2211,144 @@ def build_admin_app() -> web.Application:
 
 
 # ---------------------------------------------------------------------------
+# Mesh peer federation
+# ---------------------------------------------------------------------------
+# Each server has a MESH_TOKEN that acts as an invite secret.
+# Another server uses POST /mesh/peer/connect to register as a peer.
+# Once connected, room messages are forwarded between peers so users on
+# different instances can communicate in the same room.
+#
+# Invite URL:  http://<onion-or-host>/mesh/peer/connect
+# Invite token printed at startup by run.py.
+# ---------------------------------------------------------------------------
+
+_MESH_TOKEN: str = ""        # Set at startup; printed to console / shown by run.py
+_mesh_peers: dict[str, dict] = {}   # peer_id → {url, token, connected_at}
+
+
+async def mesh_peer_connect_handler(request: web.Request) -> web.Response:
+    """POST /mesh/peer/connect — register a remote peer.
+
+    Body::
+
+        {
+            "token":    "<MESH_TOKEN of the target server>",
+            "peer_url": "http://<other-server>/",
+            "peer_token": "<MESH_TOKEN of the connecting server>"
+        }
+
+    Returns ``{"ok": true, "peer_id": "…"}`` on success.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        raise web.HTTPBadRequest(reason="JSON body required")
+
+    import hmac as _hmac  # noqa: PLC0415
+    provided = str(body.get("token", "")).encode()
+    expected = _MESH_TOKEN.encode()
+    if not expected or not _hmac.compare_digest(provided, expected):
+        raise web.HTTPForbidden(reason="Invalid mesh token")
+
+    peer_url = str(body.get("peer_url", "")).strip().rstrip("/")
+    peer_token = str(body.get("peer_token", "")).strip()
+    if not peer_url:
+        raise web.HTTPBadRequest(reason="peer_url required")
+
+    peer_id = secrets.token_hex(16)
+    _mesh_peers[peer_id] = {
+        "url":          peer_url,
+        "token":        peer_token,
+        "connected_at": time.time(),
+    }
+    logger.info("mesh peer connected  peer_id=…%s  url=%s", peer_id[-6:], peer_url[:60])
+    return web.json_response({"ok": True, "peer_id": peer_id})
+
+
+async def mesh_peer_forward_handler(request: web.Request) -> web.Response:
+    """POST /mesh/peer/forward — receive a forwarded room message from a peer.
+
+    Body::
+
+        {
+            "token":   "<sender's MESH_TOKEN>",
+            "room_id": "…",
+            "payload": "<JSON string of the message>"
+        }
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        raise web.HTTPBadRequest(reason="JSON body required")
+
+    # Verify the sender is a registered peer (their token must match one we know)
+    provided_token = str(body.get("token", ""))
+    is_known_peer = any(
+        p["token"] == provided_token and provided_token
+        for p in _mesh_peers.values()
+    )
+    if not is_known_peer:
+        raise web.HTTPForbidden(reason="Unknown peer token")
+
+    room_id = str(body.get("room_id", "")).strip()
+    payload = str(body.get("payload", "")).strip()
+    if not room_id or not payload:
+        raise web.HTTPBadRequest(reason="room_id and payload required")
+
+    await _broadcast_to_room(room_id, payload, _from_peer=True)
+    return web.json_response({"ok": True})
+
+
+async def mesh_invite_handler(request: web.Request) -> web.Response:
+    """GET /mesh/invite — return the mesh invite info (admin-authenticated)."""
+    if not _valid_admin_session(request):
+        raise web.HTTPForbidden(reason="Not authenticated")
+    host = request.host or "localhost"
+    scheme = "http"
+    if request.secure:
+        scheme = "https"
+    connect_url = f"{scheme}://{host}/mesh/peer/connect"
+    return web.json_response({
+        "connect_url":  connect_url,
+        "mesh_token":   _MESH_TOKEN,
+        "peers":        [
+            {"peer_id": pid[-6:], "url": p["url"], "connected_at": p["connected_at"]}
+            for pid, p in _mesh_peers.items()
+        ],
+    })
+
+
+async def _forward_to_peers(room_id: str, payload: str) -> None:
+    """Fire-and-forget: POST a message to every connected mesh peer."""
+    if not _mesh_peers:
+        return
+    import aiohttp as _aiohttp  # noqa: PLC0415
+    for peer in list(_mesh_peers.values()):
+        peer_url = peer["url"].rstrip("/") + "/mesh/peer/forward"
+        try:
+            async with _aiohttp.ClientSession() as sess:
+                await sess.post(
+                    peer_url,
+                    json={"token": _MESH_TOKEN, "room_id": room_id, "payload": payload},
+                    timeout=_aiohttp.ClientTimeout(total=5),
+                )
+        except Exception:  # noqa: BLE001
+            pass
+
+
+# ---------------------------------------------------------------------------
 # App factory
 # ---------------------------------------------------------------------------
 
 
 def build_app(db_path: Path | None = None) -> web.Application:
-    global _ADMIN_PASSCODE, _ADMIN_PATH, _ADMIN_WEBHOOK_TOKEN  # noqa: PLW0603
+    global _ADMIN_PASSCODE, _ADMIN_PATH, _ADMIN_WEBHOOK_TOKEN, _MESH_TOKEN  # noqa: PLW0603
     if not _ADMIN_PASSCODE:
         _ADMIN_PATH, _ADMIN_PASSCODE = _init_admin_credentials()
     if not _ADMIN_WEBHOOK_TOKEN:
         _ADMIN_WEBHOOK_TOKEN = secrets.token_urlsafe(32)
+    if not _MESH_TOKEN:
+        _MESH_TOKEN = secrets.token_urlsafe(32)
 
     resolved_db = db_path if db_path is not None else DB_PATH
 
@@ -2056,6 +2375,7 @@ def build_app(db_path: Path | None = None) -> web.Application:
             _cleanup_expired_rooms(app["db_path"])
         )
         app["_lockdown_broadcast_task"] = asyncio.create_task(_lockdown_broadcast_task())
+        app["_mailtm_poll_task"] = asyncio.create_task(_mailtm_poll_all_inboxes())
         logger.info("admin panel ready  path=/%s/", _ADMIN_PATH)
 
         # Start the inbound SMTP server when a mail domain is configured
@@ -2078,7 +2398,7 @@ def build_app(db_path: Path | None = None) -> web.Application:
 
     async def on_cleanup(app: web.Application) -> None:
         global _smtp_controller  # noqa: PLW0603
-        for key in ("_cleanup_share_task", "_cleanup_inbox_task", "_cleanup_rooms_task", "_lockdown_broadcast_task"):
+        for key in ("_cleanup_share_task", "_cleanup_inbox_task", "_cleanup_rooms_task", "_lockdown_broadcast_task", "_mailtm_poll_task"):
             task = app.get(key)
             if task:
                 task.cancel()
@@ -2110,6 +2430,12 @@ def build_app(db_path: Path | None = None) -> web.Application:
     app.router.add_post("/inbox/{token}/drop", inbox_drop_handler)
     app.router.add_get("/inbox/{token}/read", inbox_read_handler)
     app.router.add_static("/static", STATIC_DIR, show_index=False)
+
+    # Mesh peer federation routes
+    app.router.add_post("/mesh/peer/connect", mesh_peer_connect_handler)
+    app.router.add_post("/mesh/peer/forward", mesh_peer_forward_handler)
+    app.router.add_get("/mesh/invite", mesh_invite_handler)
+
     # Mount admin panel under the secret 200-char path on the same server
     _register_admin_routes(app)
     return app
