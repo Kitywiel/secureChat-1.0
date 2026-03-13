@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>secureChat — One-Time Inbox</title>
+  <title>secureChat — Send to Inbox</title>
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     body {
@@ -92,6 +92,7 @@
     button:disabled { background: #2a5a99; cursor: not-allowed; }
     .char-count { text-align: right; font-size: .75rem; color: #555; margin-top: .25rem; }
     .char-count.warn { color: #cf9f2f; }
+    .sent-count { font-size: .8rem; color: #6fcf6f; margin-top: .6rem; text-align: center; }
     .status { margin-top: 1rem; padding: .75rem; border-radius: 8px; font-size: .9rem; display: none; }
     .status.ok  { background: #1a3a1a; border: 1px solid #2d6a2d; color: #6fcf6f; display: block; }
     .status.err { background: #3a1a1a; border: 1px solid #6a2d2d; color: #cf6f6f; display: block; }
@@ -99,10 +100,10 @@
 </head>
 <body>
 <div class="card">
-  <h1>📬 One-Time Inbox</h1>
+  <h1>📬 Send to Inbox</h1>
   <p class="subtitle">
-    Send a single message to this inbox. Once sent, no further messages can be
-    deposited. The recipient reads it once — then it is permanently deleted.
+    Send a message to this inbox. Messages are held until the inbox expires — you can
+    send as many messages as needed and the recipient can read them at any time.
   </p>
 
   <p style="font-size:.82rem;color:#888;margin-bottom:.4rem">Inbox address</p>
@@ -113,16 +114,18 @@
 
   <p class="timer" id="timer">Expires in <span id="countdown">–</span></p>
 
-  <textarea id="msg" placeholder="Type your message or one-time code here…" maxlength="4096"></textarea>
-  <div class="char-count"><span id="cc">0</span> / 4096</div>
+  <textarea id="msg" placeholder="Type your message here…" maxlength="65536"></textarea>
+  <div class="char-count"><span id="cc">0</span> / 65536</div>
   <button id="send-btn">Send Message →</button>
+  <div class="sent-count" id="sent-count" style="display:none"></div>
   <div id="status" class="status"></div>
 </div>
 
 <script>
   const TOKEN      = '__INBOX_TOKEN__';
   const EXPIRES_AT = __INBOX_EXPIRES_AT__;   // injected unix timestamp (float)
-  const MAX        = 4096;
+  const MAX        = 65536;
+  let   _sentCount = 0;
 
   /* ── Address copy ── */
   document.getElementById('copy-addr-btn').addEventListener('click', () => {
@@ -142,12 +145,15 @@
   /* ── Countdown timer ── */
   function updateCountdown() {
     const secs = Math.max(0, Math.round(EXPIRES_AT - Date.now() / 1000));
-    const m = Math.floor(secs / 60);
+    const h = Math.floor(secs / 3600);
+    const m = Math.floor((secs % 3600) / 60);
     const s = secs % 60;
     const el = document.getElementById('countdown');
     const timerEl = document.getElementById('timer');
-    el.textContent = m > 0 ? `${m}m ${s}s` : `${s}s`;
-    timerEl.className = 'timer' + (secs < 60 ? ' urgent' : '');
+    if (h > 0) el.textContent = `${h}h ${m}m`;
+    else if (m > 0) el.textContent = `${m}m ${s}s`;
+    else el.textContent = `${s}s`;
+    timerEl.className = 'timer' + (secs < 120 ? ' urgent' : '');
     if (secs === 0) {
       el.textContent = 'expired';
       document.getElementById('send-btn').disabled = true;
@@ -180,22 +186,21 @@
         body: JSON.stringify({ message }),
       });
       if (resp.ok) {
-        clearInterval(_tick);
-        showStatus('ok', '✅ Message delivered! The recipient can now read it once.');
-        msgEl.disabled = true;
-        btn.textContent = 'Message sent';
+        _sentCount++;
+        msgEl.value = '';
+        document.getElementById('cc').textContent = '0';
+        const countEl = document.getElementById('sent-count');
+        countEl.style.display = '';
+        countEl.textContent = `✅ ${_sentCount} message${_sentCount !== 1 ? 's' : ''} sent to this inbox`;
+        showStatus('ok', '✅ Message delivered!');
       } else {
         const text = await resp.text().catch(() => resp.statusText);
-        if (resp.status === 409) showStatus('err', '⚠️ This inbox already has a message.');
-        else if (resp.status === 410) showStatus('err', '⏰ This inbox has expired.');
+        if (resp.status === 410) showStatus('err', '⏰ This inbox has expired.');
         else showStatus('err', `Error: ${text || resp.statusText}`);
-        if (resp.status !== 409 && resp.status !== 410) {
-          btn.disabled = false;
-          btn.textContent = 'Send Message →';
-        }
       }
     } catch (err) {
       showStatus('err', `Network error: ${err.message}`);
+    } finally {
       btn.disabled = false;
       btn.textContent = 'Send Message →';
     }
@@ -205,7 +210,9 @@
     const el = document.getElementById('status');
     el.className = 'status ' + type;
     el.textContent = msg;
+    setTimeout(() => { el.style.display = 'none'; }, 5000);
   }
 </script>
 </body>
 </html>
+

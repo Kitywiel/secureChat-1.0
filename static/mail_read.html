@@ -1,0 +1,418 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>secureChat — Inbox</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      background: #0d0d0d;
+      color: #e0e0e0;
+      min-height: 100vh;
+      padding: 1.25rem;
+    }
+
+    /* ── Header bar ── */
+    .topbar {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: .75rem;
+      max-width: 780px;
+      margin: 0 auto 1.25rem;
+    }
+    .topbar-info h1 { font-size: 1.25rem; }
+    .topbar-info .address {
+      font-family: monospace;
+      font-size: .85rem;
+      color: #80d4ff;
+      word-break: break-all;
+      margin-top: .2rem;
+    }
+    .topbar-right { display: flex; flex-direction: column; align-items: flex-end; gap: .35rem; }
+    .timer {
+      font-size: .82rem;
+      color: #888;
+    }
+    .timer span { color: #e0c060; font-weight: 600; }
+    .timer.urgent span { color: #e06060; }
+    .refresh-btn {
+      background: #1e3a5e;
+      color: #80d4ff;
+      border: 1px solid #2a5080;
+      border-radius: 6px;
+      padding: .4rem .9rem;
+      cursor: pointer;
+      font-size: .85rem;
+      font-weight: 600;
+    }
+    .refresh-btn:hover { background: #264870; }
+    .refresh-btn:disabled { opacity: .5; cursor: not-allowed; }
+    .tor-notice {
+      max-width: 780px;
+      margin: 0 auto .9rem;
+      background: #1a1a2e;
+      border: 1px solid #2e2e4e;
+      border-radius: 8px;
+      padding: .6rem .85rem;
+      font-size: .8rem;
+      color: #8888cc;
+      line-height: 1.5;
+    }
+
+    /* ── Message list ── */
+    .inbox-wrap {
+      max-width: 780px;
+      margin: 0 auto;
+    }
+    .empty-state {
+      text-align: center;
+      padding: 3rem 1rem;
+      color: #555;
+    }
+    .empty-state .big { font-size: 2.5rem; margin-bottom: .5rem; }
+    .empty-state p   { font-size: .9rem; }
+    .msg-card {
+      background: #1a1a1a;
+      border: 1px solid #2e2e2e;
+      border-radius: 10px;
+      margin-bottom: 1rem;
+      overflow: hidden;
+    }
+    .msg-header {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: .4rem .75rem;
+      padding: .75rem 1rem;
+      background: #161616;
+      border-bottom: 1px solid #252525;
+    }
+    .msg-field { font-size: .84rem; }
+    .msg-field .label { color: #666; margin-right: .4rem; }
+    .msg-field .val   { color: #ccc; word-break: break-all; }
+    .msg-field .val.subject { color: #e0e0e0; font-weight: 600; }
+    .msg-time {
+      font-size: .75rem;
+      color: #555;
+      white-space: nowrap;
+      align-self: start;
+      padding-top: .1rem;
+    }
+    .msg-badge {
+      grid-column: 1 / -1;
+      display: inline-flex;
+      align-items: center;
+      gap: .3rem;
+      font-size: .72rem;
+      color: #5a9eff;
+      margin-top: .2rem;
+    }
+    .msg-body {
+      padding: .85rem 1rem;
+    }
+    /* Plain-text body */
+    .msg-body pre {
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-family: monospace;
+      font-size: .9rem;
+      color: #e0e0e0;
+      line-height: 1.6;
+      max-height: 500px;
+      overflow-y: auto;
+    }
+    /* HTML email in sandboxed iframe */
+    .msg-body iframe {
+      width: 100%;
+      min-height: 260px;
+      border: none;
+      background: #fff;
+      border-radius: 4px;
+    }
+
+    .status-bar {
+      max-width: 780px;
+      margin: .5rem auto;
+      font-size: .82rem;
+      color: #555;
+      text-align: right;
+    }
+
+    /* ── Tor / setup guide panel ── */
+    details.setup-guide {
+      max-width: 780px;
+      margin: 1.25rem auto 0;
+      background: #111;
+      border: 1px solid #2a2a2a;
+      border-radius: 10px;
+    }
+    details.setup-guide summary {
+      cursor: pointer;
+      padding: .75rem 1rem;
+      font-size: .88rem;
+      color: #888;
+      user-select: none;
+    }
+    details.setup-guide summary:hover { color: #aaa; }
+    .guide-body {
+      padding: .75rem 1.1rem 1rem;
+      font-size: .83rem;
+      line-height: 1.65;
+      color: #999;
+    }
+    .guide-body h3 { color: #ccc; font-size: .88rem; margin: .85rem 0 .3rem; }
+    .guide-body code {
+      background: #1e1e1e;
+      color: #80d4ff;
+      padding: .1rem .35rem;
+      border-radius: 4px;
+      font-size: .82rem;
+    }
+    .guide-body ul { padding-left: 1.2rem; margin-top: .25rem; }
+    .guide-body li { margin-bottom: .25rem; }
+    .guide-body .warn { color: #e06060; }
+  </style>
+</head>
+<body>
+
+<!-- ── Top bar ── -->
+<div class="topbar">
+  <div class="topbar-info">
+    <h1>📬 Inbox</h1>
+    <div class="address" id="addr">__INBOX_ADDRESS__</div>
+  </div>
+  <div class="topbar-right">
+    <p class="timer" id="timer">Expires in <span id="countdown">–</span></p>
+    <button class="refresh-btn" id="refresh-btn">🔄 Refresh</button>
+  </div>
+</div>
+
+<!-- ── Tor + real email note ── -->
+<div class="tor-notice" id="tor-notice" style="display:none">
+  ✅ <strong>Real SMTP enabled</strong> — this address receives email from Discord, GitHub, and any
+  other service. Point your domain's MX record at this server's IP to activate.
+</div>
+
+<!-- ── Message list ── -->
+<div class="inbox-wrap" id="inbox-wrap">
+  <div class="empty-state" id="empty-state">
+    <div class="big">📭</div>
+    <p>No messages yet.</p>
+    <p style="margin-top:.4rem;font-size:.8rem">Sign up for a service with the address above and your code will appear here automatically.</p>
+  </div>
+</div>
+
+<div class="status-bar" id="status-bar"></div>
+
+<!-- ── Tor / setup guide ── -->
+<details class="setup-guide">
+  <summary>📡 How to use this inbox with Discord, GitHub, etc. &amp; Tor setup guide</summary>
+  <div class="guide-body">
+    <h3>Using with any service</h3>
+    <p>Give the address above (<code id="addr2">__INBOX_ADDRESS__</code>) when signing up for a
+    service. When they send a verification email you will see it appear on this page automatically
+    (if the server has SMTP enabled) or you can paste the confirmation link into this page using
+    the HTTP drop form.</p>
+
+    <h3>Enabling real inbound email (SMTP)</h3>
+    <ul>
+      <li>You need a <strong>public domain</strong> with DNS control.</li>
+      <li>Add an MX record:
+        <code>mail.yourdomain.com.  MX  10  &lt;server-public-IP&gt;</code></li>
+      <li>Start the server with:
+        <code>MAIL_DOMAIN=mail.yourdomain.com SMTP_PORT=25 python -m server</code></li>
+      <li>Port 25 requires root. Run behind a reverse-proxy or use port 2525 with a firewall NAT rule
+        (<code>iptables -t nat -A PREROUTING -p tcp --dport 25 -j REDIRECT --to-port 2525</code>).</li>
+    </ul>
+
+    <h3>Hosting over Tor</h3>
+    <ul>
+      <li>The secureChat web UI works perfectly over a Tor hidden service (.onion address).</li>
+      <li class="warn">⚠️ <strong>SMTP / email cannot travel over Tor</strong> — receiving
+        real email from Discord/GitHub requires a clearnet IP with a proper MX record.
+        Tor hidden services do not have MX-resolvable addresses.</li>
+      <li>Recommended setup: host the server on a VPS with a clearnet IP for SMTP, add
+        a Tor hidden service for the web UI (port 5000 → .onion), and use
+        <code>MAIL_DOMAIN=mail.yourdomain.com</code> pointing at the VPS IP.</li>
+    </ul>
+
+    <h3>Privacy</h3>
+    <ul>
+      <li>Inboxes are held only in memory and auto-destroyed at the TTL you chose.</li>
+      <li>No messages are stored on disk or in the database.</li>
+      <li>The server only logs the token suffix (last 6 chars) — not your full address.</li>
+    </ul>
+  </div>
+</details>
+
+<script>
+  const TOKEN      = '__INBOX_TOKEN__';
+  const EXPIRES_AT = __INBOX_EXPIRES_AT__;  // injected unix timestamp
+  let   _pollTimer = null;
+  let   _refreshing = false;
+
+  /* ── Check for SMTP enabled via server-info ── */
+  fetch('/api/server-info').then(r => r.json()).then(info => {
+    if (info.mail_domain) {
+      document.getElementById('tor-notice').style.display = '';
+    }
+  }).catch(() => {});
+
+  /* ── Countdown ── */
+  function updateCountdown() {
+    const secs = Math.max(0, Math.round(EXPIRES_AT - Date.now() / 1000));
+    const h = Math.floor(secs / 3600);
+    const m = Math.floor((secs % 3600) / 60);
+    const s = secs % 60;
+    const el = document.getElementById('countdown');
+    const timerEl = document.getElementById('timer');
+    if (h > 0)
+      el.textContent = `${h}h ${m}m`;
+    else if (m > 0)
+      el.textContent = `${m}m ${s}s`;
+    else
+      el.textContent = `${s}s`;
+    timerEl.className = 'timer' + (secs < 120 ? ' urgent' : '');
+    if (secs === 0) {
+      el.textContent = 'expired';
+      document.getElementById('refresh-btn').disabled = true;
+      clearInterval(_pollTimer);
+      renderExpired();
+    }
+  }
+  updateCountdown();
+  setInterval(updateCountdown, 1000);
+
+  /* ── Fetch and render messages ── */
+  async function refresh() {
+    if (_refreshing) return;
+    _refreshing = true;
+    const btn = document.getElementById('refresh-btn');
+    btn.disabled = true;
+    btn.textContent = '⏳ Refreshing…';
+    try {
+      const resp = await fetch(`/inbox/${encodeURIComponent(TOKEN)}/read`);
+      if (resp.status === 410) {
+        renderExpired();
+        return;
+      }
+      if (!resp.ok) {
+        setStatus(`Error ${resp.status}: ${resp.statusText}`);
+        return;
+      }
+      const data = await resp.json();
+      renderMessages(data.messages);
+      const ts = new Date().toLocaleTimeString();
+      setStatus(`Last checked: ${ts} — ${data.count} message${data.count !== 1 ? 's' : ''}`);
+    } catch (err) {
+      setStatus(`Network error: ${err.message}`);
+    } finally {
+      _refreshing = false;
+      btn.disabled = false;
+      btn.textContent = '🔄 Refresh';
+    }
+  }
+
+  function renderMessages(messages) {
+    const wrap = document.getElementById('inbox-wrap');
+    const empty = document.getElementById('empty-state');
+    if (!messages || messages.length === 0) {
+      empty.style.display = '';
+      // Remove any previously rendered cards
+      [...wrap.querySelectorAll('.msg-card')].forEach(c => c.remove());
+      return;
+    }
+    empty.style.display = 'none';
+    // Re-render all messages (simple: clear old cards first)
+    [...wrap.querySelectorAll('.msg-card')].forEach(c => c.remove());
+    // Newest first
+    [...messages].reverse().forEach(m => wrap.prepend(buildCard(m)));
+    // Make sure the empty state stays at the bottom
+    wrap.appendChild(empty);
+  }
+
+  function buildCard(m) {
+    const card = document.createElement('div');
+    card.className = 'msg-card';
+
+    const ts = m.received_at
+      ? new Date(m.received_at * 1000).toLocaleString()
+      : '';
+
+    const isEmail = !!m.email_from;
+    const subjectHtml = isEmail
+      ? `<div class="msg-field"><span class="label">Subject:</span><span class="val subject">${esc(m.subject || '(no subject)')}</span></div>`
+      : '';
+    const fromHtml = isEmail
+      ? `<div class="msg-field"><span class="label">From:</span><span class="val">${esc(m.email_from)}</span></div>`
+      : '';
+    const badgeHtml = isEmail
+      ? `<div class="msg-badge">✉️ Received via SMTP</div>`
+      : `<div class="msg-badge" style="color:#888">💬 Sent via drop form</div>`;
+
+    card.innerHTML = `
+      <div class="msg-header">
+        <div>
+          ${subjectHtml}
+          ${fromHtml}
+          ${badgeHtml}
+        </div>
+        <div class="msg-time">${esc(ts)}</div>
+      </div>
+      <div class="msg-body" id="body-${Math.random().toString(36).slice(2)}"></div>
+    `;
+
+    // Render body safely
+    const bodyEl = card.querySelector('.msg-body');
+    if (m.content_type === 'text/html') {
+      // Sandboxed iframe — no scripts, no same-origin, safe for untrusted HTML
+      const blob = new Blob([m.body], { type: 'text/html' });
+      const blobUrl = URL.createObjectURL(blob);
+      const iframe = document.createElement('iframe');
+      iframe.src = blobUrl;
+      // sandbox="" is maximally restrictive: no scripts, no same-origin, no forms
+      iframe.setAttribute('sandbox', '');
+      iframe.style.cssText = 'width:100%;min-height:220px;border:none;background:#fff;border-radius:4px';
+      iframe.title = 'Email body';
+      bodyEl.appendChild(iframe);
+    } else {
+      const pre = document.createElement('pre');
+      pre.textContent = m.body;
+      bodyEl.appendChild(pre);
+    }
+
+    return card;
+  }
+
+  function renderExpired() {
+    const wrap = document.getElementById('inbox-wrap');
+    [...wrap.querySelectorAll('.msg-card')].forEach(c => c.remove());
+    wrap.innerHTML = `<div class="empty-state"><div class="big">⏰</div><p>This inbox has expired and been permanently deleted.</p></div>`;
+    clearInterval(_pollTimer);
+    setStatus('Inbox expired');
+  }
+
+  function setStatus(text) {
+    document.getElementById('status-bar').textContent = text;
+  }
+
+  function esc(s) {
+    return String(s || '')
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+  }
+
+  /* ── Manual refresh button ── */
+  document.getElementById('refresh-btn').addEventListener('click', refresh);
+
+  /* ── Auto-poll every 10 seconds ── */
+  _pollTimer = setInterval(refresh, 10000);
+
+  /* ── Initial load ── */
+  refresh();
+</script>
+</body>
+</html>

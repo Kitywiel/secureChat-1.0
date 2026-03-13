@@ -38,6 +38,9 @@ section h2{font-size:1rem;font-weight:700;margin-bottom:.75rem;padding-bottom:.4
 .log-line.ul      {color:#ff9de2}
 .log-line.inactive{color:#60a5fa}
 .log-line.chatfile{color:#22d3ee}
+.log-line.inbox-created{color:#00c896}
+.log-line.inbox-msg    {color:#fb923c}
+.log-line.inbox-read   {color:#c084fc}
 #shutdown-btn{padding:.6rem 1.4rem;background:var(--red);border:none;border-radius:8px;
               color:#fff;font-size:.95rem;font-weight:700;cursor:pointer;margin-top:1rem;
               font-family:var(--font)}
@@ -323,6 +326,9 @@ function _logClass(t){
   if(s.includes('peer joined'))return 'joined';
   if(s.includes('room inactive'))return 'inactive';
   if(s.includes('chat file share'))return 'chatfile';
+  if(s.includes('inbox created'))return 'inbox-created';
+  if(s.includes('inbox filled')||s.includes('inbox email received'))return 'inbox-msg';
+  if(s.includes('inbox read'))return 'inbox-read';
   return 'info';
 }
 

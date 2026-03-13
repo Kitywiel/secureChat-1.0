@@ -107,6 +107,7 @@ class _ColourFormatter(logging.Formatter):
     _PINK   = "\x1b[95m"
     _BLUE   = "\x1b[34m"
     _CYAN   = "\x1b[36m"
+    _ORANGE = "\x1b[38;5;208m"
     _RESET  = "\x1b[0m"
 
     # Sub-strings matched (lower-cased) against the formatted message
@@ -117,6 +118,9 @@ class _ColourFormatter(logging.Formatter):
     _SHARE_DOWNLOAD = frozenset(["share download"])
     _INACTIVE       = frozenset(["room inactive"])
     _CHAT_FILE      = frozenset(["chat file share"])
+    _INBOX_CREATED  = frozenset(["inbox created"])
+    _INBOX_MSG      = frozenset(["inbox filled", "inbox email received"])
+    _INBOX_READ     = frozenset(["inbox read"])
 
     def format(self, record: logging.LogRecord) -> str:
         msg = super().format(record)
@@ -138,6 +142,12 @@ class _ColourFormatter(logging.Formatter):
             return f"{self._BLUE}{msg}{self._RESET}"
         if any(kw in text for kw in self._CHAT_FILE):
             return f"{self._CYAN}{msg}{self._RESET}"
+        if any(kw in text for kw in self._INBOX_CREATED):
+            return f"{self._GREEN}{msg}{self._RESET}"
+        if any(kw in text for kw in self._INBOX_MSG):
+            return f"{self._ORANGE}{msg}{self._RESET}"
+        if any(kw in text for kw in self._INBOX_READ):
+            return f"{self._PURPLE}{msg}{self._RESET}"
         return msg
 
 
@@ -185,12 +195,12 @@ MAX_UPLOAD_BYTES = 10 * 1024 * 1024 * 1024  # 10 GB per file
 MAX_FILENAME_LEN = 200                       # characters in the sanitised filename
 _SHARE_TOKEN_BYTES = 32                      # 256-bit token → 43-char URL-safe base64
 
-# One-time inbox constants
+# Inbox constants
 _INBOX_TOKEN_BYTES = 16                      # 128-bit token → ~22-char URL-safe base64 local part
-MAX_INBOX_MESSAGE_LEN = 4096                 # max characters for an inbox message (HTTP drop only)
+MAX_INBOX_MESSAGE_LEN = 65536                # max bytes per message body
 INBOX_MIN_TTL_MINUTES = 1                    # minimum lifetime in minutes
-INBOX_MAX_TTL_MINUTES = 60                   # maximum lifetime in minutes
-INBOX_DEFAULT_TTL_MINUTES = 10              # default lifetime in minutes
+INBOX_MAX_TTL_MINUTES = 1440                 # maximum lifetime in minutes (24 h)
+INBOX_DEFAULT_TTL_MINUTES = 60              # default lifetime in minutes
 # Real-email SMTP support — set MAIL_DOMAIN to your MX-pointed domain to enable inbound SMTP.
 # SMTP_PORT defaults to 25; use a higher port (e.g. 2525) when running without root privileges.
 MAIL_DOMAIN: str = os.environ.get("MAIL_DOMAIN", "")
@@ -272,11 +282,12 @@ _room_meta: dict[str, dict] = {}
 # token → {"tmp_dir": Path, "filename": str, "size": int, "expires_at": float}
 _share_slots: dict[str, dict] = {}
 
-# One-time inbox registry
-# token → {"message": str | None, "expires_at": float, "filled": bool,
-#           "email_from": str | None, "subject": str | None, "content_type": str | None}
-# A slot is created empty (filled=False); filled either by HTTP POST /drop or by inbound SMTP;
-# the recipient GETs /read once to retrieve and permanently destroy it.
+# Inbox registry
+# token → {
+#   "messages":   list[{body, email_from, subject, content_type, received_at}],
+#   "expires_at": float,   # Unix timestamp — inbox is destroyed at this time
+# }
+# Inboxes accept unlimited messages and allow unlimited reads until the TTL expires.
 _inbox_slots: dict[str, dict] = {}
 
 # SMTP controller instance (started when MAIL_DOMAIN is set)
@@ -908,26 +919,26 @@ async def _cleanup_expired_share_slots() -> None:
 # ---------------------------------------------------------------------------
 
 class InboxSmtpHandler:
-    """aiosmtpd message handler — receives inbound SMTP and fills matching inbox slots.
+    """aiosmtpd message handler — receives inbound SMTP and stores messages in inbox slots.
 
     This handler runs in the aiosmtpd Controller's own thread/event-loop.
-    Writes to ``_inbox_slots`` (a plain dict) are GIL-protected in CPython and
-    consist of single-key assignments, which is safe for concurrent access.
+    Appending to ``slot["messages"]`` is GIL-protected in CPython and safe for
+    concurrent access from the SMTP thread and the aiohttp event-loop thread.
     """
 
     async def handle_RCPT(
         self, server, session, envelope, address: str, rcpt_options
     ) -> str:
-        """Accept mail only for tokens that map to an active, unfilled inbox slot."""
+        """Accept mail only for tokens that map to an active inbox slot."""
         local = address.split("@")[0]
         slot = _inbox_slots.get(local)
-        if slot is None or time.time() > slot["expires_at"] or slot["filled"]:
+        if slot is None or time.time() > slot["expires_at"]:
             return "550 5.1.1 User unknown or inbox unavailable"
         envelope.rcpt_tos.append(address)
         return "250 OK"
 
     async def handle_DATA(self, server, session, envelope) -> str:
-        """Parse the raw email and deposit its body into the matching inbox slot(s)."""
+        """Parse the raw email and append its body to the matching inbox slot(s)."""
         raw = envelope.content
         if isinstance(raw, bytes):
             msg = _email_lib.message_from_bytes(raw, policy=_email_policy.default)
@@ -981,13 +992,15 @@ class InboxSmtpHandler:
         for rcpt in envelope.rcpt_tos:
             local = rcpt.split("@")[0]
             slot = _inbox_slots.get(local)
-            if slot is None or slot["filled"] or time.time() > slot["expires_at"]:
+            if slot is None or time.time() > slot["expires_at"]:
                 continue
-            slot["message"] = body
-            slot["filled"] = True
-            slot["email_from"] = from_addr
-            slot["subject"] = subject
-            slot["content_type"] = "text/html" if body_html else "text/plain"
+            slot["messages"].append({
+                "body":         body,
+                "email_from":   from_addr,
+                "subject":      subject,
+                "content_type": "text/html" if body_html else "text/plain",
+                "received_at":  time.time(),
+            })
             logger.info(
                 "inbox email received  token=…%s  from=%.40s  subject=%r",
                 local[-6:],
@@ -998,20 +1011,21 @@ class InboxSmtpHandler:
         return "250 Message accepted for delivery"
 
 async def inbox_create_handler(request: web.Request) -> web.Response:
-    """POST /inbox/create — allocate a fresh one-time inbox slot.
+    """POST /inbox/create — allocate a new inbox that accepts unlimited messages.
 
     Accepts optional JSON body::
 
-        {"ttl_minutes": 10}   # 1–60, default 10
+        {"ttl_minutes": 60}   # 1–1440, default 60
 
     Returns::
 
         {
-          "address":    "abc123@example.com",   # real email address (when MAIL_DOMAIN is set)
-          "drop_url":   "/inbox/<token>/drop",  # HTTP drop page for the sender
-          "read_url":   "/inbox/<token>/read",  # one-time read endpoint for the recipient
-          "expires_at": <unix-timestamp>,
-          "smtp_enabled": true|false,           # whether real SMTP is active on this server
+          "address":      "abc123@example.com",   # real email address (when MAIL_DOMAIN is set)
+          "drop_url":     "/inbox/<token>/drop",  # HTTP sender page
+          "read_url":     "/inbox/<token>/read",  # JSON messages API
+          "reader_url":   "/inbox/<token>",       # full HTML mail reader page
+          "expires_at":   <unix-timestamp>,
+          "smtp_enabled": true|false,
         }
     """
     try:
@@ -1024,12 +1038,8 @@ async def inbox_create_handler(request: web.Request) -> web.Response:
     token = secrets.token_urlsafe(_INBOX_TOKEN_BYTES)
     expires_at = time.time() + ttl_seconds
     _inbox_slots[token] = {
-        "message": None,
+        "messages":   [],
         "expires_at": expires_at,
-        "filled": False,
-        "email_from": None,
-        "subject": None,
-        "content_type": None,
     }
     # Use the configured mail domain for a real working email address; fall back to request host.
     mail_host = MAIL_DOMAIN or request.host or "localhost"
@@ -1039,22 +1049,21 @@ async def inbox_create_handler(request: web.Request) -> web.Response:
         "address":      address,
         "drop_url":     f"/inbox/{token}/drop",
         "read_url":     f"/inbox/{token}/read",
+        "reader_url":   f"/inbox/{token}",
         "expires_at":   expires_at,
         "smtp_enabled": bool(MAIL_DOMAIN),
     })
 
 
 async def inbox_drop_handler(request: web.Request) -> web.Response:
-    """POST /inbox/{token}/drop — sender deposits a message (one-time)."""
+    """POST /inbox/{token}/drop — sender deposits a message (unlimited deposits allowed)."""
     token = request.match_info["token"]
     slot = _inbox_slots.get(token)
     if slot is None:
-        raise web.HTTPNotFound(reason="Inbox not found or already used")
+        raise web.HTTPNotFound(reason="Inbox not found")
     if time.time() > slot["expires_at"]:
         _inbox_slots.pop(token, None)
         raise web.HTTPGone(reason="Inbox has expired")
-    if slot["filled"]:
-        raise web.HTTPConflict(reason="Inbox already has a message")
     try:
         body = await request.json()
     except Exception:
@@ -1067,40 +1076,62 @@ async def inbox_drop_handler(request: web.Request) -> web.Response:
             max_size=MAX_INBOX_MESSAGE_LEN,
             actual_size=len(message),
         )
-    slot["message"] = message
-    slot["filled"] = True
+    slot["messages"].append({
+        "body":         message,
+        "email_from":   None,
+        "subject":      None,
+        "content_type": "text/plain",
+        "received_at":  time.time(),
+    })
     logger.info("inbox filled  token=…%s", token[-6:])
     return web.json_response({"ok": True})
 
 
 async def inbox_read_handler(request: web.Request) -> web.Response:
-    """GET /inbox/{token}/read — recipient reads and destroys the message (one-time).
+    """GET /inbox/{token}/read — JSON API: return all messages in the inbox.
 
-    Response fields:
-        message      – the message body (plain text or HTML)
-        content_type – "text/plain" or "text/html" (only for SMTP-received emails)
-        email_from   – sender address (only for SMTP-received emails)
-        subject      – email subject  (only for SMTP-received emails)
+    Inbox is NOT destroyed on read.  It auto-expires at its TTL.
+    Response::
+
+        {
+          "messages": [
+            {"body": "…", "email_from": "…", "subject": "…",
+             "content_type": "text/plain|text/html", "received_at": <unix-ts>},
+            …
+          ],
+          "expires_at": <unix-ts>,
+          "count": <int>
+        }
     """
     token = request.match_info["token"]
     slot = _inbox_slots.get(token)
     if slot is None:
-        raise web.HTTPGone(reason="Inbox not found, expired, or already read")
+        raise web.HTTPGone(reason="Inbox not found or expired")
     if time.time() > slot["expires_at"]:
         _inbox_slots.pop(token, None)
         raise web.HTTPGone(reason="Inbox has expired")
-    if not slot["filled"]:
-        # Slot exists but no message yet — tell the caller to try again
-        return web.json_response({"pending": True}, status=204)
-    # Collect all fields before destroying the slot
-    result: dict = {"message": slot["message"]}
-    if slot.get("email_from"):
-        result["email_from"] = slot["email_from"]
-        result["subject"] = slot.get("subject") or ""
-        result["content_type"] = slot.get("content_type") or "text/plain"
-    _inbox_slots.pop(token, None)
-    logger.info("inbox read  token=…%s", token[-6:])
-    return web.json_response(result)
+    logger.info("inbox read  token=…%s  count=%d", token[-6:], len(slot["messages"]))
+    return web.json_response({
+        "messages":   slot["messages"],
+        "expires_at": slot["expires_at"],
+        "count":      len(slot["messages"]),
+    })
+
+
+async def inbox_read_page_handler(request: web.Request) -> web.Response:
+    """GET /inbox/{token} — serve the full HTML mail-reader page."""
+    token = request.match_info["token"]
+    slot = _inbox_slots.get(token)
+    if slot is None or time.time() > slot["expires_at"]:
+        _inbox_slots.pop(token, None)
+        raise web.HTTPGone(reason="Inbox not found or expired")
+    mail_host = MAIL_DOMAIN or request.host or "localhost"
+    address = f"{token}@{mail_host}"
+    html = (STATIC_DIR / "mail_read.html").read_text(encoding="utf-8")
+    html = html.replace("__INBOX_TOKEN__", token)
+    html = html.replace("__INBOX_ADDRESS__", address)
+    html = html.replace("__INBOX_EXPIRES_AT__", str(slot["expires_at"]))
+    return web.Response(text=html, content_type="text/html")
 
 
 async def inbox_drop_page_handler(request: web.Request) -> web.Response:
@@ -1110,15 +1141,6 @@ async def inbox_drop_page_handler(request: web.Request) -> web.Response:
     if slot is None or time.time() > slot["expires_at"]:
         _inbox_slots.pop(token, None)
         raise web.HTTPGone(reason="Inbox not found or expired")
-    if slot["filled"]:
-        html = (
-            "<!DOCTYPE html><html><head><meta charset='UTF-8'>"
-            "<title>secureChat Inbox</title></head><body>"
-            "<h1>✅ Message already delivered</h1>"
-            "<p>This one-time inbox has already received a message.</p>"
-            "</body></html>"
-        )
-        return web.Response(text=html, content_type="text/html")
     host = MAIL_DOMAIN or request.host or "localhost"
     address = f"{token}@{host}"
     html = (STATIC_DIR / "inbox.html").read_text(encoding="utf-8")
@@ -1815,6 +1837,7 @@ def build_app(db_path: Path | None = None) -> web.Application:
     app.router.add_post("/share/download/{token}", share_download_post_handler)
     # One-time inbox routes
     app.router.add_post("/inbox/create", inbox_create_handler)
+    app.router.add_get("/inbox/{token}", inbox_read_page_handler)
     app.router.add_get("/inbox/{token}/drop", inbox_drop_page_handler)
     app.router.add_post("/inbox/{token}/drop", inbox_drop_handler)
     app.router.add_get("/inbox/{token}/read", inbox_read_handler)

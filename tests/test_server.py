@@ -1568,7 +1568,7 @@ async def test_inbox_create_returns_urls(ws_client) -> None:
 
 @pytest.mark.asyncio
 async def test_inbox_create_ttl_minutes(ws_client) -> None:
-    """POST /inbox/create respects ttl_minutes (1-60) and clamps outliers."""
+    """POST /inbox/create respects ttl_minutes (1-1440) and clamps outliers."""
     import server as _s
     import time
 
@@ -1579,11 +1579,11 @@ async def test_inbox_create_ttl_minutes(ws_client) -> None:
     expected = time.time() + 15 * 60
     assert abs(_s._inbox_slots[token]["expires_at"] - expected) < 5
 
-    # TTL above maximum should be clamped to 60 min
-    resp2 = await ws_client.post("/inbox/create", json={"ttl_minutes": 999})
+    # TTL above maximum should be clamped to 1440 min (24 h)
+    resp2 = await ws_client.post("/inbox/create", json={"ttl_minutes": 99999})
     body2 = await resp2.json()
     token2 = body2["drop_url"].split("/")[2]
-    max_expected = time.time() + 60 * 60
+    max_expected = time.time() + 1440 * 60
     assert _s._inbox_slots[token2]["expires_at"] <= max_expected + 5
 
     # TTL below minimum should be clamped to 1 min
@@ -1596,7 +1596,7 @@ async def test_inbox_create_ttl_minutes(ws_client) -> None:
 
 @pytest.mark.asyncio
 async def test_inbox_drop_and_read_once(ws_client) -> None:
-    """Full happy-path: create → drop message → read once → gone."""
+    """Full happy-path: create → drop message → read → messages in list."""
     # Create
     resp = await ws_client.post("/inbox/create", json={})
     body = await resp.json()
@@ -1608,15 +1608,17 @@ async def test_inbox_drop_and_read_once(ws_client) -> None:
     assert drop_resp.status == 200
     assert (await drop_resp.json())["ok"] is True
 
-    # Read once
+    # Read — returns messages list, inbox NOT destroyed
     read_resp = await ws_client.get(read_url)
     assert read_resp.status == 200
     read_body = await read_resp.json()
-    assert read_body["message"] == "S3cr3tC0de!"
+    assert "messages" in read_body
+    assert len(read_body["messages"]) == 1
+    assert read_body["messages"][0]["body"] == "S3cr3tC0de!"
 
-    # Second read must be gone (410)
-    gone_resp = await ws_client.get(read_url)
-    assert gone_resp.status == 410
+    # Second read still works (inbox persists until TTL)
+    read_resp2 = await ws_client.get(read_url)
+    assert read_resp2.status == 200
 
 
 @pytest.mark.asyncio
@@ -1629,30 +1631,42 @@ async def test_inbox_drop_page_served(ws_client) -> None:
     ct = page_resp.headers.get("Content-Type", "")
     assert "text/html" in ct
     text = await page_resp.text()
-    assert "One-Time Inbox" in text
+    assert "Send to Inbox" in text
     # The address placeholder must have been substituted
     assert "__INBOX_ADDRESS__" not in text
     assert "__INBOX_EXPIRES_AT__" not in text
 
 
 @pytest.mark.asyncio
-async def test_inbox_double_drop_returns_409(ws_client) -> None:
-    """A second POST to /drop on a filled inbox returns 409 Conflict."""
+async def test_inbox_accepts_multiple_messages(ws_client) -> None:
+    """Multiple POSTs to /drop on the same inbox are all accepted (no 409)."""
     resp = await ws_client.post("/inbox/create", json={})
     drop_url = (await resp.json())["drop_url"]
 
-    await ws_client.post(drop_url, json={"message": "first"})
+    first  = await ws_client.post(drop_url, json={"message": "first"})
     second = await ws_client.post(drop_url, json={"message": "second"})
-    assert second.status == 409
+    assert first.status == 200
+    assert second.status == 200
+
+    # Both messages should be stored
+    read_url = (await (await ws_client.post("/inbox/create", json={})).json())["drop_url"]
+    token = drop_url.split("/")[2]
+    import server as _s
+    slot = _s._inbox_slots.get(token)
+    assert slot is not None
+    assert len(slot["messages"]) == 2
 
 
 @pytest.mark.asyncio
 async def test_inbox_read_before_drop_returns_204(ws_client) -> None:
-    """GET /read on an empty (unfilled) inbox returns 204 (pending)."""
+    """GET /read on an empty (unfilled) inbox returns 200 with empty messages list."""
     resp = await ws_client.post("/inbox/create", json={})
     read_url = (await resp.json())["read_url"]
     read_resp = await ws_client.get(read_url)
-    assert read_resp.status == 204
+    assert read_resp.status == 200
+    body = await read_resp.json()
+    assert body["count"] == 0
+    assert body["messages"] == []
 
 
 @pytest.mark.asyncio
@@ -1696,7 +1710,7 @@ class FakeEnvelope:
 
 @pytest.mark.asyncio
 async def test_smtp_handler_fills_slot_plaintext(ws_client) -> None:
-    """InboxSmtpHandler.handle_DATA fills an inbox slot with plain-text email."""
+    """InboxSmtpHandler.handle_DATA appends a plain-text email to the inbox messages list."""
     import server as _s
 
     resp = await ws_client.post("/inbox/create", json={"ttl_minutes": 10})
@@ -1719,11 +1733,12 @@ async def test_smtp_handler_fills_slot_plaintext(ws_client) -> None:
     assert result.startswith("250")
     slot = _s._inbox_slots.get(token)
     assert slot is not None
-    assert slot["filled"] is True
-    assert "123456" in slot["message"]
-    assert slot["email_from"] == "alice@example.com"
-    assert slot["subject"] == "Test verification code"
-    assert slot["content_type"] == "text/plain"
+    assert len(slot["messages"]) == 1
+    msg = slot["messages"][0]
+    assert "123456" in msg["body"]
+    assert msg["email_from"] == "alice@example.com"
+    assert msg["subject"] == "Test verification code"
+    assert msg["content_type"] == "text/plain"
 
 
 @pytest.mark.asyncio
@@ -1751,9 +1766,10 @@ async def test_smtp_handler_fills_slot_html_email(ws_client) -> None:
     assert result.startswith("250")
     slot = _s._inbox_slots.get(token)
     assert slot is not None
-    assert slot["filled"] is True
-    assert "654321" in slot["message"]
-    assert slot["content_type"] == "text/html"
+    assert len(slot["messages"]) == 1
+    msg = slot["messages"][0]
+    assert "654321" in msg["body"]
+    assert msg["content_type"] == "text/html"
 
 
 @pytest.mark.asyncio
@@ -1777,7 +1793,7 @@ async def test_smtp_handler_ignores_unknown_token(ws_client) -> None:
 
 @pytest.mark.asyncio
 async def test_inbox_read_returns_email_metadata(ws_client) -> None:
-    """GET /inbox/{token}/read returns email_from, subject, content_type for SMTP emails."""
+    """GET /inbox/{token}/read returns messages list with email_from, subject, content_type."""
     import server as _s
 
     resp = await ws_client.post("/inbox/create", json={"ttl_minutes": 10})
@@ -1801,11 +1817,13 @@ async def test_inbox_read_returns_email_metadata(ws_client) -> None:
     read_resp = await ws_client.get(f"/inbox/{token}/read")
     assert read_resp.status == 200
     body = await read_resp.json()
-    assert "message" in body
-    assert "email_from" in body
-    assert body["email_from"] == "github@example.com"
-    assert body["subject"] == "GitHub: Verify your email"
-    assert body["content_type"] == "text/plain"
+    assert "messages" in body
+    assert body["count"] == 1
+    msg = body["messages"][0]
+    assert "body" in msg
+    assert msg["email_from"] == "github@example.com"
+    assert msg["subject"] == "GitHub: Verify your email"
+    assert msg["content_type"] == "text/plain"
 
 
 @pytest.mark.asyncio

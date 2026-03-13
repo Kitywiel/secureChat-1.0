@@ -87,7 +87,7 @@
             📎 Share Files
           </button>
           <button type="button" id="inbox-btn" class="btn-secondary">
-            📬 One-Time Inbox
+            📬 Inbox
           </button>
         </div>
       </div>
@@ -351,81 +351,43 @@
       </div>
     </div>
 
-    <!-- ── One-Time Inbox ────────────────────────────────────────────────── -->
+    <!-- ── Inbox ─────────────────────────────────────────────────────────── -->
     <div id="inbox" class="screen hidden">
       <div class="card">
         <div class="card-header">
           <button type="button" id="inbox-back-btn" class="btn-back">← Back</button>
-          <h1>📬 One-Time Inbox</h1>
+          <h1>📬 Inbox</h1>
         </div>
-        <p class="subtitle" id="inbox-subtitle">
-          Create a temporary inbox that accepts <strong>one message</strong> from
-          a sender. Share the drop link with them; the read link is yours alone.
-          Both links expire after the chosen time.
+        <p class="subtitle">
+          Create temporary inboxes that receive real email (Discord, GitHub, etc.) and messages
+          from the drop link. Each inbox self-destructs at expiry. You can create as many as you need.
         </p>
         <!-- Badge shown when the server has SMTP enabled -->
         <p id="inbox-smtp-badge" class="notice hidden" style="background:#1a2e1a;border-color:#2d6a2d;color:#6fcf6f;margin-bottom:.75rem">
-          ✅ <strong>Real email enabled</strong> — the address below works with Discord, GitHub, and any service that sends verification emails.
+          ✅ <strong>Real email enabled</strong> — addresses below work with Discord, GitHub, and any service.
           Point your domain's MX record to this server's IP to activate.
         </p>
 
+        <!-- Create form (always visible) -->
         <div id="inbox-create-area">
           <label for="inbox-ttl">Inbox expires after</label>
           <select id="inbox-ttl">
-            <option value="1">1 minute</option>
             <option value="5">5 minutes</option>
-            <option value="10" selected>10 minutes</option>
             <option value="15">15 minutes</option>
             <option value="30">30 minutes</option>
-            <option value="60">60 minutes</option>
+            <option value="60" selected>1 hour</option>
+            <option value="180">3 hours</option>
+            <option value="360">6 hours</option>
+            <option value="720">12 hours</option>
+            <option value="1440">24 hours</option>
           </select>
 
           <div id="inbox-create-error" class="field-error" aria-live="polite"></div>
           <button type="button" id="inbox-create-btn">Create Inbox →</button>
         </div>
 
-        <div id="inbox-result" class="share-result hidden">
-          <p class="share-result-label">📮 Inbox address — share this with the sender:</p>
-          <div class="share-link-row">
-            <code id="inbox-address" class="share-link"></code>
-            <button type="button" id="inbox-copy-address-btn" class="btn-copy">Copy</button>
-          </div>
-
-          <p class="share-result-label share-result-label--mt">
-            🔗 Drop link — sender opens this to type their message:
-          </p>
-          <div class="share-link-row">
-            <code id="inbox-drop-url" class="share-link"></code>
-            <button type="button" id="inbox-copy-drop-btn" class="btn-copy">Copy</button>
-          </div>
-
-          <p class="share-result-label share-result-label--mt">
-            📥 Read link — open this to receive the message (one-time only):
-          </p>
-          <div class="share-link-row">
-            <code id="inbox-read-url" class="share-link"></code>
-            <button type="button" id="inbox-copy-read-btn" class="btn-copy">Copy</button>
-          </div>
-
-          <p id="inbox-expiry" class="notice"></p>
-
-          <button type="button" id="inbox-open-read-btn">
-            📥 Check for Message →
-          </button>
-          <button type="button" id="inbox-new-btn" class="btn-secondary" style="margin-top:.5rem">
-            Create Another Inbox
-          </button>
-
-          <!-- Inline message reader — populated by app.js when the read button is clicked -->
-          <div id="inbox-read-result" class="hidden" style="margin-top:1rem">
-            <div id="inbox-read-meta" class="hidden" style="background:#111;border:1px solid #333;border-radius:8px;padding:.6rem .8rem;margin-bottom:.75rem;font-size:.85rem;color:#aaa">
-              <div><span style="color:#666">From:</span>&nbsp;<span id="inbox-read-from" style="color:#e0e0e0"></span></div>
-              <div style="margin-top:.25rem"><span style="color:#666">Subject:</span>&nbsp;<span id="inbox-read-subject" style="color:#e0e0e0"></span></div>
-            </div>
-            <div id="inbox-read-body-wrapper"></div>
-            <p id="inbox-read-notice" class="notice" style="margin-top:.75rem"></p>
-          </div>
-        </div>
+        <!-- Active inboxes list — one card per inbox -->
+        <div id="inbox-list" style="margin-top:1.25rem"></div>
       </div>
     </div>
 

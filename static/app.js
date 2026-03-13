@@ -1480,48 +1480,24 @@ document.getElementById('create-copy-delete-code-btn').addEventListener('click',
   });
 });
 
-// ─── One-Time Inbox ───────────────────────────────────────────────────────────
+// ─── Inbox (multi-inbox support) ─────────────────────────────────────────────
 
-/** Reset the inbox creation screen to its initial state. */
-function resetInboxScreen() {
-  document.getElementById('inbox-result').classList.add('hidden');
-  document.getElementById('inbox-read-result').classList.add('hidden');
-  document.getElementById('inbox-read-meta').classList.add('hidden');
-  document.getElementById('inbox-read-body-wrapper').innerHTML = '';
-  document.getElementById('inbox-read-notice').textContent = '';
-  document.getElementById('inbox-create-area').classList.remove('hidden');
-  document.getElementById('inbox-create-error').textContent = '';
-  document.getElementById('inbox-create-btn').disabled = false;
-  document.getElementById('inbox-create-btn').textContent = 'Create Inbox →';
-  document.getElementById('inbox-address').textContent = '';
-  document.getElementById('inbox-drop-url').textContent = '';
-  document.getElementById('inbox-read-url').textContent = '';
-  document.getElementById('inbox-expiry').textContent = '';
-  document.getElementById('inbox-open-read-btn').style.display = '';
-  document.getElementById('inbox-open-read-btn').disabled = false;
-  document.getElementById('inbox-open-read-btn').textContent = '📥 Check for Message →';
-  document.getElementById('inbox-open-read-btn').onclick = null;
-}
+// State: list of active inbox objects
+const _activeInboxes = [];
 
 // Fetch server-info once to know whether SMTP is configured
 fetch('/api/server-info').then(r => r.json()).then(info => {
   if (info.mail_domain) {
     document.getElementById('inbox-smtp-badge').classList.remove('hidden');
   }
-}).catch(() => {/* ignore */});
+}).catch(() => {});
 
 document.getElementById('inbox-btn').addEventListener('click', () => {
-  resetInboxScreen();
   showScreen('inbox');
 });
 
 document.getElementById('inbox-back-btn').addEventListener('click', () => {
-  resetInboxScreen();
   showScreen('lobby');
-});
-
-document.getElementById('inbox-new-btn').addEventListener('click', () => {
-  resetInboxScreen();
 });
 
 document.getElementById('inbox-create-btn').addEventListener('click', async () => {
@@ -1547,122 +1523,197 @@ document.getElementById('inbox-create-btn').addEventListener('click', async () =
       throw new Error(text || resp.statusText);
     }
     const data = await resp.json();
-
-    const base = window.location.origin;
-    const fullDrop = base + data.drop_url;
-    const fullRead = base + data.read_url;
-
-    document.getElementById('inbox-address').textContent  = data.address;
-    document.getElementById('inbox-drop-url').textContent = fullDrop;
-    document.getElementById('inbox-read-url').textContent = fullRead;
-
-    const expiresDate = new Date(data.expires_at * 1000);
-    document.getElementById('inbox-expiry').textContent =
-      `⏰ Expires at ${expiresDate.toLocaleTimeString()} (${ttlMinutes} min)`;
-
-    // Show the SMTP badge inside the result area if server has real email
-    if (data.smtp_enabled) {
-      document.getElementById('inbox-smtp-badge').classList.remove('hidden');
-    }
-
-    // "Check for Message" fetches the read URL inline and renders the result
-    document.getElementById('inbox-open-read-btn').onclick = async () => {
-      const readBtn = document.getElementById('inbox-open-read-btn');
-      readBtn.disabled = true;
-      readBtn.textContent = 'Checking…';
-
-      try {
-        const readResp = await fetch(fullRead);
-        const resultDiv = document.getElementById('inbox-read-result');
-        const noticeEl = document.getElementById('inbox-read-notice');
-        const bodyWrapper = document.getElementById('inbox-read-body-wrapper');
-        resultDiv.classList.remove('hidden');
-
-        if (readResp.status === 204) {
-          noticeEl.textContent = '⏳ No message yet — click again to check.';
-          bodyWrapper.innerHTML = '';
-          readBtn.disabled = false;
-          readBtn.textContent = '🔄 Check Again →';
-        } else if (readResp.status === 410) {
-          noticeEl.textContent = '🗑️ Inbox has expired or the message was already read.';
-          bodyWrapper.innerHTML = '';
-          readBtn.style.display = 'none';
-        } else if (readResp.ok) {
-          const msg = await readResp.json();
-
-          // Show email headers (From / Subject) if this was a real SMTP email
-          if (msg.email_from) {
-            document.getElementById('inbox-read-from').textContent = msg.email_from;
-            document.getElementById('inbox-read-subject').textContent =
-              msg.subject || '(no subject)';
-            document.getElementById('inbox-read-meta').classList.remove('hidden');
-          }
-
-          // Render the body — HTML emails go in a sandboxed iframe; plain text in <pre>
-          if (msg.content_type === 'text/html') {
-            const blob = new Blob([msg.message], { type: 'text/html' });
-            const blobUrl = URL.createObjectURL(blob);
-            // sandbox="" is maximally restrictive: no scripts, no same-origin access,
-            // no form submission — safe for rendering untrusted email HTML.
-            bodyWrapper.innerHTML =
-              `<iframe src="${blobUrl}" sandbox="" style="width:100%;min-height:280px;` +
-              `border:1px solid #333;border-radius:8px;background:#fff" title="Email body">` +
-              `</iframe>`;
-          } else {
-            const pre = document.createElement('pre');
-            pre.style.cssText =
-              'background:#111;border:1px solid #333;border-radius:8px;padding:1rem;' +
-              'white-space:pre-wrap;word-break:break-word;font-family:monospace;' +
-              'font-size:.9rem;color:#e0e0e0;max-height:400px;overflow-y:auto';
-            pre.textContent = msg.message;
-            bodyWrapper.innerHTML = '';
-            bodyWrapper.appendChild(pre);
-          }
-
-          noticeEl.textContent = '✅ Message received — inbox permanently deleted.';
-          readBtn.style.display = 'none';
-        } else {
-          noticeEl.textContent = `Error ${readResp.status}: ${readResp.statusText}`;
-          readBtn.disabled = false;
-          readBtn.textContent = '📥 Check for Message →';
-        }
-      } catch (err) {
-        document.getElementById('inbox-read-notice').textContent =
-          `Network error: ${err.message}`;
-        document.getElementById('inbox-open-read-btn').disabled = false;
-        document.getElementById('inbox-open-read-btn').textContent = '📥 Check for Message →';
-      }
-    };
-
-    document.getElementById('inbox-create-area').classList.add('hidden');
-    document.getElementById('inbox-result').classList.remove('hidden');
+    _activeInboxes.unshift(data);  // newest first
+    renderInboxList();
   } catch (err) {
     errEl.textContent = 'Failed to create inbox: ' + (err instanceof Error ? err.message : String(err));
+  } finally {
     btn.disabled = false;
     btn.textContent = 'Create Inbox →';
   }
 });
 
-// Copy buttons for inbox result
-[
-  ['inbox-copy-address-btn', 'inbox-address'],
-  ['inbox-copy-drop-btn',    'inbox-drop-url'],
-  ['inbox-copy-read-btn',    'inbox-read-url'],
-].forEach(([btnId, srcId]) => {
-  document.getElementById(btnId).addEventListener('click', () => {
-    const text = document.getElementById(srcId).textContent;
-    const btn  = document.getElementById(btnId);
-    navigator.clipboard.writeText(text).then(() => {
-      btn.textContent = 'Copied!';
-      setTimeout(() => { btn.textContent = 'Copy'; }, 2000);
-    }).catch(() => {
-      const r = document.createRange();
-      r.selectNodeContents(document.getElementById(srcId));
-      const s = window.getSelection();
-      if (s) { s.removeAllRanges(); s.addRange(r); }
-    });
+/** Render the full inbox list. */
+function renderInboxList() {
+  const listEl = document.getElementById('inbox-list');
+  listEl.innerHTML = '';
+  if (_activeInboxes.length === 0) return;
+  _activeInboxes.forEach((data, idx) => {
+    listEl.appendChild(buildInboxCard(data, idx));
   });
-});
+}
+
+/**
+ * Build a DOM card for a single inbox entry.
+ * @param {object} data  — response from POST /inbox/create
+ * @param {number} idx   — index into _activeInboxes (for removal)
+ * @returns {HTMLElement}
+ */
+function buildInboxCard(data, idx) {
+  const base = window.location.origin;
+  const fullDrop   = base + data.drop_url;
+  const readerUrl  = base + data.reader_url;
+  const expiresDate = new Date(data.expires_at * 1000);
+  const expiresLabel = expiresDate.toLocaleString();
+
+  const card = document.createElement('div');
+  card.className = 'share-result';
+  card.style.cssText = 'margin-bottom:1rem;position:relative';
+
+  card.innerHTML = `
+    <button type="button" class="inbox-remove-btn" title="Remove from list"
+      style="position:absolute;top:.6rem;right:.6rem;background:none;border:none;
+             color:#555;cursor:pointer;font-size:1rem;padding:.1rem .3rem">✕</button>
+
+    <p class="share-result-label">📮 Email address</p>
+    <div class="share-link-row">
+      <code class="share-link inbox-addr-code">${escHtml(data.address)}</code>
+      <button type="button" class="btn-copy inbox-copy-addr">Copy</button>
+    </div>
+
+    <p class="share-result-label share-result-label--mt">🔗 Drop link (sender)</p>
+    <div class="share-link-row">
+      <code class="share-link">${escHtml(fullDrop)}</code>
+      <button type="button" class="btn-copy inbox-copy-drop">Copy</button>
+    </div>
+
+    <p class="notice" style="margin-top:.5rem">⏰ Expires ${escHtml(expiresLabel)}</p>
+
+    <div style="display:flex;gap:.5rem;margin-top:.75rem;flex-wrap:wrap">
+      <button type="button" class="inbox-open-reader-btn"
+        style="flex:1;padding:.55rem .75rem;background:#1e3a5e;color:#80d4ff;
+               border:1px solid #2a5080;border-radius:8px;cursor:pointer;font-size:.88rem;font-weight:600">
+        📬 Open Reader →
+      </button>
+      <button type="button" class="inbox-refresh-btn"
+        style="flex:1;padding:.55rem .75rem;background:#1a2e1a;color:#6fcf6f;
+               border:1px solid #2d6a2d;border-radius:8px;cursor:pointer;font-size:.88rem;font-weight:600">
+        🔄 Check Messages
+      </button>
+    </div>
+
+    <!-- Inline message preview -->
+    <div class="inbox-preview" style="margin-top:.75rem;display:none"></div>
+    <div class="inbox-status" style="margin-top:.4rem;font-size:.8rem;color:#666"></div>
+  `;
+
+  // Remove button
+  card.querySelector('.inbox-remove-btn').addEventListener('click', () => {
+    _activeInboxes.splice(idx, 1);
+    renderInboxList();
+  });
+
+  // Copy address
+  card.querySelector('.inbox-copy-addr').addEventListener('click', () => {
+    copyText(data.address, card.querySelector('.inbox-copy-addr'));
+  });
+
+  // Copy drop link
+  card.querySelector('.inbox-copy-drop').addEventListener('click', () => {
+    copyText(fullDrop, card.querySelector('.inbox-copy-drop'));
+  });
+
+  // Open full HTML reader in new tab
+  card.querySelector('.inbox-open-reader-btn').addEventListener('click', () => {
+    window.open(readerUrl, '_blank', 'noopener,noreferrer');
+  });
+
+  // Check messages inline
+  card.querySelector('.inbox-refresh-btn').addEventListener('click', async () => {
+    const refreshBtn = card.querySelector('.inbox-refresh-btn');
+    const previewEl  = card.querySelector('.inbox-preview');
+    const statusEl   = card.querySelector('.inbox-status');
+    refreshBtn.disabled = true;
+    refreshBtn.textContent = '⏳ Checking…';
+    statusEl.textContent = '';
+    try {
+      const r = await fetch(data.read_url);
+      if (r.status === 410) {
+        statusEl.textContent = '⏰ Inbox expired';
+        previewEl.style.display = 'none';
+        return;
+      }
+      if (!r.ok) { statusEl.textContent = `Error ${r.status}`; return; }
+      const info = await r.json();
+      renderInboxPreview(previewEl, info.messages);
+      statusEl.textContent = `Last checked: ${new Date().toLocaleTimeString()} — ${info.count} message${info.count !== 1 ? 's' : ''}`;
+    } catch (err) {
+      statusEl.textContent = `Network error: ${err.message}`;
+    } finally {
+      refreshBtn.disabled = false;
+      refreshBtn.textContent = '🔄 Check Messages';
+    }
+  });
+
+  return card;
+}
+
+/**
+ * Render the latest message(s) inside an inbox card's preview div.
+ * @param {HTMLElement} previewEl
+ * @param {Array} messages
+ */
+function renderInboxPreview(previewEl, messages) {
+  previewEl.innerHTML = '';
+  if (!messages || messages.length === 0) {
+    previewEl.style.display = 'block';
+    previewEl.innerHTML = '<p style="color:#555;font-size:.85rem">No messages yet.</p>';
+    return;
+  }
+  previewEl.style.display = 'block';
+  // Show up to 3 most recent messages
+  const toShow = [...messages].reverse().slice(0, 3);
+  toShow.forEach(m => {
+    const wrap = document.createElement('div');
+    wrap.style.cssText = 'background:#111;border:1px solid #2a2a2a;border-radius:8px;padding:.6rem .8rem;margin-bottom:.6rem';
+    const from    = m.email_from ? `<div style="font-size:.78rem;color:#666"><strong>From:</strong> ${escHtml(m.email_from)}</div>` : '';
+    const subject = m.subject    ? `<div style="font-size:.78rem;color:#666"><strong>Subject:</strong> ${escHtml(m.subject)}</div>` : '';
+    const ts      = m.received_at ? `<div style="font-size:.72rem;color:#444">${new Date(m.received_at * 1000).toLocaleString()}</div>` : '';
+
+    if (m.content_type === 'text/html') {
+      const blob = new Blob([m.body], { type: 'text/html' });
+      const blobUrl = URL.createObjectURL(blob);
+      // sandbox="" is maximally restrictive: no scripts, no same-origin, no forms
+      wrap.innerHTML = `${from}${subject}${ts}<iframe src="${blobUrl}" sandbox=""
+        style="width:100%;min-height:160px;border:none;background:#fff;border-radius:4px;margin-top:.4rem"
+        title="Email body"></iframe>`;
+    } else {
+      const pre = document.createElement('pre');
+      pre.style.cssText = 'white-space:pre-wrap;word-break:break-word;font-size:.85rem;color:#ccc;margin-top:.35rem;max-height:200px;overflow-y:auto';
+      pre.textContent = m.body;
+      wrap.innerHTML = `${from}${subject}${ts}`;
+      wrap.appendChild(pre);
+    }
+    previewEl.appendChild(wrap);
+  });
+  if (messages.length > 3) {
+    const more = document.createElement('p');
+    more.style.cssText = 'font-size:.8rem;color:#555;text-align:center;margin-top:.3rem';
+    more.textContent = `… and ${messages.length - 3} more — open the reader for the full inbox`;
+    previewEl.appendChild(more);
+  }
+}
+
+/** Copy text to clipboard, show feedback on the given button. */
+function copyText(text, btn) {
+  navigator.clipboard.writeText(text).then(() => {
+    const orig = btn.textContent;
+    btn.textContent = 'Copied!';
+    setTimeout(() => { btn.textContent = orig; }, 2000);
+  }).catch(() => {
+    const r = document.createRange();
+    r.selectNodeContents(btn.parentElement.querySelector('code') || btn);
+    const s = window.getSelection();
+    if (s) { s.removeAllRanges(); s.addRange(r); }
+  });
+}
+
+/** HTML-escape a string for safe insertion via innerHTML. */
+function escHtml(s) {
+  return String(s || '')
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
 
 // ─── Init ─────────────────────────────────────────────────────────────────────
 
