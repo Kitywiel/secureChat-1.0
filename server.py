@@ -182,6 +182,12 @@ MAX_UPLOAD_BYTES = 10 * 1024 * 1024 * 1024  # 10 GB per file
 MAX_FILENAME_LEN = 200                       # characters in the sanitised filename
 _SHARE_TOKEN_BYTES = 32                      # 256-bit token → 43-char URL-safe base64
 
+# One-time inbox constants
+_INBOX_TOKEN_BYTES = 32                      # 256-bit token
+MAX_INBOX_MESSAGE_LEN = 4096                 # max characters for an inbox message
+INBOX_DEFAULT_TTL = 3600 * 24               # 24 hours default TTL
+INBOX_MAX_TTL     = 3600 * 24 * 7          # 7 days maximum TTL
+
 # Room-create / passcode constants
 MAX_PASSCODE_LEN = 64                  # characters in a room or share passcode
 MAX_DESTRUCT_MINUTES = 1440            # 24 hours maximum
@@ -257,6 +263,12 @@ _room_meta: dict[str, dict] = {}
 # In-memory file-share slot registry
 # token → {"tmp_dir": Path, "filename": str, "size": int, "expires_at": float}
 _share_slots: dict[str, dict] = {}
+
+# One-time inbox registry
+# token → {"message": str | None, "expires_at": float, "filled": bool}
+# A slot is created empty (filled=False); the sender POSTs once to fill it;
+# the recipient GETs once to read and destroy it.
+_inbox_slots: dict[str, dict] = {}
 
 # ---------------------------------------------------------------------------
 # Global statistics counters
@@ -866,6 +878,118 @@ async def _cleanup_expired_share_slots() -> None:
                 await asyncio.to_thread(_rmtree, slot["tmp_dir"])
         if expired:
             logger.info("cleaned up %d expired share slot(s)", len(expired))
+
+
+# ---------------------------------------------------------------------------
+# One-time inbox handlers
+# ---------------------------------------------------------------------------
+# Workflow:
+#   1. Creator:  POST /inbox/create  → {"drop_url": "…/inbox/<token>/drop",
+#                                        "read_url": "…/inbox/<token>/read",
+#                                        "expires_at": <unix-ts>}
+#   2. Sender:   POST /inbox/<token>/drop  {body: {"message": "…"}}
+#                → 200 {"ok": true}  (only once — subsequent posts return 409)
+#   3. Recipient: GET /inbox/<token>/read  → 200 {"message": "…"} (one-time; slot deleted)
+#                 Returns 204 if nothing deposited yet, 410 if expired/used.
+# ---------------------------------------------------------------------------
+
+async def inbox_create_handler(request: web.Request) -> web.Response:
+    """POST /inbox/create — allocate a fresh one-time inbox slot."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    ttl = min(int(body.get("ttl", INBOX_DEFAULT_TTL)), INBOX_MAX_TTL)
+    ttl = max(ttl, 60)   # at least 1 minute
+    token = secrets.token_urlsafe(_INBOX_TOKEN_BYTES)
+    expires_at = time.time() + ttl
+    _inbox_slots[token] = {"message": None, "expires_at": expires_at, "filled": False}
+    logger.info("inbox created  token=…%s  ttl=%ds", token[-6:], ttl)
+    return web.json_response({
+        "drop_url": f"/inbox/{token}/drop",
+        "read_url": f"/inbox/{token}/read",
+        "expires_at": expires_at,
+    })
+
+
+async def inbox_drop_handler(request: web.Request) -> web.Response:
+    """POST /inbox/{token}/drop — sender deposits a message (one-time)."""
+    token = request.match_info["token"]
+    slot = _inbox_slots.get(token)
+    if slot is None:
+        raise web.HTTPNotFound(reason="Inbox not found or already used")
+    if time.time() > slot["expires_at"]:
+        _inbox_slots.pop(token, None)
+        raise web.HTTPGone(reason="Inbox has expired")
+    if slot["filled"]:
+        raise web.HTTPConflict(reason="Inbox already has a message")
+    try:
+        body = await request.json()
+    except Exception:
+        raise web.HTTPBadRequest(reason="JSON body required")
+    message = str(body.get("message", "")).strip()
+    if not message:
+        raise web.HTTPBadRequest(reason="message field must not be empty")
+    if len(message) > MAX_INBOX_MESSAGE_LEN:
+        raise web.HTTPRequestEntityTooLarge(
+            max_size=MAX_INBOX_MESSAGE_LEN,
+            actual_size=len(message),
+        )
+    slot["message"] = message
+    slot["filled"] = True
+    logger.info("inbox filled  token=…%s", token[-6:])
+    return web.json_response({"ok": True})
+
+
+async def inbox_read_handler(request: web.Request) -> web.Response:
+    """GET /inbox/{token}/read — recipient reads and destroys the message (one-time)."""
+    token = request.match_info["token"]
+    slot = _inbox_slots.get(token)
+    if slot is None:
+        raise web.HTTPGone(reason="Inbox not found, expired, or already read")
+    if time.time() > slot["expires_at"]:
+        _inbox_slots.pop(token, None)
+        raise web.HTTPGone(reason="Inbox has expired")
+    if not slot["filled"]:
+        # Slot exists but no message yet — tell the caller to try again
+        return web.json_response({"pending": True}, status=204)
+    message = slot.pop("message")
+    _inbox_slots.pop(token, None)
+    logger.info("inbox read  token=…%s", token[-6:])
+    return web.json_response({"message": message})
+
+
+async def inbox_drop_page_handler(request: web.Request) -> web.Response:
+    """GET /inbox/{token}/drop — serve the sender HTML page."""
+    token = request.match_info["token"]
+    slot = _inbox_slots.get(token)
+    if slot is None or time.time() > slot["expires_at"]:
+        _inbox_slots.pop(token, None)
+        raise web.HTTPGone(reason="Inbox not found or expired")
+    if slot["filled"]:
+        html = (
+            "<!DOCTYPE html><html><head><meta charset='UTF-8'>"
+            "<title>secureChat Inbox</title></head><body>"
+            "<h1>✅ Message already delivered</h1>"
+            "<p>This one-time inbox has already received a message.</p>"
+            "</body></html>"
+        )
+        return web.Response(text=html, content_type="text/html")
+    html = (STATIC_DIR / "inbox.html").read_text(encoding="utf-8")
+    html = html.replace("__INBOX_TOKEN__", token)
+    return web.Response(text=html, content_type="text/html")
+
+
+async def _cleanup_expired_inbox_slots() -> None:
+    """Background task: sweep expired inbox slots every 5 minutes."""
+    while True:
+        await asyncio.sleep(300)
+        now = time.time()
+        expired = [t for t, s in list(_inbox_slots.items()) if now > s["expires_at"]]
+        for t in expired:
+            _inbox_slots.pop(t, None)
+        if expired:
+            logger.info("cleaned up %d expired inbox slot(s)", len(expired))
 
 
 # ---------------------------------------------------------------------------
@@ -1491,13 +1615,14 @@ def build_app(db_path: Path | None = None) -> web.Application:
         await init_db(app["db_path"])
         logger.info("database ready  path=%s", app["db_path"])
         app["_cleanup_share_task"] = asyncio.create_task(_cleanup_expired_share_slots())
+        app["_cleanup_inbox_task"] = asyncio.create_task(_cleanup_expired_inbox_slots())
         app["_cleanup_rooms_task"] = asyncio.create_task(
             _cleanup_expired_rooms(app["db_path"])
         )
         logger.info("admin panel ready  path=/%s/", _ADMIN_PATH)
 
     async def on_cleanup(app: web.Application) -> None:
-        for key in ("_cleanup_share_task", "_cleanup_rooms_task"):
+        for key in ("_cleanup_share_task", "_cleanup_inbox_task", "_cleanup_rooms_task"):
             task = app.get(key)
             if task:
                 task.cancel()
@@ -1517,6 +1642,11 @@ def build_app(db_path: Path | None = None) -> web.Application:
     app.router.add_post("/share/upload", share_upload_handler)
     app.router.add_get("/share/download/{token}", share_download_handler)
     app.router.add_post("/share/download/{token}", share_download_post_handler)
+    # One-time inbox routes
+    app.router.add_post("/inbox/create", inbox_create_handler)
+    app.router.add_get("/inbox/{token}/drop", inbox_drop_page_handler)
+    app.router.add_post("/inbox/{token}/drop", inbox_drop_handler)
+    app.router.add_get("/inbox/{token}/read", inbox_read_handler)
     app.router.add_static("/static", STATIC_DIR, show_index=False)
     # Mount admin panel under the secret 200-char path on the same server
     _register_admin_routes(app)

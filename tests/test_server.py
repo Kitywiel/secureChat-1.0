@@ -1545,3 +1545,106 @@ async def test_log_recent_ring_buffer_populated() -> None:
     assert any(marker in m for m in _s._log_recent), (
         "_log_recent does not contain the emitted log line"
     )
+
+
+# ─── One-time inbox tests ─────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_inbox_create_returns_urls(ws_client) -> None:
+    """POST /inbox/create returns drop_url, read_url, and expires_at."""
+    resp = await ws_client.post("/inbox/create", json={})
+    assert resp.status == 200
+    body = await resp.json()
+    assert "drop_url" in body
+    assert "read_url" in body
+    assert "expires_at" in body
+    assert body["drop_url"].startswith("/inbox/")
+    assert body["drop_url"].endswith("/drop")
+    assert body["read_url"].endswith("/read")
+
+
+@pytest.mark.asyncio
+async def test_inbox_drop_and_read_once(ws_client) -> None:
+    """Full happy-path: create → drop message → read once → gone."""
+    # Create
+    resp = await ws_client.post("/inbox/create", json={})
+    body = await resp.json()
+    drop_url = body["drop_url"]
+    read_url = body["read_url"]
+
+    # Drop a message
+    drop_resp = await ws_client.post(drop_url, json={"message": "S3cr3tC0de!"})
+    assert drop_resp.status == 200
+    assert (await drop_resp.json())["ok"] is True
+
+    # Read once
+    read_resp = await ws_client.get(read_url)
+    assert read_resp.status == 200
+    read_body = await read_resp.json()
+    assert read_body["message"] == "S3cr3tC0de!"
+
+    # Second read must be gone (410)
+    gone_resp = await ws_client.get(read_url)
+    assert gone_resp.status == 410
+
+
+@pytest.mark.asyncio
+async def test_inbox_drop_page_served(ws_client) -> None:
+    """GET /inbox/{token}/drop returns the sender HTML page."""
+    resp = await ws_client.post("/inbox/create", json={})
+    drop_url = (await resp.json())["drop_url"]
+    page_resp = await ws_client.get(drop_url)
+    assert page_resp.status == 200
+    ct = page_resp.headers.get("Content-Type", "")
+    assert "text/html" in ct
+    text = await page_resp.text()
+    assert "One-Time Inbox" in text
+
+
+@pytest.mark.asyncio
+async def test_inbox_double_drop_returns_409(ws_client) -> None:
+    """A second POST to /drop on a filled inbox returns 409 Conflict."""
+    resp = await ws_client.post("/inbox/create", json={})
+    drop_url = (await resp.json())["drop_url"]
+
+    await ws_client.post(drop_url, json={"message": "first"})
+    second = await ws_client.post(drop_url, json={"message": "second"})
+    assert second.status == 409
+
+
+@pytest.mark.asyncio
+async def test_inbox_read_before_drop_returns_204(ws_client) -> None:
+    """GET /read on an empty (unfilled) inbox returns 204 (pending)."""
+    resp = await ws_client.post("/inbox/create", json={})
+    read_url = (await resp.json())["read_url"]
+    read_resp = await ws_client.get(read_url)
+    assert read_resp.status == 204
+
+
+@pytest.mark.asyncio
+async def test_inbox_empty_message_returns_400(ws_client) -> None:
+    """POST /drop with an empty message string returns 400."""
+    resp = await ws_client.post("/inbox/create", json={})
+    drop_url = (await resp.json())["drop_url"]
+    bad = await ws_client.post(drop_url, json={"message": "   "})
+    assert bad.status == 400
+
+
+@pytest.mark.asyncio
+async def test_inbox_unknown_token_returns_404(ws_client) -> None:
+    """POST /inbox/<bogus>/drop on an unknown token returns 404."""
+    resp = await ws_client.post("/inbox/not-a-real-token/drop",
+                                json={"message": "hi"})
+    assert resp.status == 404
+
+
+@pytest.mark.asyncio
+async def test_inbox_expired_drop_returns_410(ws_client) -> None:
+    """POSTing to a manually expired inbox returns 410."""
+    import server as _s
+    resp = await ws_client.post("/inbox/create", json={"ttl": 3600})
+    token = (await resp.json())["drop_url"].split("/")[2]
+    # Force expiry
+    _s._inbox_slots[token]["expires_at"] = 0.0
+    gone = await ws_client.post(f"/inbox/{token}/drop", json={"message": "hi"})
+    assert gone.status == 410
