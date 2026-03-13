@@ -362,10 +362,18 @@ def _join_mesh_peer(
     onion: str | None,
     server_port: int,
 ) -> None:
-    """POST to the remote server's /mesh/peer/connect to register as a peer."""
-    import socket as _socket  # noqa: PLC0415
-    import urllib.request as _urllib_request  # noqa: PLC0415
+    """POST to the remote server's /mesh/peer/connect to register as a peer.
+
+    When the target URL is a .onion address the request is routed through the
+    local Tor SOCKS5 proxy at 127.0.0.1:9050 so hidden-service peers can be
+    reached.  Up to 3 attempts are made with a short delay between each so
+    that a freshly-started Tor circuit has time to become usable.
+
+    For plain (non-onion) URLs the legacy urllib path is used so that there is
+    no hard dependency on aiohttp / aiohttp-socks in non-Tor deployments.
+    """
     import json as _json  # noqa: PLC0415
+    import time as _time  # noqa: PLC0415
 
     if not remote_token:
         print("\n  ⚠️  --mesh-join requires --mesh-token <MESH_TOKEN of the remote server>")
@@ -379,22 +387,62 @@ def _join_mesh_peer(
         "peer_token": local_token,
     }).encode()
 
+    is_onion = ".onion" in connect_url.lower()
+    max_attempts = 3
+    attempt_delay = 2.0  # seconds between retries
+
     print(f"\n  Joining mesh peer at {connect_url} …")
-    try:
-        req = _urllib_request.Request(
-            connect_url,
-            data=payload,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with _urllib_request.urlopen(req, timeout=10) as resp:
-            data = _json.loads(resp.read())
+    if is_onion:
+        print("  (routing through Tor SOCKS5 — may take a few seconds)")
+
+    last_exc: Exception | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            if is_onion:
+                # Use aiohttp + aiohttp-socks so the request goes through Tor.
+                import asyncio as _asyncio  # noqa: PLC0415
+                import aiohttp as _aiohttp  # noqa: PLC0415
+                from aiohttp_socks import ProxyConnector as _ProxyConnector  # noqa: PLC0415
+
+                async def _post_via_tor() -> dict:
+                    connector = _ProxyConnector.from_url("socks5://127.0.0.1:9050")
+                    timeout = _aiohttp.ClientTimeout(total=30.0)
+                    async with _aiohttp.ClientSession(
+                        connector=connector, timeout=timeout
+                    ) as sess:
+                        async with sess.post(
+                            connect_url,
+                            data=payload,
+                            headers={"Content-Type": "application/json"},
+                        ) as resp:
+                            return await resp.json()
+
+                data = _asyncio.run(_post_via_tor())
+            else:
+                import urllib.request as _urllib_request  # noqa: PLC0415
+
+                req = _urllib_request.Request(
+                    connect_url,
+                    data=payload,
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with _urllib_request.urlopen(req, timeout=15) as resp:
+                    data = _json.loads(resp.read())
+
             if data.get("ok"):
                 print(f"  ✅  Mesh peer connected  (peer_id: …{data.get('peer_id', '')[-6:]})")
             else:
                 print(f"  ⚠️  Mesh join response: {data}")
-    except Exception as exc:  # noqa: BLE001
-        print(f"  ⚠️  Mesh join failed: {exc}")
+            return  # success — stop retrying
+
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            if attempt < max_attempts:
+                print(f"  ↻  Attempt {attempt}/{max_attempts} failed: {exc}  — retrying in {attempt_delay:.0f}s …")
+                _time.sleep(attempt_delay)
+
+    print(f"  ⚠️  Mesh join failed after {max_attempts} attempts: {last_exc}")
 
 
 # ---------------------------------------------------------------------------

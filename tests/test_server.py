@@ -2638,3 +2638,122 @@ def test_proxy_health_dict_exists() -> None:
     import server as _s
     assert isinstance(_s._proxy_health, dict)
     assert callable(_s._proxy_watchdog_task)
+
+
+# ---------------------------------------------------------------------------
+# run.py _join_mesh_peer — onion routing tests
+# ---------------------------------------------------------------------------
+
+def test_join_mesh_peer_onion_uses_tor(capsys) -> None:
+    """_join_mesh_peer routes .onion URLs through Tor SOCKS5 via aiohttp."""
+    import sys, os
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    import run as _run
+    from unittest.mock import patch, AsyncMock, MagicMock
+    import asyncio as _asyncio
+
+    mock_resp_data = {"ok": True, "peer_id": "abc123XYZ"}
+
+    async def _fake_post_via_tor():
+        return mock_resp_data
+
+    calls: list[str] = []
+
+    # Capture the inner async function that _join_mesh_peer builds and runs
+    original_run = _asyncio.run
+
+    def _fake_asyncio_run(coro, **kwargs):
+        calls.append("asyncio.run")
+        # Actually execute the coroutine so we test real code paths
+        loop = _asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(coro)
+        finally:
+            loop.close()
+
+    # Mock aiohttp and ProxyConnector
+    mock_sess = MagicMock()
+    mock_resp = AsyncMock()
+    mock_resp.json = AsyncMock(return_value=mock_resp_data)
+    mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+    mock_resp.__aexit__ = AsyncMock(return_value=False)
+    mock_sess.post = MagicMock(return_value=mock_resp)
+    mock_sess.__aenter__ = AsyncMock(return_value=mock_sess)
+    mock_sess.__aexit__ = AsyncMock(return_value=False)
+
+    import aiohttp as _aiohttp
+    import aiohttp_socks as _aiohttp_socks
+
+    with patch.object(_aiohttp, "ClientSession", return_value=mock_sess), \
+         patch.object(_aiohttp_socks.ProxyConnector, "from_url", return_value=MagicMock()), \
+         patch.object(_run, "_lan_ip", return_value="1.2.3.4"), \
+         patch("asyncio.run", side_effect=_fake_asyncio_run):
+        _run._join_mesh_peer(
+            connect_url="http://sometest1234.onion/mesh/peer/connect",
+            remote_token="REMOTE_TOKEN",
+            local_token="LOCAL_TOKEN",
+            onion=None,
+            server_port=5000,
+        )
+
+    captured = capsys.readouterr()
+    assert "Joining mesh peer" in captured.out
+    assert "Tor SOCKS5" in captured.out
+
+
+def test_join_mesh_peer_non_onion_uses_urllib(capsys) -> None:
+    """_join_mesh_peer uses urllib for non-onion URLs (existing behaviour)."""
+    import sys, os
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    import run as _run
+    from unittest.mock import patch, MagicMock
+    import io
+
+    fake_response = MagicMock()
+    fake_response.read.return_value = b'{"ok": true, "peer_id": "xyz999"}'
+    fake_response.__enter__ = lambda s: s
+    fake_response.__exit__ = MagicMock(return_value=False)
+
+    with patch("urllib.request.urlopen", return_value=fake_response), \
+         patch.object(_run, "_lan_ip", return_value="10.0.0.1"):
+        _run._join_mesh_peer(
+            connect_url="http://10.0.0.2:5000/mesh/peer/connect",
+            remote_token="REMOTE_TOKEN",
+            local_token="LOCAL_TOKEN",
+            onion=None,
+            server_port=5000,
+        )
+
+    captured = capsys.readouterr()
+    assert "✅" in captured.out
+    assert "Tor SOCKS5" not in captured.out
+
+
+def test_join_mesh_peer_retries_on_failure(capsys) -> None:
+    """_join_mesh_peer retries up to 3 times before giving up."""
+    import sys, os
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    import run as _run
+    from unittest.mock import patch
+
+    call_count = 0
+
+    def _always_fail(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        raise ConnectionRefusedError("connection refused")
+
+    with patch("urllib.request.urlopen", side_effect=_always_fail), \
+         patch.object(_run, "_lan_ip", return_value="10.0.0.1"), \
+         patch("time.sleep"):  # skip real sleeps
+        _run._join_mesh_peer(
+            connect_url="http://10.0.0.2:5000/mesh/peer/connect",
+            remote_token="REMOTE_TOKEN",
+            local_token="LOCAL_TOKEN",
+            onion=None,
+            server_port=5000,
+        )
+
+    assert call_count == 3  # exactly 3 attempts
+    captured = capsys.readouterr()
+    assert "failed after 3 attempts" in captured.out
