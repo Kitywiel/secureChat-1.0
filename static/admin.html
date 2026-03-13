@@ -55,6 +55,24 @@ section h2{font-size:1rem;font-weight:700;margin-bottom:.75rem;padding-bottom:.4
                         border-radius:8px;color:var(--text);font-size:.82rem;cursor:pointer;
                         white-space:nowrap}
 .webhook-url-row button:hover{border-color:var(--accent);color:var(--accent)}
+/* ── System resource cards ── */
+.res-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:1rem;
+          padding:0 1.5rem 1.5rem}
+.res-card{background:var(--surface);border:1px solid var(--border);border-radius:10px;
+          padding:1.1rem 1.4rem}
+.res-card h3{font-size:.78rem;color:var(--dim);font-weight:600;text-transform:uppercase;
+             letter-spacing:.06em;margin-bottom:.6rem}
+.res-row{display:flex;justify-content:space-between;align-items:baseline;
+         font-size:.82rem;margin-bottom:.35rem}
+.res-row .res-label{color:var(--dim)}
+.res-row .res-val{font-weight:700;color:var(--accent)}
+.res-bar-wrap{background:#111;border-radius:999px;height:8px;overflow:hidden;margin-bottom:.5rem}
+.res-bar{height:100%;border-radius:999px;background:var(--accent);
+         transition:width .4s ease,background .4s ease}
+.res-bar.warn{background:#ffb347}
+.res-bar.crit{background:var(--red)}
+.res-sub{font-size:.72rem;color:var(--dim)}
+.res-na{font-size:.82rem;color:#444;padding:.5rem 0}
 </style>
 </head>
 <body>
@@ -104,6 +122,47 @@ function renderLogin(errMsg=''){
   });
 }
 
+/** Render a single resource bar card and return its HTML string. */
+function resCard(icon, title, pct, valLabel, subLabel){
+  const cls = pct>=90?'crit':pct>=75?'warn':'';
+  return `<div class="res-card">
+    <h3>${icon} ${title}</h3>
+    <div class="res-row"><span class="res-label">Usage</span><span class="res-val">${pct.toFixed(1)}%</span></div>
+    <div class="res-bar-wrap"><div class="res-bar ${cls}" style="width:${Math.min(pct,100)}%"></div></div>
+    ${valLabel?`<div class="res-sub">${valLabel}</div>`:''}
+    ${subLabel?`<div class="res-sub">${subLabel}</div>`:''}
+  </div>`;
+}
+
+/** Build the HTML for the System Resources section from a stats object. */
+function renderSysResources(s){
+  if(s.sys_cpu_percent===undefined&&s.sys_ram_percent===undefined&&!s.sys_gpus){
+    return '<p class="res-na">System metrics unavailable (psutil not installed).</p>';
+  }
+  let html='<div class="res-grid">';
+  if(s.sys_cpu_percent!==undefined){
+    html+=resCard('🖥️','CPU',s.sys_cpu_percent,'','');
+  }
+  if(s.sys_ram_percent!==undefined){
+    html+=resCard('🧠','RAM',s.sys_ram_percent,
+      `${fmtBytes(s.sys_ram_used)} / ${fmtBytes(s.sys_ram_total)}`,'');
+  }
+  if(s.sys_disk_percent!==undefined){
+    html+=resCard('💾','Disk',s.sys_disk_percent,
+      `${fmtBytes(s.sys_disk_used)} / ${fmtBytes(s.sys_disk_total)}`,'');
+  }
+  if(s.sys_gpus&&s.sys_gpus.length){
+    s.sys_gpus.forEach((g,i)=>{
+      const lbl=s.sys_gpus.length>1?`GPU ${i}: ${g.name}`:g.name;
+      const sub=g.temp_c!=null?`Temp: ${g.temp_c}°C`:'';
+      html+=resCard('⚡',lbl,g.load_percent,
+        `VRAM: ${fmtBytes(g.mem_used)} / ${fmtBytes(g.mem_total)} (${g.mem_percent}%)`,sub);
+    });
+  }
+  html+='</div>';
+  return html;
+}
+
 async function renderDashboard(){
   const stats=await fetchStats();
   if(!stats){renderLogin('Session expired.');return;}
@@ -137,6 +196,10 @@ async function renderDashboard(){
       <div class="card"><h2>Chat Files Shared</h2>
         <div class="val">${stats.chat_files_shared}</div></div>
     </div>
+    <section>
+      <h2>System Resources</h2>
+    </section>
+    <div id="sys-res-area">${renderSysResources(stats)}</div>
     <section>
       <h2>Chats by Self-Destruct Timer</h2>
       <div id="timer-breakdown">${renderTimerBreakdown(stats.rooms_by_destruct)}</div>
@@ -185,7 +248,7 @@ async function renderDashboard(){
 
   startLogStream();
 
-  // Refresh stats every 10 s
+  // Refresh stats every 5s (system metrics need faster refresh for live monitoring)
   setInterval(async()=>{
     const s=await fetchStats();
     if(!s)return;
@@ -201,8 +264,10 @@ async function renderDashboard(){
         <div class="sub">${fmtBytes(s.files_downloaded_bytes)}</div></div>
       <div class="card"><h2>Chat Files Shared</h2><div class="val">${s.chat_files_shared}</div></div>
     </div>`;
+    const sysArea=document.getElementById('sys-res-area');
+    if(sysArea)sysArea.innerHTML=renderSysResources(s);
     document.getElementById('timer-breakdown').innerHTML=renderTimerBreakdown(s.rooms_by_destruct);
-  },10000);
+  },5000);
 }
 
 function renderTimerBreakdown(obj){

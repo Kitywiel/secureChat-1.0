@@ -51,6 +51,24 @@ import qrcode.constants
 from qrcode.image.svg import SvgImage as _QrSvgImage
 from aiohttp import web, WSMsgType
 
+try:
+    import psutil as _psutil  # type: ignore[import-untyped]
+    _PSUTIL_AVAILABLE = True
+    # Prime the CPU percent sampler so that subsequent interval=None calls
+    # immediately return meaningful (non-zero) usage rather than 0.0.
+    _psutil.cpu_percent(interval=None)
+except ImportError:  # pragma: no cover
+    _psutil = None  # type: ignore[assignment]
+    _PSUTIL_AVAILABLE = False
+
+try:
+    import pynvml as _pynvml  # type: ignore[import-untyped]
+    _pynvml.nvmlInit()
+    _NVML_AVAILABLE = True
+except Exception:  # pragma: no cover  # noqa: BLE001
+    _pynvml = None  # type: ignore[assignment]
+    _NVML_AVAILABLE = False
+
 # ---------------------------------------------------------------------------
 # Python version guard — asyncio.to_thread requires 3.9+
 # ---------------------------------------------------------------------------
@@ -1139,6 +1157,61 @@ async def _admin_index_handler(request: web.Request) -> web.Response:
     return resp
 
 
+def _get_sys_metrics() -> dict:
+    """Return CPU, RAM, disk, and (if available) GPU metrics as a dict.
+
+    All values that cannot be collected are omitted from the returned dict so
+    the caller can check their presence before rendering them.
+    """
+    metrics: dict = {}
+
+    if _PSUTIL_AVAILABLE:
+        try:
+            metrics["sys_cpu_percent"] = _psutil.cpu_percent(interval=None)
+            vm = _psutil.virtual_memory()
+            metrics["sys_ram_percent"]  = vm.percent
+            metrics["sys_ram_total"]    = vm.total
+            metrics["sys_ram_used"]     = vm.used
+            du = _psutil.disk_usage("/")
+            metrics["sys_disk_percent"] = du.percent
+            metrics["sys_disk_total"]   = du.total
+            metrics["sys_disk_used"]    = du.used
+        except Exception:  # pragma: no cover  # noqa: BLE001
+            pass
+
+    if _NVML_AVAILABLE:
+        gpus = []
+        try:
+            count = _pynvml.nvmlDeviceGetCount()
+            for i in range(count):
+                handle = _pynvml.nvmlDeviceGetHandleByIndex(i)
+                name   = _pynvml.nvmlDeviceGetName(handle)
+                if isinstance(name, bytes):
+                    name = name.decode()
+                util   = _pynvml.nvmlDeviceGetUtilizationRates(handle)
+                mem    = _pynvml.nvmlDeviceGetMemoryInfo(handle)
+                try:
+                    temp = _pynvml.nvmlDeviceGetTemperature(
+                        handle, _pynvml.NVML_TEMPERATURE_GPU
+                    )
+                except Exception:  # noqa: BLE001
+                    temp = None
+                gpus.append({
+                    "name":         name,
+                    "load_percent": util.gpu,
+                    "mem_total":    mem.total,
+                    "mem_used":     mem.used,
+                    "mem_percent":  round(mem.used / mem.total * 100, 1) if mem.total else 0,
+                    "temp_c":       temp,
+                })
+        except Exception:  # pragma: no cover  # noqa: BLE001
+            pass
+        if gpus:
+            metrics["sys_gpus"] = gpus
+
+    return metrics
+
+
 async def _admin_stats_handler(request: web.Request) -> web.Response:
     """GET /{path}/api/stats — return current server stats as JSON."""
     if not _valid_admin_session(request):
@@ -1178,6 +1251,7 @@ async def _admin_stats_handler(request: web.Request) -> web.Response:
         "invite_rooms": len(meta_rooms),
         "open_file_transfers": len(_share_slots),
         "rooms_by_destruct": by_destruct,
+        **_get_sys_metrics(),
     })
     _add_admin_security_headers(resp)
     return resp

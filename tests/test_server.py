@@ -1240,6 +1240,13 @@ async def test_admin_stats_with_auth(admin_client) -> None:
     assert "open_rooms" in body
     assert "rooms_created_total" in body
     assert "rooms_by_destruct" in body
+    # System resource metrics should be present when psutil is installed
+    assert "sys_cpu_percent" in body, "sys_cpu_percent missing — is psutil installed?"
+    assert "sys_ram_percent" in body
+    assert "sys_disk_percent" in body
+    assert isinstance(body["sys_cpu_percent"], (int, float))
+    assert 0 <= body["sys_ram_percent"] <= 100
+    assert 0 <= body["sys_disk_percent"] <= 100
 
 
 @pytest.mark.asyncio
