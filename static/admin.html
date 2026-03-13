@@ -27,9 +27,17 @@ section h2{font-size:1rem;font-weight:700;margin-bottom:.75rem;padding-bottom:.4
 #log-box{background:#000;border:1px solid var(--border);border-radius:8px;height:320px;
          overflow-y:auto;padding:.75rem;font-family:monospace;font-size:.78rem;
          color:#aaa;white-space:pre-wrap;word-break:break-all}
-.log-line.err{color:var(--red)}
-.log-line.warn{color:#ffb347}
-.log-line.info{color:#aaa}
+.log-line.err     {color:var(--red)}
+.log-line.warn    {color:#ffb347}
+.log-line.info    {color:#aaa}
+/* Semantic colours — mirror _ColourFormatter in server.py */
+.log-line.created {color:#00c896}
+.log-line.joined  {color:#f5c518}
+.log-line.deleted {color:var(--red)}
+.log-line.dl      {color:#c084fc}
+.log-line.ul      {color:#ff9de2}
+.log-line.inactive{color:#60a5fa}
+.log-line.chatfile{color:#22d3ee}
 #shutdown-btn{padding:.6rem 1.4rem;background:var(--red);border:none;border-radius:8px;
               color:#fff;font-size:.95rem;font-weight:700;cursor:pointer;margin-top:1rem;
               font-family:var(--font)}
@@ -285,8 +293,7 @@ function startLogStream(){
   es.addEventListener('log',e=>{
     const line=document.createElement('div');
     const t=e.data||'';
-    line.className='log-line '+(t.includes('ERROR')||t.includes('WARNING')?'err':
-                                t.includes('WARN')?'warn':'info');
+    line.className='log-line '+_logClass(t);
     line.textContent=t;
     box.appendChild(line);
     box.scrollTop=box.scrollHeight;
@@ -294,6 +301,29 @@ function startLogStream(){
     while(box.children.length>500)box.removeChild(box.firstChild);
   });
   es.onerror=()=>{es.close();setTimeout(startLogStream,3000);};
+}
+
+/**
+ * Classify a log line into a CSS colour class.
+ * Mirrors the keyword logic in _ColourFormatter (server.py) so the admin
+ * panel uses the same semantic colour scheme as the terminal output.
+ */
+function _logClass(t){
+  const s=t.toLowerCase();
+  // Level overrides first
+  if(s.includes('error')||s.includes('warning'))return 'err';
+  if(s.includes('warn'))return 'warn';
+  // Semantic keywords (same sets as _ColourFormatter._DELETION, etc.)
+  if(s.includes('room deleted')||s.includes('room self-destructed')||
+     s.includes('cleaned up')||s.includes('expired'))return 'deleted';
+  if(s.includes('share download'))return 'dl';
+  if(s.includes('share upload'))return 'ul';
+  if(s.includes('room created')||s.includes('database ready')||
+     s.includes('securechat starting'))return 'created';
+  if(s.includes('peer joined'))return 'joined';
+  if(s.includes('room inactive'))return 'inactive';
+  if(s.includes('chat file share'))return 'chatfile';
+  return 'info';
 }
 
 // Bootstrap — attach submit handler to the pre-rendered login form, then check session
