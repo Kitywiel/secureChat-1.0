@@ -368,11 +368,9 @@
     // Render body safely
     const bodyEl = card.querySelector('.msg-body');
     if (m.content_type === 'text/html') {
-      // Sandboxed iframe — no scripts, no same-origin, safe for untrusted HTML
-      const blob = new Blob([m.body], { type: 'text/html' });
-      const blobUrl = URL.createObjectURL(blob);
+      // Use srcdoc instead of a blob: URL so Tor Browser can render HTML emails.
       const iframe = document.createElement('iframe');
-      iframe.src = blobUrl;
+      iframe.srcdoc = m.body;
       // sandbox="" is maximally restrictive: no scripts, no same-origin, no forms
       iframe.setAttribute('sandbox', '');
       iframe.style.cssText = 'width:100%;min-height:220px;border:none;background:#fff;border-radius:4px';

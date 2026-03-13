@@ -306,6 +306,8 @@ _share_slots: dict[str, dict] = {}
 # }
 # Inboxes accept unlimited messages and allow unlimited reads until the TTL expires.
 _inbox_slots: dict[str, dict] = {}
+# Tracks which inbox tokens have already emitted their first-read log line.
+_inbox_logged_tokens: set[str] = set()
 
 # Lockdown state — set True by admin panel; cleared by admin panel deactivate.
 # While active, all non-admin HTTP/WS requests are redirected to the lockdown page.
@@ -1412,7 +1414,9 @@ async def inbox_read_handler(request: web.Request) -> web.Response:
     if time.time() > slot["expires_at"]:
         _inbox_slots.pop(token, None)
         raise web.HTTPGone(reason="Inbox has expired")
-    logger.info("inbox read  token=…%s  count=%d", token[-6:], len(slot["messages"]))
+    if token not in _inbox_logged_tokens:
+        _inbox_logged_tokens.add(token)
+        logger.info("inbox read  token=…%s  count=%d", token[-6:], len(slot["messages"]))
     return web.json_response({
         "messages":   slot["messages"],
         "expires_at": slot["expires_at"],
@@ -1601,6 +1605,7 @@ async def _cleanup_expired_inbox_slots() -> None:
         expired = [t for t, s in list(_inbox_slots.items()) if now > s["expires_at"]]
         for t in expired:
             _inbox_slots.pop(t, None)
+            _inbox_logged_tokens.discard(t)
         if expired:
             logger.info("cleaned up %d expired inbox slot(s)", len(expired))
 
@@ -2202,6 +2207,7 @@ async def _admin_lockdown_handler(request: web.Request) -> web.Response:
 
         # 3. Wipe in-memory data stores
         _inbox_slots.clear()
+        _inbox_logged_tokens.clear()
         _share_slots.clear()
         _room_meta.clear()
 

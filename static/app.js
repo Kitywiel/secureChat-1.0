@@ -1676,12 +1676,15 @@ function renderInboxPreview(previewEl, messages) {
     const ts      = m.received_at ? `<div style="font-size:.72rem;color:#444">${new Date(m.received_at * 1000).toLocaleString()}</div>` : '';
 
     if (m.content_type === 'text/html') {
-      const blob = new Blob([m.body], { type: 'text/html' });
-      const blobUrl = URL.createObjectURL(blob);
+      // Use srcdoc instead of a blob: URL so Tor Browser can render HTML emails.
+      wrap.innerHTML = `${from}${subject}${ts}`;
+      const iframe = document.createElement('iframe');
+      iframe.srcdoc = m.body;
       // sandbox="" is maximally restrictive: no scripts, no same-origin, no forms
-      wrap.innerHTML = `${from}${subject}${ts}<iframe src="${blobUrl}" sandbox=""
-        style="width:100%;min-height:160px;border:none;background:#fff;border-radius:4px;margin-top:.4rem"
-        title="Email body"></iframe>`;
+      iframe.setAttribute('sandbox', '');
+      iframe.style.cssText = 'width:100%;min-height:160px;border:none;background:#fff;border-radius:4px;margin-top:.4rem';
+      iframe.title = 'Email body';
+      wrap.appendChild(iframe);
     } else {
       const pre = document.createElement('pre');
       pre.style.cssText = 'white-space:pre-wrap;word-break:break-word;font-size:.85rem;color:#ccc;margin-top:.35rem;max-height:200px;overflow-y:auto';
