@@ -21,11 +21,49 @@
       border: 1px solid #2e2e2e;
       border-radius: 12px;
       padding: 2rem;
-      max-width: 520px;
+      max-width: 540px;
       width: 100%;
     }
-    h1 { font-size: 1.4rem; margin-bottom: .5rem; }
-    p  { color: #888; font-size: .9rem; margin-bottom: 1.5rem; line-height: 1.5; }
+    h1 { font-size: 1.4rem; margin-bottom: .4rem; }
+    .subtitle { color: #888; font-size: .88rem; margin-bottom: 1.2rem; line-height: 1.5; }
+    .address-box {
+      background: #111;
+      border: 1px solid #333;
+      border-radius: 8px;
+      padding: .6rem .75rem;
+      display: flex;
+      align-items: center;
+      gap: .5rem;
+      margin-bottom: 1rem;
+    }
+    .address-box code {
+      flex: 1;
+      font-family: monospace;
+      font-size: .9rem;
+      color: #80d4ff;
+      word-break: break-all;
+    }
+    .copy-btn {
+      flex-shrink: 0;
+      background: #2a4a6a;
+      color: #80d4ff;
+      border: none;
+      border-radius: 6px;
+      padding: .3rem .7rem;
+      cursor: pointer;
+      font-size: .8rem;
+      margin-top: 0;
+      width: auto;
+      font-weight: 600;
+    }
+    .copy-btn:hover { background: #3a5a7a; }
+    .timer {
+      font-size: .82rem;
+      color: #888;
+      margin-bottom: 1.2rem;
+    }
+    .timer span { color: #e0c060; font-weight: 600; }
+    .timer.urgent span { color: #e06060; }
     textarea {
       width: 100%;
       min-height: 120px;
@@ -52,21 +90,29 @@
       font-weight: 600;
     }
     button:disabled { background: #2a5a99; cursor: not-allowed; }
+    .char-count { text-align: right; font-size: .75rem; color: #555; margin-top: .25rem; }
+    .char-count.warn { color: #cf9f2f; }
     .status { margin-top: 1rem; padding: .75rem; border-radius: 8px; font-size: .9rem; display: none; }
     .status.ok  { background: #1a3a1a; border: 1px solid #2d6a2d; color: #6fcf6f; display: block; }
     .status.err { background: #3a1a1a; border: 1px solid #6a2d2d; color: #cf6f6f; display: block; }
-    .char-count { text-align: right; font-size: .75rem; color: #555; margin-top: .25rem; }
-    .char-count.warn { color: #cf9f2f; }
   </style>
 </head>
 <body>
 <div class="card">
   <h1>📬 One-Time Inbox</h1>
-  <p>
-    Send a single message to the recipient. Once sent, this inbox cannot
-    receive another message. The recipient can only read it once — after that
-    the message is permanently deleted.
+  <p class="subtitle">
+    Send a single message to this inbox. Once sent, no further messages can be
+    deposited. The recipient reads it once — then it is permanently deleted.
   </p>
+
+  <p style="font-size:.82rem;color:#888;margin-bottom:.4rem">Inbox address</p>
+  <div class="address-box">
+    <code id="addr">__INBOX_ADDRESS__</code>
+    <button type="button" class="copy-btn" id="copy-addr-btn">Copy</button>
+  </div>
+
+  <p class="timer" id="timer">Expires in <span id="countdown">–</span></p>
+
   <textarea id="msg" placeholder="Type your message or one-time code here…" maxlength="4096"></textarea>
   <div class="char-count"><span id="cc">0</span> / 4096</div>
   <button id="send-btn">Send Message →</button>
@@ -74,23 +120,57 @@
 </div>
 
 <script>
-  const TOKEN = '__INBOX_TOKEN__';
-  const MAX   = 4096;
+  const TOKEN      = '__INBOX_TOKEN__';
+  const EXPIRES_AT = __INBOX_EXPIRES_AT__;   // injected unix timestamp (float)
+  const MAX        = 4096;
 
-  const msgEl    = document.getElementById('msg');
-  const ccEl     = document.getElementById('cc');
-  const btn      = document.getElementById('send-btn');
-  const statusEl = document.getElementById('status');
-
-  msgEl.addEventListener('input', () => {
-    const n = msgEl.value.length;
-    ccEl.textContent = n;
-    ccEl.parentElement.className = 'char-count' + (n > MAX * 0.9 ? ' warn' : '');
+  /* ── Address copy ── */
+  document.getElementById('copy-addr-btn').addEventListener('click', () => {
+    const addr = document.getElementById('addr').textContent;
+    navigator.clipboard.writeText(addr).then(() => {
+      const b = document.getElementById('copy-addr-btn');
+      b.textContent = 'Copied!';
+      setTimeout(() => { b.textContent = 'Copy'; }, 2000);
+    }).catch(() => {
+      const r = document.createRange();
+      r.selectNodeContents(document.getElementById('addr'));
+      const s = window.getSelection();
+      if (s) { s.removeAllRanges(); s.addRange(r); }
+    });
   });
 
-  btn.addEventListener('click', async () => {
+  /* ── Countdown timer ── */
+  function updateCountdown() {
+    const secs = Math.max(0, Math.round(EXPIRES_AT - Date.now() / 1000));
+    const m = Math.floor(secs / 60);
+    const s = secs % 60;
+    const el = document.getElementById('countdown');
+    const timerEl = document.getElementById('timer');
+    el.textContent = m > 0 ? `${m}m ${s}s` : `${s}s`;
+    timerEl.className = 'timer' + (secs < 60 ? ' urgent' : '');
+    if (secs === 0) {
+      el.textContent = 'expired';
+      document.getElementById('send-btn').disabled = true;
+      showStatus('err', '⏰ This inbox has expired.');
+    }
+  }
+  updateCountdown();
+  const _tick = setInterval(updateCountdown, 1000);
+
+  /* ── Char counter ── */
+  const msgEl = document.getElementById('msg');
+  msgEl.addEventListener('input', () => {
+    const n = msgEl.value.length;
+    document.getElementById('cc').textContent = n;
+    document.querySelector('.char-count').className =
+      'char-count' + (n > MAX * 0.9 ? ' warn' : '');
+  });
+
+  /* ── Send ── */
+  document.getElementById('send-btn').addEventListener('click', async () => {
     const message = msgEl.value.trim();
     if (!message) { showStatus('err', 'Please enter a message before sending.'); return; }
+    const btn = document.getElementById('send-btn');
     btn.disabled = true;
     btn.textContent = 'Sending…';
     try {
@@ -100,17 +180,16 @@
         body: JSON.stringify({ message }),
       });
       if (resp.ok) {
+        clearInterval(_tick);
         showStatus('ok', '✅ Message delivered! The recipient can now read it once.');
         msgEl.disabled = true;
         btn.textContent = 'Message sent';
       } else {
         const text = await resp.text().catch(() => resp.statusText);
-        if (resp.status === 409) {
-          showStatus('err', '⚠️ This inbox has already received a message.');
-        } else if (resp.status === 410) {
-          showStatus('err', '⏰ This inbox has expired.');
-        } else {
-          showStatus('err', `Error: ${text || resp.statusText}`);
+        if (resp.status === 409) showStatus('err', '⚠️ This inbox already has a message.');
+        else if (resp.status === 410) showStatus('err', '⏰ This inbox has expired.');
+        else showStatus('err', `Error: ${text || resp.statusText}`);
+        if (resp.status !== 409 && resp.status !== 410) {
           btn.disabled = false;
           btn.textContent = 'Send Message →';
         }
@@ -123,8 +202,9 @@
   });
 
   function showStatus(type, msg) {
-    statusEl.className = 'status ' + type;
-    statusEl.textContent = msg;
+    const el = document.getElementById('status');
+    el.className = 'status ' + type;
+    el.textContent = msg;
   }
 </script>
 </body>

@@ -183,10 +183,11 @@ MAX_FILENAME_LEN = 200                       # characters in the sanitised filen
 _SHARE_TOKEN_BYTES = 32                      # 256-bit token → 43-char URL-safe base64
 
 # One-time inbox constants
-_INBOX_TOKEN_BYTES = 32                      # 256-bit token
+_INBOX_TOKEN_BYTES = 16                      # 128-bit token → ~22-char URL-safe base64 local part
 MAX_INBOX_MESSAGE_LEN = 4096                 # max characters for an inbox message
-INBOX_DEFAULT_TTL = 3600 * 24               # 24 hours default TTL
-INBOX_MAX_TTL     = 3600 * 24 * 7          # 7 days maximum TTL
+INBOX_MIN_TTL_MINUTES = 1                    # minimum lifetime in minutes
+INBOX_MAX_TTL_MINUTES = 60                   # maximum lifetime in minutes
+INBOX_DEFAULT_TTL_MINUTES = 10              # default lifetime in minutes
 
 # Room-create / passcode constants
 MAX_PASSCODE_LEN = 64                  # characters in a room or share passcode
@@ -894,20 +895,39 @@ async def _cleanup_expired_share_slots() -> None:
 # ---------------------------------------------------------------------------
 
 async def inbox_create_handler(request: web.Request) -> web.Response:
-    """POST /inbox/create — allocate a fresh one-time inbox slot."""
+    """POST /inbox/create — allocate a fresh one-time inbox slot.
+
+    Accepts optional JSON body::
+
+        {"ttl_minutes": 10}   # 1–60, default 10
+
+    Returns::
+
+        {
+          "address":   "abc123@host",       # email-like identifier to share
+          "drop_url":  "/inbox/<token>/drop",
+          "read_url":  "/inbox/<token>/read",
+          "expires_at": <unix-timestamp>,
+        }
+    """
     try:
         body = await request.json()
     except Exception:
         body = {}
-    ttl = min(int(body.get("ttl", INBOX_DEFAULT_TTL)), INBOX_MAX_TTL)
-    ttl = max(ttl, 60)   # at least 1 minute
+    ttl_minutes = int(body.get("ttl_minutes", INBOX_DEFAULT_TTL_MINUTES))
+    ttl_minutes = max(INBOX_MIN_TTL_MINUTES, min(ttl_minutes, INBOX_MAX_TTL_MINUTES))
+    ttl_seconds = ttl_minutes * 60
     token = secrets.token_urlsafe(_INBOX_TOKEN_BYTES)
-    expires_at = time.time() + ttl
+    expires_at = time.time() + ttl_seconds
     _inbox_slots[token] = {"message": None, "expires_at": expires_at, "filled": False}
-    logger.info("inbox created  token=…%s  ttl=%ds", token[-6:], ttl)
+    # Derive the email-like address from the request host (falls back to "localhost")
+    host = request.host or "localhost"
+    address = f"{token}@{host}"
+    logger.info("inbox created  address=%s@…  ttl=%dm", token[:6], ttl_minutes)
     return web.json_response({
-        "drop_url": f"/inbox/{token}/drop",
-        "read_url": f"/inbox/{token}/read",
+        "address":    address,
+        "drop_url":   f"/inbox/{token}/drop",
+        "read_url":   f"/inbox/{token}/read",
         "expires_at": expires_at,
     })
 
@@ -975,8 +995,12 @@ async def inbox_drop_page_handler(request: web.Request) -> web.Response:
             "</body></html>"
         )
         return web.Response(text=html, content_type="text/html")
+    host = request.host or "localhost"
+    address = f"{token}@{host}"
     html = (STATIC_DIR / "inbox.html").read_text(encoding="utf-8")
     html = html.replace("__INBOX_TOKEN__", token)
+    html = html.replace("__INBOX_ADDRESS__", address)
+    html = html.replace("__INBOX_EXPIRES_AT__", str(slot["expires_at"]))
     return web.Response(text=html, content_type="text/html")
 
 

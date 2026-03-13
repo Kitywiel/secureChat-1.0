@@ -86,6 +86,9 @@
           <button type="button" id="share-files-btn" class="btn-secondary">
             📎 Share Files
           </button>
+          <button type="button" id="inbox-btn" class="btn-secondary">
+            📬 One-Time Inbox
+          </button>
         </div>
       </div>
     </div>
@@ -343,6 +346,69 @@
           <div id="share-links-container"></div>
           <button type="button" id="share-again-btn" class="btn-secondary" style="margin-top:1rem">
             Share More Files
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── One-Time Inbox ────────────────────────────────────────────────── -->
+    <div id="inbox" class="screen hidden">
+      <div class="card">
+        <div class="card-header">
+          <button type="button" id="inbox-back-btn" class="btn-back">← Back</button>
+          <h1>📬 One-Time Inbox</h1>
+        </div>
+        <p class="subtitle">
+          Create a temporary inbox that accepts <strong>one message</strong> from
+          a sender. Share the drop link with them; the read link is yours alone.
+          Both links expire after the chosen time.
+        </p>
+
+        <div id="inbox-create-area">
+          <label for="inbox-ttl">Inbox expires after</label>
+          <select id="inbox-ttl">
+            <option value="1">1 minute</option>
+            <option value="5">5 minutes</option>
+            <option value="10" selected>10 minutes</option>
+            <option value="15">15 minutes</option>
+            <option value="30">30 minutes</option>
+            <option value="60">60 minutes</option>
+          </select>
+
+          <div id="inbox-create-error" class="field-error" aria-live="polite"></div>
+          <button type="button" id="inbox-create-btn">Create Inbox →</button>
+        </div>
+
+        <div id="inbox-result" class="share-result hidden">
+          <p class="share-result-label">📮 Inbox address — share this with the sender:</p>
+          <div class="share-link-row">
+            <code id="inbox-address" class="share-link"></code>
+            <button type="button" id="inbox-copy-address-btn" class="btn-copy">Copy</button>
+          </div>
+
+          <p class="share-result-label share-result-label--mt">
+            🔗 Drop link — sender opens this to type their message:
+          </p>
+          <div class="share-link-row">
+            <code id="inbox-drop-url" class="share-link"></code>
+            <button type="button" id="inbox-copy-drop-btn" class="btn-copy">Copy</button>
+          </div>
+
+          <p class="share-result-label share-result-label--mt">
+            📥 Read link — open this to receive the message (one-time only):
+          </p>
+          <div class="share-link-row">
+            <code id="inbox-read-url" class="share-link"></code>
+            <button type="button" id="inbox-copy-read-btn" class="btn-copy">Copy</button>
+          </div>
+
+          <p id="inbox-expiry" class="notice"></p>
+
+          <button type="button" id="inbox-open-read-btn">
+            📥 Open Read Link →
+          </button>
+          <button type="button" id="inbox-new-btn" class="btn-secondary" style="margin-top:.5rem">
+            Create Another Inbox
           </button>
         </div>
       </div>

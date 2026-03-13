@@ -1480,6 +1480,106 @@ document.getElementById('create-copy-delete-code-btn').addEventListener('click',
   });
 });
 
+// ─── One-Time Inbox ───────────────────────────────────────────────────────────
+
+/** Reset the inbox creation screen to its initial state. */
+function resetInboxScreen() {
+  document.getElementById('inbox-result').classList.add('hidden');
+  document.getElementById('inbox-create-area').classList.remove('hidden');
+  document.getElementById('inbox-create-error').textContent = '';
+  document.getElementById('inbox-create-btn').disabled = false;
+  document.getElementById('inbox-create-btn').textContent = 'Create Inbox →';
+  document.getElementById('inbox-address').textContent = '';
+  document.getElementById('inbox-drop-url').textContent = '';
+  document.getElementById('inbox-read-url').textContent = '';
+  document.getElementById('inbox-expiry').textContent = '';
+  document.getElementById('inbox-open-read-btn').onclick = null;
+}
+
+document.getElementById('inbox-btn').addEventListener('click', () => {
+  resetInboxScreen();
+  showScreen('inbox');
+});
+
+document.getElementById('inbox-back-btn').addEventListener('click', () => {
+  resetInboxScreen();
+  showScreen('lobby');
+});
+
+document.getElementById('inbox-new-btn').addEventListener('click', () => {
+  resetInboxScreen();
+});
+
+document.getElementById('inbox-create-btn').addEventListener('click', async () => {
+  const btn = document.getElementById('inbox-create-btn');
+  const errEl = document.getElementById('inbox-create-error');
+  errEl.textContent = '';
+  btn.disabled = true;
+  btn.textContent = 'Creating…';
+
+  const ttlMinutes = parseInt(
+    /** @type {HTMLSelectElement} */ (document.getElementById('inbox-ttl')).value,
+    10,
+  );
+
+  try {
+    const resp = await fetch('/inbox/create', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ttl_minutes: ttlMinutes }),
+    });
+    if (!resp.ok) {
+      const text = await resp.text().catch(() => resp.statusText);
+      throw new Error(text || resp.statusText);
+    }
+    const data = await resp.json();
+
+    const base = window.location.origin;
+    const fullDrop = base + data.drop_url;
+    const fullRead = base + data.read_url;
+
+    document.getElementById('inbox-address').textContent  = data.address;
+    document.getElementById('inbox-drop-url').textContent = fullDrop;
+    document.getElementById('inbox-read-url').textContent = fullRead;
+
+    const expiresDate = new Date(data.expires_at * 1000);
+    document.getElementById('inbox-expiry').textContent =
+      `⏰ Expires at ${expiresDate.toLocaleTimeString()} (${ttlMinutes} min)`;
+
+    document.getElementById('inbox-open-read-btn').onclick = () => {
+      window.open(fullRead, '_blank', 'noopener,noreferrer');
+    };
+
+    document.getElementById('inbox-create-area').classList.add('hidden');
+    document.getElementById('inbox-result').classList.remove('hidden');
+  } catch (err) {
+    errEl.textContent = 'Failed to create inbox: ' + (err instanceof Error ? err.message : String(err));
+    btn.disabled = false;
+    btn.textContent = 'Create Inbox →';
+  }
+});
+
+// Copy buttons for inbox result
+[
+  ['inbox-copy-address-btn', 'inbox-address'],
+  ['inbox-copy-drop-btn',    'inbox-drop-url'],
+  ['inbox-copy-read-btn',    'inbox-read-url'],
+].forEach(([btnId, srcId]) => {
+  document.getElementById(btnId).addEventListener('click', () => {
+    const text = document.getElementById(srcId).textContent;
+    const btn  = document.getElementById(btnId);
+    navigator.clipboard.writeText(text).then(() => {
+      btn.textContent = 'Copied!';
+      setTimeout(() => { btn.textContent = 'Copy'; }, 2000);
+    }).catch(() => {
+      const r = document.createRange();
+      r.selectNodeContents(document.getElementById(srcId));
+      const s = window.getSelection();
+      if (s) { s.removeAllRanges(); s.addRange(r); }
+    });
+  });
+});
+
 // ─── Init ─────────────────────────────────────────────────────────────────────
 
 // On page load, pre-fill the join form from any invite link fragment

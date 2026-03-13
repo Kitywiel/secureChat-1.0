@@ -1551,16 +1551,47 @@ async def test_log_recent_ring_buffer_populated() -> None:
 
 @pytest.mark.asyncio
 async def test_inbox_create_returns_urls(ws_client) -> None:
-    """POST /inbox/create returns drop_url, read_url, and expires_at."""
+    """POST /inbox/create returns address, drop_url, read_url, and expires_at."""
     resp = await ws_client.post("/inbox/create", json={})
     assert resp.status == 200
     body = await resp.json()
-    assert "drop_url" in body
-    assert "read_url" in body
+    assert "address"    in body
+    assert "drop_url"   in body
+    assert "read_url"   in body
     assert "expires_at" in body
     assert body["drop_url"].startswith("/inbox/")
     assert body["drop_url"].endswith("/drop")
     assert body["read_url"].endswith("/read")
+    # address should be in the form local@host
+    assert "@" in body["address"]
+
+
+@pytest.mark.asyncio
+async def test_inbox_create_ttl_minutes(ws_client) -> None:
+    """POST /inbox/create respects ttl_minutes (1-60) and clamps outliers."""
+    import server as _s
+    import time
+
+    # Custom TTL = 15 minutes
+    resp = await ws_client.post("/inbox/create", json={"ttl_minutes": 15})
+    body = await resp.json()
+    token = body["drop_url"].split("/")[2]
+    expected = time.time() + 15 * 60
+    assert abs(_s._inbox_slots[token]["expires_at"] - expected) < 5
+
+    # TTL above maximum should be clamped to 60 min
+    resp2 = await ws_client.post("/inbox/create", json={"ttl_minutes": 999})
+    body2 = await resp2.json()
+    token2 = body2["drop_url"].split("/")[2]
+    max_expected = time.time() + 60 * 60
+    assert _s._inbox_slots[token2]["expires_at"] <= max_expected + 5
+
+    # TTL below minimum should be clamped to 1 min
+    resp3 = await ws_client.post("/inbox/create", json={"ttl_minutes": 0})
+    body3 = await resp3.json()
+    token3 = body3["drop_url"].split("/")[2]
+    min_expected = time.time() + 1 * 60
+    assert abs(_s._inbox_slots[token3]["expires_at"] - min_expected) < 5
 
 
 @pytest.mark.asyncio
@@ -1590,7 +1621,7 @@ async def test_inbox_drop_and_read_once(ws_client) -> None:
 
 @pytest.mark.asyncio
 async def test_inbox_drop_page_served(ws_client) -> None:
-    """GET /inbox/{token}/drop returns the sender HTML page."""
+    """GET /inbox/{token}/drop returns the sender HTML page with address/expiry."""
     resp = await ws_client.post("/inbox/create", json={})
     drop_url = (await resp.json())["drop_url"]
     page_resp = await ws_client.get(drop_url)
@@ -1599,6 +1630,9 @@ async def test_inbox_drop_page_served(ws_client) -> None:
     assert "text/html" in ct
     text = await page_resp.text()
     assert "One-Time Inbox" in text
+    # The address placeholder must have been substituted
+    assert "__INBOX_ADDRESS__" not in text
+    assert "__INBOX_EXPIRES_AT__" not in text
 
 
 @pytest.mark.asyncio
@@ -1642,7 +1676,7 @@ async def test_inbox_unknown_token_returns_404(ws_client) -> None:
 async def test_inbox_expired_drop_returns_410(ws_client) -> None:
     """POSTing to a manually expired inbox returns 410."""
     import server as _s
-    resp = await ws_client.post("/inbox/create", json={"ttl": 3600})
+    resp = await ws_client.post("/inbox/create", json={"ttl_minutes": 10})
     token = (await resp.json())["drop_url"].split("/")[2]
     # Force expiry
     _s._inbox_slots[token]["expires_at"] = 0.0
