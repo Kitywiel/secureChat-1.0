@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import email as _email_lib
 import hashlib
 import io
 import json
@@ -45,10 +46,12 @@ import sqlite3
 import sys
 import tempfile
 import time
+from email import policy as _email_policy
 from pathlib import Path
 
 import qrcode
 import qrcode.constants
+from aiosmtpd.controller import Controller as _SmtpController
 from qrcode.image.svg import SvgImage as _QrSvgImage
 from aiohttp import web, WSMsgType
 
@@ -184,10 +187,14 @@ _SHARE_TOKEN_BYTES = 32                      # 256-bit token → 43-char URL-saf
 
 # One-time inbox constants
 _INBOX_TOKEN_BYTES = 16                      # 128-bit token → ~22-char URL-safe base64 local part
-MAX_INBOX_MESSAGE_LEN = 4096                 # max characters for an inbox message
+MAX_INBOX_MESSAGE_LEN = 4096                 # max characters for an inbox message (HTTP drop only)
 INBOX_MIN_TTL_MINUTES = 1                    # minimum lifetime in minutes
 INBOX_MAX_TTL_MINUTES = 60                   # maximum lifetime in minutes
 INBOX_DEFAULT_TTL_MINUTES = 10              # default lifetime in minutes
+# Real-email SMTP support — set MAIL_DOMAIN to your MX-pointed domain to enable inbound SMTP.
+# SMTP_PORT defaults to 25; use a higher port (e.g. 2525) when running without root privileges.
+MAIL_DOMAIN: str = os.environ.get("MAIL_DOMAIN", "")
+SMTP_PORT: int = int(os.environ.get("SMTP_PORT", "25"))
 
 # Room-create / passcode constants
 MAX_PASSCODE_LEN = 64                  # characters in a room or share passcode
@@ -266,10 +273,14 @@ _room_meta: dict[str, dict] = {}
 _share_slots: dict[str, dict] = {}
 
 # One-time inbox registry
-# token → {"message": str | None, "expires_at": float, "filled": bool}
-# A slot is created empty (filled=False); the sender POSTs once to fill it;
-# the recipient GETs once to read and destroy it.
+# token → {"message": str | None, "expires_at": float, "filled": bool,
+#           "email_from": str | None, "subject": str | None, "content_type": str | None}
+# A slot is created empty (filled=False); filled either by HTTP POST /drop or by inbound SMTP;
+# the recipient GETs /read once to retrieve and permanently destroy it.
 _inbox_slots: dict[str, dict] = {}
+
+# SMTP controller instance (started when MAIL_DOMAIN is set)
+_smtp_controller: _SmtpController | None = None
 
 # ---------------------------------------------------------------------------
 # Global statistics counters
@@ -885,14 +896,106 @@ async def _cleanup_expired_share_slots() -> None:
 # One-time inbox handlers
 # ---------------------------------------------------------------------------
 # Workflow:
-#   1. Creator:  POST /inbox/create  → {"drop_url": "…/inbox/<token>/drop",
+#   1. Creator:  POST /inbox/create  → {"address": "token@domain",
+#                                        "drop_url": "…/inbox/<token>/drop",
 #                                        "read_url": "…/inbox/<token>/read",
 #                                        "expires_at": <unix-ts>}
-#   2. Sender:   POST /inbox/<token>/drop  {body: {"message": "…"}}
-#                → 200 {"ok": true}  (only once — subsequent posts return 409)
-#   3. Recipient: GET /inbox/<token>/read  → 200 {"message": "…"} (one-time; slot deleted)
-#                 Returns 204 if nothing deposited yet, 410 if expired/used.
+#   2. Sender (HTTP):  POST /inbox/<token>/drop  {body: {"message": "…"}}
+#                      → 200 {"ok": true}  (only once — subsequent posts return 409)
+#      Sender (SMTP):  Send real email to <token>@MAIL_DOMAIN (if MAIL_DOMAIN is set)
+#   3. Recipient:      GET /inbox/<token>/read  → 200 {"message": "…", …} (one-time)
+#                      Returns 204 if nothing deposited yet, 410 if expired/used.
 # ---------------------------------------------------------------------------
+
+class InboxSmtpHandler:
+    """aiosmtpd message handler — receives inbound SMTP and fills matching inbox slots.
+
+    This handler runs in the aiosmtpd Controller's own thread/event-loop.
+    Writes to ``_inbox_slots`` (a plain dict) are GIL-protected in CPython and
+    consist of single-key assignments, which is safe for concurrent access.
+    """
+
+    async def handle_RCPT(
+        self, server, session, envelope, address: str, rcpt_options
+    ) -> str:
+        """Accept mail only for tokens that map to an active, unfilled inbox slot."""
+        local = address.split("@")[0]
+        slot = _inbox_slots.get(local)
+        if slot is None or time.time() > slot["expires_at"] or slot["filled"]:
+            return "550 5.1.1 User unknown or inbox unavailable"
+        envelope.rcpt_tos.append(address)
+        return "250 OK"
+
+    async def handle_DATA(self, server, session, envelope) -> str:
+        """Parse the raw email and deposit its body into the matching inbox slot(s)."""
+        raw = envelope.content
+        if isinstance(raw, bytes):
+            msg = _email_lib.message_from_bytes(raw, policy=_email_policy.default)
+        else:
+            msg = _email_lib.message_from_string(raw, policy=_email_policy.default)
+
+        subject = str(msg.get("Subject", "(no subject)"))
+        from_addr = str(msg.get("From", "(unknown sender)"))
+
+        body_text = ""
+        body_html = ""
+        if msg.is_multipart():
+            for part in msg.walk():
+                ct = part.get_content_type()
+                disp = str(part.get_content_disposition() or "")
+                if "attachment" in disp:
+                    continue
+                if ct == "text/plain" and not body_text:
+                    try:
+                        body_text = part.get_content()
+                    except Exception:  # noqa: BLE001
+                        body_text = (part.get_payload(decode=True) or b"").decode(
+                            "utf-8", errors="replace"
+                        )
+                elif ct == "text/html" and not body_html:
+                    try:
+                        body_html = part.get_content()
+                    except Exception:  # noqa: BLE001
+                        body_html = (part.get_payload(decode=True) or b"").decode(
+                            "utf-8", errors="replace"
+                        )
+        else:
+            ct = msg.get_content_type()
+            if ct == "text/html":
+                try:
+                    body_html = msg.get_content()
+                except Exception:  # noqa: BLE001
+                    body_html = (msg.get_payload(decode=True) or b"").decode(
+                        "utf-8", errors="replace"
+                    )
+            else:
+                try:
+                    body_text = msg.get_content()
+                except Exception:  # noqa: BLE001
+                    body_text = (msg.get_payload(decode=True) or b"").decode(
+                        "utf-8", errors="replace"
+                    )
+
+        body = body_html or body_text or "(empty message)"
+
+        for rcpt in envelope.rcpt_tos:
+            local = rcpt.split("@")[0]
+            slot = _inbox_slots.get(local)
+            if slot is None or slot["filled"] or time.time() > slot["expires_at"]:
+                continue
+            slot["message"] = body
+            slot["filled"] = True
+            slot["email_from"] = from_addr
+            slot["subject"] = subject
+            slot["content_type"] = "text/html" if body_html else "text/plain"
+            logger.info(
+                "inbox email received  token=…%s  from=%.40s  subject=%r",
+                local[-6:],
+                from_addr,
+                subject[:60],
+            )
+
+        return "250 Message accepted for delivery"
 
 async def inbox_create_handler(request: web.Request) -> web.Response:
     """POST /inbox/create — allocate a fresh one-time inbox slot.
@@ -904,10 +1007,11 @@ async def inbox_create_handler(request: web.Request) -> web.Response:
     Returns::
 
         {
-          "address":   "abc123@host",       # email-like identifier to share
-          "drop_url":  "/inbox/<token>/drop",
-          "read_url":  "/inbox/<token>/read",
+          "address":    "abc123@example.com",   # real email address (when MAIL_DOMAIN is set)
+          "drop_url":   "/inbox/<token>/drop",  # HTTP drop page for the sender
+          "read_url":   "/inbox/<token>/read",  # one-time read endpoint for the recipient
           "expires_at": <unix-timestamp>,
+          "smtp_enabled": true|false,           # whether real SMTP is active on this server
         }
     """
     try:
@@ -919,16 +1023,24 @@ async def inbox_create_handler(request: web.Request) -> web.Response:
     ttl_seconds = ttl_minutes * 60
     token = secrets.token_urlsafe(_INBOX_TOKEN_BYTES)
     expires_at = time.time() + ttl_seconds
-    _inbox_slots[token] = {"message": None, "expires_at": expires_at, "filled": False}
-    # Derive the email-like address from the request host (falls back to "localhost")
-    host = request.host or "localhost"
-    address = f"{token}@{host}"
-    logger.info("inbox created  address=%s@…  ttl=%dm", token[:6], ttl_minutes)
-    return web.json_response({
-        "address":    address,
-        "drop_url":   f"/inbox/{token}/drop",
-        "read_url":   f"/inbox/{token}/read",
+    _inbox_slots[token] = {
+        "message": None,
         "expires_at": expires_at,
+        "filled": False,
+        "email_from": None,
+        "subject": None,
+        "content_type": None,
+    }
+    # Use the configured mail domain for a real working email address; fall back to request host.
+    mail_host = MAIL_DOMAIN or request.host or "localhost"
+    address = f"{token}@{mail_host}"
+    logger.info("inbox created  address=%.6s@%s  ttl=%dm", token, mail_host, ttl_minutes)
+    return web.json_response({
+        "address":      address,
+        "drop_url":     f"/inbox/{token}/drop",
+        "read_url":     f"/inbox/{token}/read",
+        "expires_at":   expires_at,
+        "smtp_enabled": bool(MAIL_DOMAIN),
     })
 
 
@@ -962,7 +1074,14 @@ async def inbox_drop_handler(request: web.Request) -> web.Response:
 
 
 async def inbox_read_handler(request: web.Request) -> web.Response:
-    """GET /inbox/{token}/read — recipient reads and destroys the message (one-time)."""
+    """GET /inbox/{token}/read — recipient reads and destroys the message (one-time).
+
+    Response fields:
+        message      – the message body (plain text or HTML)
+        content_type – "text/plain" or "text/html" (only for SMTP-received emails)
+        email_from   – sender address (only for SMTP-received emails)
+        subject      – email subject  (only for SMTP-received emails)
+    """
     token = request.match_info["token"]
     slot = _inbox_slots.get(token)
     if slot is None:
@@ -973,10 +1092,15 @@ async def inbox_read_handler(request: web.Request) -> web.Response:
     if not slot["filled"]:
         # Slot exists but no message yet — tell the caller to try again
         return web.json_response({"pending": True}, status=204)
-    message = slot.pop("message")
+    # Collect all fields before destroying the slot
+    result: dict = {"message": slot["message"]}
+    if slot.get("email_from"):
+        result["email_from"] = slot["email_from"]
+        result["subject"] = slot.get("subject") or ""
+        result["content_type"] = slot.get("content_type") or "text/plain"
     _inbox_slots.pop(token, None)
     logger.info("inbox read  token=…%s", token[-6:])
-    return web.json_response({"message": message})
+    return web.json_response(result)
 
 
 async def inbox_drop_page_handler(request: web.Request) -> web.Response:
@@ -995,7 +1119,7 @@ async def inbox_drop_page_handler(request: web.Request) -> web.Response:
             "</body></html>"
         )
         return web.Response(text=html, content_type="text/html")
-    host = request.host or "localhost"
+    host = MAIL_DOMAIN or request.host or "localhost"
     address = f"{token}@{host}"
     html = (STATIC_DIR / "inbox.html").read_text(encoding="utf-8")
     html = html.replace("__INBOX_TOKEN__", token)
@@ -1144,7 +1268,7 @@ async def server_info_handler(request: web.Request) -> web.Response:
                 except Exception:  # noqa: BLE001
                     pass
                 break
-    return web.json_response({"onion": onion})
+    return web.json_response({"onion": onion, "mail_domain": MAIL_DOMAIN or None})
 
 
 async def qrcode_handler(request: web.Request) -> web.Response:
@@ -1626,7 +1750,7 @@ def build_app(db_path: Path | None = None) -> web.Application:
     app["db_path"] = resolved_db
 
     async def on_startup(app: web.Application) -> None:
-        global _admin_event_loop  # noqa: PLW0603
+        global _admin_event_loop, _smtp_controller  # noqa: PLW0603
         _admin_event_loop = asyncio.get_running_loop()
         # Attach SSE log handler so live-log stream works
         handler = _SseLogHandler()
@@ -1645,7 +1769,26 @@ def build_app(db_path: Path | None = None) -> web.Application:
         )
         logger.info("admin panel ready  path=/%s/", _ADMIN_PATH)
 
+        # Start the inbound SMTP server when a mail domain is configured
+        if MAIL_DOMAIN:
+            _smtp_controller = _SmtpController(
+                InboxSmtpHandler(),
+                hostname="0.0.0.0",
+                port=SMTP_PORT,
+            )
+            _smtp_controller.start()
+            logger.info(
+                "SMTP inbox server listening  domain=%s  port=%d",
+                MAIL_DOMAIN,
+                SMTP_PORT,
+            )
+        else:
+            logger.info(
+                "SMTP inbox disabled (set MAIL_DOMAIN env var to enable real email)"
+            )
+
     async def on_cleanup(app: web.Application) -> None:
+        global _smtp_controller  # noqa: PLW0603
         for key in ("_cleanup_share_task", "_cleanup_inbox_task", "_cleanup_rooms_task"):
             task = app.get(key)
             if task:
@@ -1654,6 +1797,10 @@ def build_app(db_path: Path | None = None) -> web.Application:
                     await task
                 except asyncio.CancelledError:
                     pass
+        if _smtp_controller is not None:
+            _smtp_controller.stop()
+            _smtp_controller = None
+            logger.info("SMTP inbox server stopped")
 
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_cleanup)

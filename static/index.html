@@ -358,10 +358,15 @@
           <button type="button" id="inbox-back-btn" class="btn-back">← Back</button>
           <h1>📬 One-Time Inbox</h1>
         </div>
-        <p class="subtitle">
+        <p class="subtitle" id="inbox-subtitle">
           Create a temporary inbox that accepts <strong>one message</strong> from
           a sender. Share the drop link with them; the read link is yours alone.
           Both links expire after the chosen time.
+        </p>
+        <!-- Badge shown when the server has SMTP enabled -->
+        <p id="inbox-smtp-badge" class="notice hidden" style="background:#1a2e1a;border-color:#2d6a2d;color:#6fcf6f;margin-bottom:.75rem">
+          ✅ <strong>Real email enabled</strong> — the address below works with Discord, GitHub, and any service that sends verification emails.
+          Point your domain's MX record to this server's IP to activate.
         </p>
 
         <div id="inbox-create-area">
@@ -405,11 +410,21 @@
           <p id="inbox-expiry" class="notice"></p>
 
           <button type="button" id="inbox-open-read-btn">
-            📥 Open Read Link →
+            📥 Check for Message →
           </button>
           <button type="button" id="inbox-new-btn" class="btn-secondary" style="margin-top:.5rem">
             Create Another Inbox
           </button>
+
+          <!-- Inline message reader — populated by app.js when the read button is clicked -->
+          <div id="inbox-read-result" class="hidden" style="margin-top:1rem">
+            <div id="inbox-read-meta" class="hidden" style="background:#111;border:1px solid #333;border-radius:8px;padding:.6rem .8rem;margin-bottom:.75rem;font-size:.85rem;color:#aaa">
+              <div><span style="color:#666">From:</span>&nbsp;<span id="inbox-read-from" style="color:#e0e0e0"></span></div>
+              <div style="margin-top:.25rem"><span style="color:#666">Subject:</span>&nbsp;<span id="inbox-read-subject" style="color:#e0e0e0"></span></div>
+            </div>
+            <div id="inbox-read-body-wrapper"></div>
+            <p id="inbox-read-notice" class="notice" style="margin-top:.75rem"></p>
+          </div>
         </div>
       </div>
     </div>

@@ -1682,3 +1682,163 @@ async def test_inbox_expired_drop_returns_410(ws_client) -> None:
     _s._inbox_slots[token]["expires_at"] = 0.0
     gone = await ws_client.post(f"/inbox/{token}/drop", json={"message": "hi"})
     assert gone.status == 410
+
+
+# ─── SMTP inbox tests ────────────────────────────────────────────────────────
+
+class FakeEnvelope:
+    """Minimal aiosmtpd Envelope stub for unit-testing InboxSmtpHandler."""
+    def __init__(self, rcpt_tos: list, content: bytes):
+        self.rcpt_tos = rcpt_tos
+        self.content = content
+        self.mail_from = "sender@example.com"
+
+
+@pytest.mark.asyncio
+async def test_smtp_handler_fills_slot_plaintext(ws_client) -> None:
+    """InboxSmtpHandler.handle_DATA fills an inbox slot with plain-text email."""
+    import server as _s
+
+    resp = await ws_client.post("/inbox/create", json={"ttl_minutes": 10})
+    data = await resp.json()
+    token = data["drop_url"].split("/")[2]
+
+    raw_email = (
+        "From: alice@example.com\r\n"
+        "To: {token}@example.com\r\n"
+        "Subject: Test verification code\r\n"
+        "Content-Type: text/plain; charset=utf-8\r\n"
+        "\r\n"
+        "Your code is 123456\r\n"
+    ).format(token=token).encode()
+
+    handler = _s.InboxSmtpHandler()
+    envelope = FakeEnvelope(rcpt_tos=[f"{token}@example.com"], content=raw_email)
+    result = await handler.handle_DATA(None, None, envelope)
+
+    assert result.startswith("250")
+    slot = _s._inbox_slots.get(token)
+    assert slot is not None
+    assert slot["filled"] is True
+    assert "123456" in slot["message"]
+    assert slot["email_from"] == "alice@example.com"
+    assert slot["subject"] == "Test verification code"
+    assert slot["content_type"] == "text/plain"
+
+
+@pytest.mark.asyncio
+async def test_smtp_handler_fills_slot_html_email(ws_client) -> None:
+    """InboxSmtpHandler.handle_DATA stores HTML content and sets content_type=text/html."""
+    import server as _s
+
+    resp = await ws_client.post("/inbox/create", json={"ttl_minutes": 5})
+    token = (await resp.json())["drop_url"].split("/")[2]
+
+    raw_email = (
+        "From: noreply@discord.com\r\n"
+        "To: {token}@mail.example.com\r\n"
+        "Subject: Discord verify\r\n"
+        "MIME-Version: 1.0\r\n"
+        "Content-Type: text/html; charset=utf-8\r\n"
+        "\r\n"
+        "<html><body><p>Your code is <b>654321</b></p></body></html>\r\n"
+    ).format(token=token).encode()
+
+    handler = _s.InboxSmtpHandler()
+    envelope = FakeEnvelope(rcpt_tos=[f"{token}@mail.example.com"], content=raw_email)
+    result = await handler.handle_DATA(None, None, envelope)
+
+    assert result.startswith("250")
+    slot = _s._inbox_slots.get(token)
+    assert slot is not None
+    assert slot["filled"] is True
+    assert "654321" in slot["message"]
+    assert slot["content_type"] == "text/html"
+
+
+@pytest.mark.asyncio
+async def test_smtp_handler_ignores_unknown_token(ws_client) -> None:
+    """InboxSmtpHandler.handle_DATA silently ignores recipients with no matching slot."""
+    import server as _s
+
+    raw_email = (
+        "From: x@example.com\r\n"
+        "To: notavalidtoken@example.com\r\n"
+        "Subject: Ignored\r\n"
+        "\r\n"
+        "body\r\n"
+    ).encode()
+
+    handler = _s.InboxSmtpHandler()
+    envelope = FakeEnvelope(rcpt_tos=["notavalidtoken@example.com"], content=raw_email)
+    result = await handler.handle_DATA(None, None, envelope)
+    assert result.startswith("250")  # still returns 250; unknown tokens are silently skipped
+
+
+@pytest.mark.asyncio
+async def test_inbox_read_returns_email_metadata(ws_client) -> None:
+    """GET /inbox/{token}/read returns email_from, subject, content_type for SMTP emails."""
+    import server as _s
+
+    resp = await ws_client.post("/inbox/create", json={"ttl_minutes": 10})
+    data = await resp.json()
+    token = data["drop_url"].split("/")[2]
+
+    # Simulate SMTP delivery by calling the handler directly
+    raw_email = (
+        "From: github@example.com\r\n"
+        "To: {token}@example.com\r\n"
+        "Subject: GitHub: Verify your email\r\n"
+        "Content-Type: text/plain; charset=utf-8\r\n"
+        "\r\n"
+        "Click here to verify: https://github.com/verify/abc\r\n"
+    ).format(token=token).encode()
+
+    handler = _s.InboxSmtpHandler()
+    envelope = FakeEnvelope(rcpt_tos=[f"{token}@example.com"], content=raw_email)
+    await handler.handle_DATA(None, None, envelope)
+
+    read_resp = await ws_client.get(f"/inbox/{token}/read")
+    assert read_resp.status == 200
+    body = await read_resp.json()
+    assert "message" in body
+    assert "email_from" in body
+    assert body["email_from"] == "github@example.com"
+    assert body["subject"] == "GitHub: Verify your email"
+    assert body["content_type"] == "text/plain"
+
+
+@pytest.mark.asyncio
+async def test_smtp_handler_handle_rcpt_rejects_unknown_token() -> None:
+    """InboxSmtpHandler.handle_RCPT returns 550 for unknown/expired tokens."""
+    import server as _s
+
+    handler = _s.InboxSmtpHandler()
+
+    class _FakeEnvelopeRcpt:
+        rcpt_tos: list = []
+
+    result = await handler.handle_RCPT(None, None, _FakeEnvelopeRcpt(), "badtoken@x.com", [])
+    assert result.startswith("550")
+
+
+@pytest.mark.asyncio
+async def test_smtp_enabled_field_in_create_response(ws_client) -> None:
+    """POST /inbox/create always returns smtp_enabled field."""
+    resp = await ws_client.post("/inbox/create", json={})
+    assert resp.status == 200
+    data = await resp.json()
+    assert "smtp_enabled" in data
+    # In test environment MAIL_DOMAIN is not set, so smtp_enabled should be False
+    assert data["smtp_enabled"] is False
+
+
+@pytest.mark.asyncio
+async def test_server_info_includes_mail_domain(ws_client) -> None:
+    """GET /api/server-info includes mail_domain field."""
+    resp = await ws_client.get("/api/server-info")
+    assert resp.status == 200
+    data = await resp.json()
+    assert "mail_domain" in data
+    # In test environment MAIL_DOMAIN is not set
+    assert data["mail_domain"] is None

@@ -1485,6 +1485,10 @@ document.getElementById('create-copy-delete-code-btn').addEventListener('click',
 /** Reset the inbox creation screen to its initial state. */
 function resetInboxScreen() {
   document.getElementById('inbox-result').classList.add('hidden');
+  document.getElementById('inbox-read-result').classList.add('hidden');
+  document.getElementById('inbox-read-meta').classList.add('hidden');
+  document.getElementById('inbox-read-body-wrapper').innerHTML = '';
+  document.getElementById('inbox-read-notice').textContent = '';
   document.getElementById('inbox-create-area').classList.remove('hidden');
   document.getElementById('inbox-create-error').textContent = '';
   document.getElementById('inbox-create-btn').disabled = false;
@@ -1493,8 +1497,18 @@ function resetInboxScreen() {
   document.getElementById('inbox-drop-url').textContent = '';
   document.getElementById('inbox-read-url').textContent = '';
   document.getElementById('inbox-expiry').textContent = '';
+  document.getElementById('inbox-open-read-btn').style.display = '';
+  document.getElementById('inbox-open-read-btn').disabled = false;
+  document.getElementById('inbox-open-read-btn').textContent = '📥 Check for Message →';
   document.getElementById('inbox-open-read-btn').onclick = null;
 }
+
+// Fetch server-info once to know whether SMTP is configured
+fetch('/api/server-info').then(r => r.json()).then(info => {
+  if (info.mail_domain) {
+    document.getElementById('inbox-smtp-badge').classList.remove('hidden');
+  }
+}).catch(() => {/* ignore */});
 
 document.getElementById('inbox-btn').addEventListener('click', () => {
   resetInboxScreen();
@@ -1546,8 +1560,78 @@ document.getElementById('inbox-create-btn').addEventListener('click', async () =
     document.getElementById('inbox-expiry').textContent =
       `⏰ Expires at ${expiresDate.toLocaleTimeString()} (${ttlMinutes} min)`;
 
-    document.getElementById('inbox-open-read-btn').onclick = () => {
-      window.open(fullRead, '_blank', 'noopener,noreferrer');
+    // Show the SMTP badge inside the result area if server has real email
+    if (data.smtp_enabled) {
+      document.getElementById('inbox-smtp-badge').classList.remove('hidden');
+    }
+
+    // "Check for Message" fetches the read URL inline and renders the result
+    document.getElementById('inbox-open-read-btn').onclick = async () => {
+      const readBtn = document.getElementById('inbox-open-read-btn');
+      readBtn.disabled = true;
+      readBtn.textContent = 'Checking…';
+
+      try {
+        const readResp = await fetch(fullRead);
+        const resultDiv = document.getElementById('inbox-read-result');
+        const noticeEl = document.getElementById('inbox-read-notice');
+        const bodyWrapper = document.getElementById('inbox-read-body-wrapper');
+        resultDiv.classList.remove('hidden');
+
+        if (readResp.status === 204) {
+          noticeEl.textContent = '⏳ No message yet — click again to check.';
+          bodyWrapper.innerHTML = '';
+          readBtn.disabled = false;
+          readBtn.textContent = '🔄 Check Again →';
+        } else if (readResp.status === 410) {
+          noticeEl.textContent = '🗑️ Inbox has expired or the message was already read.';
+          bodyWrapper.innerHTML = '';
+          readBtn.style.display = 'none';
+        } else if (readResp.ok) {
+          const msg = await readResp.json();
+
+          // Show email headers (From / Subject) if this was a real SMTP email
+          if (msg.email_from) {
+            document.getElementById('inbox-read-from').textContent = msg.email_from;
+            document.getElementById('inbox-read-subject').textContent =
+              msg.subject || '(no subject)';
+            document.getElementById('inbox-read-meta').classList.remove('hidden');
+          }
+
+          // Render the body — HTML emails go in a sandboxed iframe; plain text in <pre>
+          if (msg.content_type === 'text/html') {
+            const blob = new Blob([msg.message], { type: 'text/html' });
+            const blobUrl = URL.createObjectURL(blob);
+            // sandbox="" is maximally restrictive: no scripts, no same-origin access,
+            // no form submission — safe for rendering untrusted email HTML.
+            bodyWrapper.innerHTML =
+              `<iframe src="${blobUrl}" sandbox="" style="width:100%;min-height:280px;` +
+              `border:1px solid #333;border-radius:8px;background:#fff" title="Email body">` +
+              `</iframe>`;
+          } else {
+            const pre = document.createElement('pre');
+            pre.style.cssText =
+              'background:#111;border:1px solid #333;border-radius:8px;padding:1rem;' +
+              'white-space:pre-wrap;word-break:break-word;font-family:monospace;' +
+              'font-size:.9rem;color:#e0e0e0;max-height:400px;overflow-y:auto';
+            pre.textContent = msg.message;
+            bodyWrapper.innerHTML = '';
+            bodyWrapper.appendChild(pre);
+          }
+
+          noticeEl.textContent = '✅ Message received — inbox permanently deleted.';
+          readBtn.style.display = 'none';
+        } else {
+          noticeEl.textContent = `Error ${readResp.status}: ${readResp.statusText}`;
+          readBtn.disabled = false;
+          readBtn.textContent = '📥 Check for Message →';
+        }
+      } catch (err) {
+        document.getElementById('inbox-read-notice').textContent =
+          `Network error: ${err.message}`;
+        document.getElementById('inbox-open-read-btn').disabled = false;
+        document.getElementById('inbox-open-read-btn').textContent = '📥 Check for Message →';
+      }
     };
 
     document.getElementById('inbox-create-area').classList.add('hidden');
