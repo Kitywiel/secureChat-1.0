@@ -956,3 +956,23 @@ select:focus {
 #chat-upload-progress {
   margin: 0.25rem 0.75rem;
 }
+
+/* ── Inbox clearnet-deliverable status badge ───────────────────────────────── */
+.inbox-badge {
+  display: inline-block;
+  margin-bottom: .55rem;
+  padding: .25rem .6rem;
+  border-radius: 6px;
+  font-size: .78rem;
+  font-weight: 600;
+}
+.inbox-badge--real {
+  background: #1a3a1a;
+  color: #6fcf6f;
+  border: 1px solid #2d6a2d;
+}
+.inbox-badge--drop {
+  background: #3a2a1a;
+  color: #d4a76f;
+  border: 1px solid #6a4a2d;
+}

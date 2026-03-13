@@ -1560,11 +1560,16 @@ function buildInboxCard(data, idx) {
   card.className = 'share-result';
   card.style.cssText = 'margin-bottom:1rem;position:relative';
 
+  const clearnetBadge = data.mailtm_enabled
+    ? `<span class="inbox-badge inbox-badge--real">✅ Real email — clearnet deliverable (Discord, Google, GitHub, etc.)</span>`
+    : `<span class="inbox-badge inbox-badge--drop">⚠️ HTTP-drop only — not a real deliverable email</span>`;
+
   card.innerHTML = `
     <button type="button" class="inbox-remove-btn" title="Remove from list"
       style="position:absolute;top:.6rem;right:.6rem;background:none;border:none;
              color:#555;cursor:pointer;font-size:1rem;padding:.1rem .3rem">✕</button>
 
+    ${clearnetBadge}
     <p class="share-result-label">📮 Email address</p>
     <div class="share-link-row">
       <code class="share-link inbox-addr-code">${escHtml(data.address)}</code>

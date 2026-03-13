@@ -2253,3 +2253,82 @@ async def test_make_proxied_session_returns_session() -> None:
     sess = await _s._make_proxied_session(timeout=3.0)
     assert sess is not None
     await sess.close()
+
+
+# ---------------------------------------------------------------------------
+# mail.tm clearnet-deliverable tests (mocked network)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_inbox_create_mailtm_mocked(ws_client) -> None:
+    """When _mailtm_provision is mocked to succeed, POST /inbox/create returns
+    mailtm_enabled=True and a real @domain address (not @localhost)."""
+    import server as _s
+
+    fake_domain   = "testdomain.example"
+    fake_address  = f"abcdef1234567890@{fake_domain}"
+    fake_bearer   = "jwt-test-token"
+
+    orig_enabled   = _s.MAILTM_ENABLED
+    orig_provision = _s._mailtm_provision
+
+    async def _mock_provision(token_bytes: int):
+        return {
+            "mailtm_address": fake_address,
+            "mailtm_bearer":  fake_bearer,
+            "mailtm_seen":    set(),
+        }
+
+    try:
+        _s.MAILTM_ENABLED   = True
+        _s._mailtm_provision = _mock_provision
+
+        resp = await ws_client.post("/inbox/create", json={"ttl_minutes": 30})
+        assert resp.status == 200
+        body = await resp.json()
+
+        # Must be flagged as a real clearnet-deliverable address
+        assert body["mailtm_enabled"] is True
+
+        # Address must be the one returned by mail.tm, not token@localhost
+        assert body["address"] == fake_address
+        assert "@" in body["address"]
+        local, domain = body["address"].split("@", 1)
+        assert domain == fake_domain       # real domain, not "localhost"
+        assert len(local) >= 8             # non-trivial local part
+
+        # Standard fields still present
+        assert body["drop_url"].startswith("/inbox/")
+        assert body["read_url"].startswith("/inbox/")
+        assert "expires_at" in body
+    finally:
+        _s.MAILTM_ENABLED   = orig_enabled
+        _s._mailtm_provision = orig_provision
+
+
+@pytest.mark.asyncio
+async def test_inbox_create_mailtm_fallback_when_unavailable(ws_client) -> None:
+    """When _mailtm_provision returns None (network error), inbox still
+    succeeds and mailtm_enabled is False — no crash."""
+    import server as _s
+
+    orig_enabled   = _s.MAILTM_ENABLED
+    orig_provision = _s._mailtm_provision
+
+    async def _mock_fail(_: int):
+        return None  # simulates unreachable mail.tm
+
+    try:
+        _s.MAILTM_ENABLED   = True
+        _s._mailtm_provision = _mock_fail
+
+        resp = await ws_client.post("/inbox/create", json={"ttl_minutes": 30})
+        assert resp.status == 200
+        body = await resp.json()
+
+        # Fallback: still works, but address is not a real mail.tm address
+        assert body["mailtm_enabled"] is False
+        assert "@" in body["address"]
+    finally:
+        _s.MAILTM_ENABLED   = orig_enabled
+        _s._mailtm_provision = orig_provision
