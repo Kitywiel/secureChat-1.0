@@ -55,7 +55,7 @@
             id="passphrase"
             placeholder="Strong shared passphrase"
             required
-            autocomplete="new-password"
+            autocomplete="off"
           />
 
           <label for="room-passcode">
@@ -323,6 +323,11 @@
             <div id="share-error" class="field-error" aria-live="polite"></div>
 
             <button type="submit" id="share-btn">Upload &amp; Generate Link</button>
+
+            <div id="share-progress" class="upload-progress hidden" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+              <div id="share-progress-bar" class="upload-progress-fill"></div>
+              <span id="share-progress-text" class="upload-progress-text"></span>
+            </div>
           </form>
         </div>
 

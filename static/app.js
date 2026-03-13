@@ -822,6 +822,36 @@ document.getElementById('delete-room-btn').addEventListener('click', async () =>
 
 // ─── Share Files ──────────────────────────────────────────────────────────────
 
+/**
+ * Upload FormData via XHR with real-time progress reporting.
+ *
+ * @param {string}   url        POST endpoint
+ * @param {FormData} formData
+ * @param {function(number): void} onProgress  Called with 0–100 integer percent.
+ * @returns {Promise<{ok: boolean, status: number, text: ()=>Promise<string>, json: ()=>Promise<any>}>}
+ */
+function uploadWithProgress(url, formData, onProgress) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', url);
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable) onProgress(Math.round((e.loaded / e.total) * 100));
+    };
+    xhr.onload = () => {
+      const responseText = xhr.responseText;
+      resolve({
+        ok: xhr.status >= 200 && xhr.status < 300,
+        status: xhr.status,
+        text: () => Promise.resolve(responseText),
+        json: () => Promise.resolve(JSON.parse(responseText)),
+      });
+    };
+    xhr.onerror = () => reject(new Error(`Upload failed (network error, status: ${xhr.status})`));
+    xhr.ontimeout = () => reject(new Error('Upload timed out'));
+    xhr.send(formData);
+  });
+}
+
 /** Reset the share screen to its initial (upload) state. */
 function resetShareScreen() {
   document.getElementById('share-form').reset();
@@ -832,6 +862,13 @@ function resetShareScreen() {
   document.getElementById('share-passcode-row').classList.add('hidden');
   // Clear the links container
   document.getElementById('share-links-container').innerHTML = '';
+  // Reset progress bar
+  const progressWrap = document.getElementById('share-progress');
+  if (progressWrap) {
+    progressWrap.classList.add('hidden');
+    document.getElementById('share-progress-bar').style.width = '0%';
+    document.getElementById('share-progress-text').textContent = '';
+  }
 }
 
 /**
@@ -984,20 +1021,44 @@ document.getElementById('share-form').addEventListener('submit', async (e) => {
   // Clear previous results
   document.getElementById('share-links-container').innerHTML = '';
 
+  const progressWrap = document.getElementById('share-progress');
+  const progressBar  = document.getElementById('share-progress-bar');
+  const progressText = document.getElementById('share-progress-text');
+
+  /** Update the progress bar to the given 0–100 percent. */
+  function setProgress(pct, label) {
+    progressWrap.classList.remove('hidden');
+    progressWrap.setAttribute('aria-valuenow', String(pct));
+    progressBar.style.width = pct + '%';
+    progressText.textContent = label;
+  }
+
+  function hideProgress() {
+    progressWrap.classList.add('hidden');
+    progressBar.style.width = '0%';
+    progressText.textContent = '';
+  }
+
   let successCount = 0;
   for (let i = 0; i < files.length; i++) {
     const file = files[i];
-    btn.textContent = `Uploading ${i + 1} / ${files.length}…`;
+    const fileLabel = `${i + 1} / ${files.length}`;
+    btn.textContent = `Uploading ${fileLabel}…`;
+    setProgress(0, `${fileLabel} — 0%`);
 
     const formData = new FormData();
     formData.append('file', file);
     if (passcode) formData.append('passcode', passcode);
 
     try {
-      const resp = await fetch(`/share/upload?ttl=${encodeURIComponent(ttl)}`, {
-        method: 'POST',
-        body: formData,
-      });
+      const resp = await uploadWithProgress(
+        `/share/upload?ttl=${encodeURIComponent(ttl)}`,
+        formData,
+        (pct) => {
+          btn.textContent = `Uploading ${fileLabel} (${pct}%)…`;
+          setProgress(pct, `${fileLabel} — ${pct}%`);
+        },
+      );
 
       if (!resp.ok) {
         const text = await resp.text();
@@ -1015,6 +1076,7 @@ document.getElementById('share-form').addEventListener('submit', async (e) => {
 
   btn.disabled = false;
   btn.textContent = 'Upload & Generate Link';
+  hideProgress();
 
   if (successCount > 0) {
     document.getElementById('share-result').classList.remove('hidden');
