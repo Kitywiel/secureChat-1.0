@@ -2041,3 +2041,114 @@ async def test_server_info_includes_relay_enabled(ws_client) -> None:
     resp = await ws_client.get("/api/server-info")
     data = await resp.json()
     assert "relay_enabled" in data
+
+
+# ---------------------------------------------------------------------------
+# Lockdown feature tests
+# Lockdown feature tests
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_lockdown_status_requires_auth(ws_client) -> None:
+    """GET /{ADMIN_PATH}/api/lockdown returns 403 without session."""
+    import server as _s
+    ap = _s._ADMIN_PATH
+    resp = await ws_client.get(f"/{ap}/api/lockdown")
+    assert resp.status == 403
+
+
+@pytest.mark.asyncio
+async def test_lockdown_activate_requires_auth(ws_client) -> None:
+    """POST /{ADMIN_PATH}/api/lockdown returns 403 without session."""
+    import server as _s
+    ap = _s._ADMIN_PATH
+    resp = await ws_client.post(f"/{ap}/api/lockdown", json={"action": "activate"})
+    assert resp.status == 403
+
+
+@pytest.mark.asyncio
+async def test_lockdown_toggle_and_wipe(ws_client) -> None:
+    """Admin can activate lockdown which clears inboxes; deactivate lifts it."""
+    import server as _s
+
+    _s._lockdown_active = False
+    ap = _s._ADMIN_PATH
+    passcode = _s._ADMIN_PASSCODE
+
+    # Login
+    login = await ws_client.post(f"/{ap}/login", json={"passcode": passcode})
+    assert login.status == 200
+
+    # Create an inbox and deposit a message
+    cr = await ws_client.post("/inbox/create", json={})
+    token = (await cr.json())["drop_url"].split("/")[2]
+    await ws_client.post(f"/inbox/{token}/drop", json={"message": "secret"})
+
+    # Verify inbox has a message
+    read = await ws_client.get(f"/inbox/{token}/read")
+    assert (await read.json())["count"] == 1
+
+    try:
+        # Activate lockdown
+        act = await ws_client.post(f"/{ap}/api/lockdown", json={"action": "activate"})
+        assert act.status == 200
+        assert (await act.json())["lockdown"] is True
+        assert _s._lockdown_active is True
+
+        # Inbox should now be wiped
+        assert token not in _s._inbox_slots
+
+        # Status endpoint should report lockdown active
+        status = await ws_client.get(f"/{ap}/api/lockdown")
+        assert (await status.json())["lockdown"] is True
+
+    finally:
+        _s._lockdown_active = False
+
+    # Deactivate via API
+    _s._lockdown_active = True
+    deact = await ws_client.post(f"/{ap}/api/lockdown", json={"action": "deactivate"})
+    assert deact.status == 200
+    assert (await deact.json())["lockdown"] is False
+    assert _s._lockdown_active is False
+
+
+@pytest.mark.asyncio
+async def test_lockdown_blocks_normal_routes(ws_client) -> None:
+    """While lockdown is active, non-admin routes return 503."""
+    import server as _s
+
+    _s._lockdown_active = True
+    try:
+        resp = await ws_client.get("/")
+        assert resp.status == 503
+    finally:
+        _s._lockdown_active = False
+
+
+@pytest.mark.asyncio
+async def test_lockdown_allows_admin_routes(ws_client) -> None:
+    """While lockdown is active, the admin path itself is not blocked (503)."""
+    import server as _s
+
+    _s._lockdown_active = True
+    ap = _s._ADMIN_PATH
+    try:
+        resp = await ws_client.get(f"/{ap}/")
+        assert resp.status != 503
+    finally:
+        _s._lockdown_active = False
+
+
+@pytest.mark.asyncio
+async def test_lockdown_bad_action_returns_400(ws_client) -> None:
+    """POST /{ADMIN_PATH}/api/lockdown with unknown action returns 400."""
+    import server as _s
+
+    _s._lockdown_active = False
+    ap = _s._ADMIN_PATH
+    passcode = _s._ADMIN_PASSCODE
+    await ws_client.post(f"/{ap}/login", json={"passcode": passcode})
+
+    resp = await ws_client.post(f"/{ap}/api/lockdown", json={"action": "explode"})
+    assert resp.status == 400

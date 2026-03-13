@@ -235,6 +235,8 @@ async function renderDashboard(){
     </section>
     <section>
       <h2>Emergency Controls</h2>
+      <div id="lockdown-bar" style="margin-bottom:1rem;padding:.8rem 1rem;border-radius:8px;font-weight:700;font-size:.95rem;display:none"></div>
+      <button id="lockdown-btn" style="padding:.6rem 1.4rem;background:#b91c1c;border:none;border-radius:8px;color:#fff;font-size:.95rem;font-weight:700;cursor:pointer;font-family:var(--font);margin-right:.5rem">🔴 Activate Lockdown</button>
       <button id="shutdown-btn">⚠️ Emergency Shutdown</button>
       <div id="shutdown-msg"></div>
     </section>`;
@@ -256,6 +258,42 @@ async function renderDashboard(){
     const r=await fetch(_AP+'/api/shutdown',{method:'POST'});
     document.getElementById('shutdown-msg').textContent=r.ok?'Server is shutting down…':'Shutdown failed.';
   });
+
+  // ── Lockdown ────────────────────────────────────────────────────────────
+  async function refreshLockdownState(){
+    try{
+      const r=await fetch(_AP+'/api/lockdown');
+      if(!r.ok)return;
+      const d=await r.json();
+      const bar=document.getElementById('lockdown-bar');
+      const btn=document.getElementById('lockdown-btn');
+      if(d.lockdown){
+        bar.style.display='block';
+        bar.style.background='#7f1d1d';
+        bar.style.color='#fca5a5';
+        bar.textContent='🔴 LOCKDOWN IS ACTIVE — all data wiped, all visitors see lockdown screen';
+        btn.textContent='🟢 Deactivate Lockdown';
+        btn.style.background='#166534';
+      } else {
+        bar.style.display='none';
+        btn.textContent='🔴 Activate Lockdown';
+        btn.style.background='#b91c1c';
+      }
+    } catch(_){}
+  }
+
+  document.getElementById('lockdown-btn').addEventListener('click',async()=>{
+    const active=document.getElementById('lockdown-btn').textContent.includes('Deactivate');
+    const action=active?'deactivate':'activate';
+    if(action==='activate'){
+      if(!confirm('⚠️ ACTIVATE LOCKDOWN?\n\nThis will:\n• Wipe ALL chats, inboxes, and files immediately\n• Block all visitors with a lockdown screen\n• Close all active connections\n\nThis cannot be undone. Continue?'))return;
+    }
+    const r=await fetch(_AP+'/api/lockdown',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action})});
+    if(r.ok)refreshLockdownState();
+  });
+
+  refreshLockdownState();
+  setInterval(refreshLockdownState,5000);
 
   startLogStream();
 

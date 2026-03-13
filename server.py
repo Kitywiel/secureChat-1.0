@@ -296,6 +296,10 @@ _share_slots: dict[str, dict] = {}
 # Inboxes accept unlimited messages and allow unlimited reads until the TTL expires.
 _inbox_slots: dict[str, dict] = {}
 
+# Lockdown state — set True by admin panel; cleared by admin panel deactivate.
+# While active, all non-admin HTTP/WS requests are redirected to the lockdown page.
+_lockdown_active: bool = False
+
 # SMTP controller instance (started when MAIL_DOMAIN is set)
 _smtp_controller: _SmtpController | None = None
 
@@ -436,6 +440,16 @@ def _delete_room_history_sync(path: Path, room_id: str) -> None:
     con = sqlite3.connect(path)
     try:
         con.execute("DELETE FROM messages WHERE room = ?", (room_id,))
+        con.commit()
+    finally:
+        con.close()
+
+
+def _wipe_all_data_sync(path: Path) -> None:
+    """Delete every message in the DB.  Called during lockdown activation."""
+    con = sqlite3.connect(path)
+    try:
+        con.execute("DELETE FROM messages")
         con.commit()
     finally:
         con.close()
@@ -1845,6 +1859,14 @@ def _init_admin_credentials() -> tuple[str, str]:
     return path, pc
 
 
+async def _lockdown_broadcast_task() -> None:
+    """Background task: while lockdown is active, emit a warning log every 5 seconds."""
+    while True:
+        await asyncio.sleep(5)
+        if _lockdown_active:
+            logger.warning("🔴 LOCKDOWN ACTIVE — server is in lockdown mode")
+
+
 def _register_admin_routes(app: web.Application) -> None:
     """Add admin-panel routes to *app* under the secret path prefix."""
     p = _ADMIN_PATH
@@ -1856,6 +1878,100 @@ def _register_admin_routes(app: web.Application) -> None:
     app.router.add_get(f"/{p}/api/logs", _admin_logs_sse_handler)
     app.router.add_post(f"/{p}/api/shutdown", _admin_shutdown_handler)
     app.router.add_post(f"/{p}/webhook/{{token}}", _admin_incoming_webhook_handler)
+    app.router.add_post(f"/{p}/api/lockdown", _admin_lockdown_handler)
+    app.router.add_get(f"/{p}/api/lockdown", _admin_lockdown_status_handler)
+
+
+# ---------------------------------------------------------------------------
+# Lockdown — wipe-all and block-all feature
+# ---------------------------------------------------------------------------
+
+async def _admin_lockdown_handler(request: web.Request) -> web.Response:
+    """POST /{admin}/api/lockdown — toggle lockdown on/off.
+
+    Body: ``{"action": "activate"}`` or ``{"action": "deactivate"}``
+    Requires an active admin session cookie.
+    Returns ``{"lockdown": true|false}``
+    """
+    global _lockdown_active  # noqa: PLW0603
+    if not _valid_admin_session(request):
+        raise web.HTTPForbidden(reason="Not authenticated")
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    action = str(body.get("action", "")).strip().lower()
+
+    if action == "activate":
+        _lockdown_active = True
+        db_path: Path = request.app["db_path"]
+
+        # 1. Wipe all DB messages
+        await asyncio.to_thread(_wipe_all_data_sync, db_path)
+
+        # 2. Delete all share-slot temp files on disk before clearing the registry
+        for slot in list(_share_slots.values()):
+            tmp_dir: Path | None = slot.get("tmp_dir")
+            if tmp_dir is not None:
+                try:
+                    shutil.rmtree(tmp_dir, ignore_errors=True)
+                except Exception:  # noqa: BLE001
+                    pass
+
+        # 3. Wipe in-memory data stores
+        _inbox_slots.clear()
+        _share_slots.clear()
+        _room_meta.clear()
+
+        # 4. Close all open WebSocket connections
+        for ws_set in list(rooms.values()):
+            for ws in list(ws_set):
+                try:
+                    await ws.close(message=b"lockdown")
+                except Exception:  # noqa: BLE001
+                    pass
+        rooms.clear()
+
+        logger.warning("🔴 LOCKDOWN ACTIVATED — all data wiped, all connections closed")
+    elif action == "deactivate":
+        _lockdown_active = False
+        logger.info("🟢 LOCKDOWN DEACTIVATED")
+    else:
+        raise web.HTTPBadRequest(reason="action must be 'activate' or 'deactivate'")
+
+    return web.json_response({"lockdown": _lockdown_active})
+
+
+async def _admin_lockdown_status_handler(request: web.Request) -> web.Response:
+    """GET /{admin}/api/lockdown — return current lockdown state (requires auth)."""
+    if not _valid_admin_session(request):
+        raise web.HTTPForbidden(reason="Not authenticated")
+    return web.json_response({"lockdown": _lockdown_active})
+
+
+@web.middleware
+async def _lockdown_middleware(request: web.Request, handler):
+    """Block all non-admin requests while lockdown is active."""
+    if not _lockdown_active:
+        return await handler(request)
+
+    path = request.path.rstrip("/")
+    # Allow admin panel routes through (they have the secret path prefix)
+    admin_prefix = f"/{_ADMIN_PATH}"
+    if path.startswith(admin_prefix) or path == admin_prefix:
+        return await handler(request)
+    # Also keep static assets reachable so the lockdown page renders correctly
+    if path.startswith("/static"):
+        return await handler(request)
+
+    # Serve the lockdown page to everything else
+    lockdown_html_path = STATIC_DIR.parent / "static" / "lockdown.html"
+    if lockdown_html_path.is_file():
+        html = lockdown_html_path.read_text(encoding="utf-8")
+    else:
+        html = "<html><body><h1>🔴 LOCKDOWN ACTIVE</h1><p>This server is in lockdown.</p></body></html>"
+    return web.Response(text=html, content_type="text/html", status=503)
 
 
 # ---------------------------------------------------------------------------
@@ -1898,6 +2014,8 @@ def build_admin_app() -> web.Application:
     app.router.add_get("/admin/api/logs", _admin_logs_sse_handler)
     app.router.add_post("/admin/api/shutdown", _admin_shutdown_handler)
     app.router.add_post("/admin/webhook/{token}", _admin_incoming_webhook_handler)
+    app.router.add_post("/admin/api/lockdown", _admin_lockdown_handler)
+    app.router.add_get("/admin/api/lockdown", _admin_lockdown_status_handler)
     return app
 
 
@@ -1916,7 +2034,7 @@ def build_app(db_path: Path | None = None) -> web.Application:
     resolved_db = db_path if db_path is not None else DB_PATH
 
     # Allow up to MAX_UPLOAD_BYTES for multipart uploads
-    app = web.Application(client_max_size=MAX_UPLOAD_BYTES)
+    app = web.Application(client_max_size=MAX_UPLOAD_BYTES, middlewares=[_lockdown_middleware])
     app["db_path"] = resolved_db
 
     async def on_startup(app: web.Application) -> None:
@@ -1937,6 +2055,7 @@ def build_app(db_path: Path | None = None) -> web.Application:
         app["_cleanup_rooms_task"] = asyncio.create_task(
             _cleanup_expired_rooms(app["db_path"])
         )
+        app["_lockdown_broadcast_task"] = asyncio.create_task(_lockdown_broadcast_task())
         logger.info("admin panel ready  path=/%s/", _ADMIN_PATH)
 
         # Start the inbound SMTP server when a mail domain is configured
@@ -1959,7 +2078,7 @@ def build_app(db_path: Path | None = None) -> web.Application:
 
     async def on_cleanup(app: web.Application) -> None:
         global _smtp_controller  # noqa: PLW0603
-        for key in ("_cleanup_share_task", "_cleanup_inbox_task", "_cleanup_rooms_task"):
+        for key in ("_cleanup_share_task", "_cleanup_inbox_task", "_cleanup_rooms_task", "_lockdown_broadcast_task"):
             task = app.get(key)
             if task:
                 task.cancel()
