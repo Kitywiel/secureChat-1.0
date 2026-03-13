@@ -933,3 +933,26 @@ select:focus {
 .message.one-time-msg .message-file {
   pointer-events: auto; /* allow clicking to download */
 }
+
+/* ── Drag-and-drop drop zone ────────────────────────────────────────────────── */
+#chat.drag-over::after {
+  content: 'Drop files to attach';
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 1.4rem;
+  font-weight: 700;
+  color: var(--accent);
+  background: rgba(0, 0, 0, 0.55);
+  border: 3px dashed var(--accent);
+  border-radius: 12px;
+  pointer-events: none;
+  z-index: 100;
+}
+
+/* ── In-chat upload progress bar ────────────────────────────────────────────── */
+#chat-upload-progress {
+  margin: 0.25rem 0.75rem;
+}

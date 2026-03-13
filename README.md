@@ -1,9 +1,24 @@
 
 # secureChat-1.0
 
-A lightweight **end-to-end encrypted (E2EE) chat service** that automatically
-creates a **public `.onion` address** so you and your contacts can chat
-privately over Tor — no manual Tor configuration required.
+A **self-hosted, end-to-end encrypted (E2EE) chat service** with automatic
+Tor hidden-service support — your messages never leave your control.
+
+---
+
+## What it is & what it has
+
+| Feature | Detail |
+|---|---|
+| **E2EE messaging** | Every message is encrypted in your browser with AES-GCM-256 before it reaches the server. The server *never* sees plaintext. |
+| **Key derivation** | PBKDF2-SHA-256 with 600 000 iterations (OWASP minimum), salted per room. |
+| **Persistent history** | The last 100 messages per room are stored (encrypted) in a local SQLite database and replayed on join. |
+| **In-chat file attachments** | Attach files up to **50 MB** directly in the chat — they are encrypted end-to-end and relayed over WebSocket. Files between 50 MB and **10 GB** are auto-routed through the secure share system and a download link is posted in chat. Paste images from clipboard or drag-and-drop files onto the chat window. |
+| **Secure file sharing** | A dedicated file-share screen lets you upload files up to **10 GB** each. Files are served from a one-time, token-protected download URL that self-destructs after the first download or expiry (1–24 h). Optional passcode protection. |
+| **Rooms with invite links** | Create a room with a generated invite link, optional room passcode, self-destruct timer (30 min – 24 h), and incoming webhook notifications. |
+| **Admin panel** | Hidden behind a randomly-generated **200-character URL path** and a **100-character passcode** (both printed to the console at startup). Runs on the same port as the chat. Includes live server stats, a live log stream (SSE), incoming webhook support, and an emergency shutdown button. Hardened with rate-limiting, constant-time comparisons, strict CSP, and no-store cache headers. |
+| **Tor hidden service** | One-click setup on Windows (`start_server.bat`) or Linux/macOS (`start_with_tor.py`) — auto-downloads Tor if needed and creates a stable `.onion` address. |
+| **No tracking, no analytics** | Access log is disabled; the server only routes encrypted payloads. |
 
 ---
 
@@ -133,12 +148,17 @@ python server.py
 
 ## Environment variables
 
-| Variable        | Default                          | Description                               |
-|-----------------|----------------------------------|-------------------------------------------|
-| `HOST`          | `127.0.0.1`                      | Interface to bind (keep as-is for Tor)    |
-| `PORT`          | `5000`                           | TCP port                                  |
-| `DB_PATH`       | `securechat.db` (beside `server.py`) | Path to the SQLite message store      |
-| `HISTORY_LIMIT` | `100`                            | Max messages stored and replayed per room |
+| Variable         | Default                              | Description                                                             |
+|------------------|--------------------------------------|-------------------------------------------------------------------------|
+| `HOST`           | `127.0.0.1`                          | Interface to bind (keep as-is for Tor)                                  |
+| `PORT`           | `5000`                               | TCP port                                                                |
+| `DB_PATH`        | `securechat.db` (beside `server.py`) | Path to the SQLite message store                                        |
+| `HISTORY_LIMIT`  | `100`                                | Max messages stored and replayed per room                               |
+| `ADMIN_PATH`     | *(auto-generated 200 chars)*         | Override the admin panel URL path (set this to pin a stable path)       |
+| `ADMIN_PASSCODE` | *(auto-generated 100 chars)*         | Override the admin panel passcode                                       |
+
+Both `ADMIN_PATH` and `ADMIN_PASSCODE` are printed prominently to the console
+on every startup so you always know how to reach the admin panel.
 
 ---
 
@@ -176,16 +196,19 @@ pytest tests/
 
 ## Security model
 
-| Threat                            | Mitigation                                          |
-|-----------------------------------|-----------------------------------------------------|
-| Server reads messages             | Server only sees ciphertext; key never leaves client|
-| Server reads stored history       | SQLite stores only ciphertext; server cannot decrypt|
-| Server logs traffic               | Access log disabled                                 |
-| Weak passphrase                   | PBKDF2-SHA-256, 600 000 iterations                  |
-| IV reuse                          | Fresh `crypto.getRandomValues(12 bytes)` per message|
-| XSS via display names / messages  | All text set via `textContent`, never `innerHTML`   |
-| Path traversal in room IDs        | Allowlist regex `[A-Za-z0-9_-]{1,64}`               |
-| Traffic analysis / metadata       | Tor hidden service hides server IP and user IPs     |
+| Threat                            | Mitigation                                                         |
+|-----------------------------------|--------------------------------------------------------------------|
+| Server reads messages             | Server only sees ciphertext; key never leaves client               |
+| Server reads stored history       | SQLite stores only ciphertext; server cannot decrypt               |
+| Server logs traffic               | Access log disabled                                                |
+| Weak passphrase                   | PBKDF2-SHA-256, 600 000 iterations                                 |
+| IV reuse                          | Fresh `crypto.getRandomValues(12 bytes)` per message               |
+| XSS via display names / messages  | All text set via `textContent`, never `innerHTML`                  |
+| Path traversal in room IDs        | Allowlist regex `[A-Za-z0-9_-]{1,64}`                              |
+| Traffic analysis / metadata       | Tor hidden service hides server IP and user IPs                    |
+| Admin panel discovery             | Hidden behind a 200-char random URL path + 100-char passcode       |
+| Admin brute-force                 | Rate-limited (10 attempts / 60 s per IP); constant-time comparison |
+| Admin clickjacking / injection    | `X-Frame-Options: DENY`, strict CSP, `no-store` cache headers      |
 
 ---
 
@@ -198,8 +221,9 @@ secureChat-1.0/
 ├── start_server.bat     # Windows one-click launcher (calls start_with_tor.py)
 ├── requirements.txt     # Python dependencies
 ├── static/
-│   ├── index.html       # Chat UI (lobby + chat screens)
+│   ├── index.html       # Chat UI (lobby + chat + share screens)
 │   ├── app.js           # E2EE crypto (Web Crypto API) + WebSocket client
+│   ├── admin.html       # Admin panel UI (served at the secret path)
 │   └── style.css        # Dark theme
 └── tests/
     └── test_server.py   # pytest test suite
@@ -212,3 +236,7 @@ tor/        Tor Expert Bundle (Windows auto-download)
 tor_data/   Tor's internal data directory
 tor_hs/     Hidden-service keys + hostname file (.onion address)
 ```
+
+> **Security note:** `tor_hs/` contains the **private key** for your `.onion`
+> address. Back it up to keep a stable address across re-installs.  Never share
+> it — anyone with this key can impersonate your hidden service.

@@ -117,12 +117,19 @@
         </div>
       </div>
 
+      <!-- Progress bar shown while uploading a large file via the share system -->
+      <div id="chat-upload-progress" class="upload-progress hidden" role="progressbar"
+           aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+        <div id="chat-upload-progress-bar" class="upload-progress-fill"></div>
+        <span id="chat-upload-progress-text" class="upload-progress-text"></span>
+      </div>
+
       <form id="message-form" class="message-bar">
         <input type="file" id="chat-file-input" multiple class="hidden" aria-hidden="true" />
         <button type="button" id="attach-btn" class="btn-attach" aria-label="Attach file" disabled>📎</button>
         <textarea
           id="message-input"
-          placeholder="Type a message… (Enter to send, Shift+Enter for new line)"
+          placeholder="Type a message… (Enter to send, Shift+Enter for new line, paste or drag files to attach)"
           maxlength="2048"
           autocomplete="off"
           spellcheck="true"

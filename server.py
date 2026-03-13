@@ -151,7 +151,9 @@ MAX_IV_LEN = 24          # 12 raw bytes → 16 base64 chars; 24 allows padding v
 MAX_CIPHERTEXT_LEN = 8192  # ~6 KiB plaintext after base64 expansion
 
 # In-chat file/image relay limits (files are never persisted)
-MAX_FILE_CIPHERTEXT_LEN = 1_500_000  # base64+AES-GCM limit; ≈1 MiB plaintext before encoding
+# 50 MiB plaintext → ~67 MiB after AES-GCM + base64 encoding; large files are
+# routed through the share system on the client side (no WebSocket involvement).
+MAX_FILE_CIPHERTEXT_LEN = 68_000_000  # base64+AES-GCM limit; ≈50 MiB plaintext before encoding
 MAX_MIME_LEN = 64                    # characters in a MIME type string
 MAX_CHAT_FILENAME_LEN = 200          # characters in an in-chat attachment filename
 

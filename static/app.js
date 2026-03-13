@@ -256,8 +256,15 @@ function appendFileMessage(sender, filename, mime, bytes, kind, timestamp = null
   log.scrollTop = log.scrollHeight;
 }
 
-/** Maximum in-chat attachment size in bytes (1 MiB = 1 048 576 bytes). */
-const MAX_CHAT_FILE_BYTES = 1_048_576;
+/**
+ * Maximum in-chat attachment size for the E2EE WebSocket path (50 MiB).
+ * After AES-GCM encryption + base64 encoding the ciphertext is ~67 MB —
+ * matching the server-side MAX_FILE_CIPHERTEXT_LEN (68 MB) limit.
+ */
+const MAX_CHAT_FILE_BYTES = 50 * 1024 * 1024;
+
+/** Maximum in-chat attachment size for the share-upload path (10 GiB). */
+const MAX_CHAT_SHARE_BYTES = 10 * 1024 * 1024 * 1024;
 
 /**
  * Safe image MIME types rendered inline as <img>.
@@ -268,7 +275,9 @@ const SAFE_IMAGE_MIMES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image
 
 /**
  * Encrypt and send a file over the current WebSocket connection.
- * Shows the file locally (outgoing) immediately without waiting for relay echo.
+ * Files ≤ 50 MB are encrypted client-side (E2EE) and relayed as-is.
+ * Files > 50 MB and ≤ 10 GB are uploaded through the share system and a
+ * download link is posted in the chat.
  *
  * @param {File}    file
  * @param {boolean} [nsfw]    Mark as NSFW
@@ -277,11 +286,18 @@ const SAFE_IMAGE_MIMES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image
 async function sendFile(file, nsfw = false, oneTime = false) {
   if (!roomKey || !ws || ws.readyState !== WebSocket.OPEN) return;
 
-  if (file.size > MAX_CHAT_FILE_BYTES) {
-    appendMessage('⚠️', `File too large — max 1 MB per attachment (${file.name})`, 'error');
+  if (file.size > MAX_CHAT_SHARE_BYTES) {
+    appendMessage('⚠️', `File too large — max 10 GB per attachment (${file.name})`, 'error');
     return;
   }
 
+  // ── Large file path: upload via share system, post link in chat ───────────
+  if (file.size > MAX_CHAT_FILE_BYTES) {
+    await _sendLargeFileViaShare(file);
+    return;
+  }
+
+  // ── Small file path: E2EE via WebSocket ───────────────────────────────────
   const mime     = file.type || 'application/octet-stream';
   const filename = file.name || 'file';
   const bytes    = new Uint8Array(await file.arrayBuffer());
@@ -292,6 +308,71 @@ async function sendFile(file, nsfw = false, oneTime = false) {
 
   // Render own attachment immediately
   appendFileMessage(displayName, filename, mime, bytes, 'outgoing', null, nsfw, oneTime);
+}
+
+/**
+ * Upload a large file through the share system and post the download link
+ * as an encrypted chat message so all room members can access it.
+ *
+ * @param {File} file
+ */
+async function _sendLargeFileViaShare(file) {
+  const chatProgress    = document.getElementById('chat-upload-progress');
+  const chatProgressBar = document.getElementById('chat-upload-progress-bar');
+  const chatProgressTxt = document.getElementById('chat-upload-progress-text');
+
+  function setProgress(pct, label) {
+    chatProgress.classList.remove('hidden');
+    chatProgress.setAttribute('aria-valuenow', String(pct));
+    chatProgressBar.style.width = pct + '%';
+    chatProgressTxt.textContent = label;
+  }
+  function hideProgress() {
+    chatProgress.classList.add('hidden');
+    chatProgressBar.style.width = '0%';
+    chatProgressTxt.textContent = '';
+  }
+
+  appendMessage('📤', `Uploading ${file.name} (${_fmtFileSize(file.size)})…`, 'system');
+  setProgress(0, `${file.name} — 0%`);
+
+  try {
+    const formData = new FormData();
+    formData.append('file', file);
+
+    const result = await uploadWithProgress('/share/upload?ttl=24', formData, (pct) => {
+      setProgress(pct, `${file.name} — ${pct}%`);
+    });
+
+    hideProgress();
+
+    if (!result.ok) {
+      const reason = await result.text().catch(() => '');
+      appendMessage('⚠️', `Upload failed: ${reason || result.status}`, 'error');
+      return;
+    }
+
+    const data = await result.json();
+    const downloadUrl = `${location.origin}${data.download_url}`;
+    const sizeLabel   = _fmtFileSize(data.size ?? file.size);
+
+    // Post the download link as a regular encrypted chat message
+    const linkText = `📎 ${file.name} (${sizeLabel}) — ${downloadUrl}`;
+    const { iv, ciphertext } = await encryptMessage(roomKey, linkText);
+    ws.send(JSON.stringify({ type: 'message', iv, ciphertext, sender: displayName }));
+    appendMessage(displayName, linkText, 'outgoing');
+  } catch (err) {
+    hideProgress();
+    appendMessage('⚠️', `Upload failed: ${err.message}`, 'error');
+  }
+}
+
+/** Format a byte count as a human-readable string. */
+function _fmtFileSize(bytes) {
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1048576) return (bytes / 1024).toFixed(1) + ' KB';
+  if (bytes < 1073741824) return (bytes / 1048576).toFixed(1) + ' MB';
+  return (bytes / 1073741824).toFixed(2) + ' GB';
 }
 
 // ─── UI helpers ───────────────────────────────────────────────────────────────
@@ -772,6 +853,65 @@ document.getElementById('chat-file-input').addEventListener('change', (e) => {
   input.value = ''; // reset so the same file can be re-selected
   updateFilePreview();
 });
+
+// ─── Paste to attach ─────────────────────────────────────────────────────────
+// Pasting an image or file while the message input (or chat screen) is focused
+// queues it as a pending attachment instead of inserting raw data into the text.
+document.getElementById('message-input').addEventListener('paste', (e) => {
+  const items = e.clipboardData?.items;
+  if (!items) return;
+  const files = [];
+  for (const item of items) {
+    if (item.kind === 'file') {
+      const file = item.getAsFile();
+      if (file) files.push(file);
+    }
+  }
+  if (files.length === 0) return;
+  e.preventDefault(); // don't paste raw bytes as text
+  for (const file of files) {
+    pendingFiles.push(file);
+  }
+  updateFilePreview();
+});
+
+// ─── Drag-and-drop to attach ─────────────────────────────────────────────────
+// Dragging files onto the chat screen (messages area or message bar) queues
+// them as pending attachments and shows a visual drop-zone highlight.
+(function () {
+  const chatScreen = document.getElementById('chat');
+
+  chatScreen.addEventListener('dragenter', (e) => {
+    if (!e.dataTransfer?.types?.includes('Files')) return;
+    e.preventDefault();
+    chatScreen.classList.add('drag-over');
+  });
+
+  chatScreen.addEventListener('dragover', (e) => {
+    if (!e.dataTransfer?.types?.includes('Files')) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'copy';
+  });
+
+  chatScreen.addEventListener('dragleave', (e) => {
+    // Only remove the highlight when leaving the chat screen entirely
+    // (not when moving between child elements).
+    if (!chatScreen.contains(/** @type {Element} */ (e.relatedTarget))) {
+      chatScreen.classList.remove('drag-over');
+    }
+  });
+
+  chatScreen.addEventListener('drop', (e) => {
+    e.preventDefault();
+    chatScreen.classList.remove('drag-over');
+    const files = e.dataTransfer?.files;
+    if (!files?.length) return;
+    for (const file of files) {
+      pendingFiles.push(file);
+    }
+    updateFilePreview();
+  });
+}());
 
 // Delete room button — removes all room data from the server and leaves.
 document.getElementById('delete-room-btn').addEventListener('click', async () => {
