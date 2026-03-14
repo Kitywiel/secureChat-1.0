@@ -2757,3 +2757,217 @@ def test_join_mesh_peer_retries_on_failure(capsys) -> None:
     assert call_count == 3  # exactly 3 attempts
     captured = capsys.readouterr()
     assert "failed after 3 attempts" in captured.out
+
+
+# ---------------------------------------------------------------------------
+# Mesh forward security tests
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_mesh_forward_rejects_non_json_content_type(ws_client) -> None:
+    """POST /mesh/peer/forward returns 415 when Content-Type is not application/json."""
+    import server as _s
+    _s._mesh_peers.clear()
+    resp = await ws_client.post(
+        "/mesh/peer/forward",
+        data=b'{"token":"x","room_id":"r1","payload":"{}"}',
+        headers={"Content-Type": "text/plain"},
+    )
+    assert resp.status == 415
+
+
+@pytest.mark.asyncio
+async def test_mesh_forward_rejects_invalid_room_id(ws_client) -> None:
+    """POST /mesh/peer/forward returns 400 when room_id contains illegal characters."""
+    import server as _s
+    # Register a fake peer so the token check passes
+    fake_token = "test_token_for_room_id_test_12345"
+    _s._mesh_peers["fakepeer"] = {"token": fake_token, "url": "http://x", "connected_at": 0}
+    try:
+        resp = await ws_client.post(
+            "/mesh/peer/forward",
+            json={"token": fake_token, "room_id": "../../etc/passwd", "payload": "{}"},
+        )
+        assert resp.status == 400
+    finally:
+        _s._mesh_peers.pop("fakepeer", None)
+
+
+@pytest.mark.asyncio
+async def test_mesh_forward_rejects_oversized_room_id(ws_client) -> None:
+    """POST /mesh/peer/forward returns 400 when room_id exceeds MAX_MESH_ROOM_ID_LEN."""
+    import server as _s
+    fake_token = "test_token_for_long_room_id_12345"
+    _s._mesh_peers["fakepeer2"] = {"token": fake_token, "url": "http://x", "connected_at": 0}
+    try:
+        resp = await ws_client.post(
+            "/mesh/peer/forward",
+            json={"token": fake_token, "room_id": "a" * 200, "payload": "{}"},
+        )
+        assert resp.status == 400
+    finally:
+        _s._mesh_peers.pop("fakepeer2", None)
+
+
+# ---------------------------------------------------------------------------
+# .env loader tests (run.py)
+# ---------------------------------------------------------------------------
+
+def test_load_dotenv_sets_env_vars(tmp_path) -> None:
+    """_load_dotenv() reads KEY=VALUE pairs and sets them in os.environ."""
+    import sys
+    import os
+    import importlib
+
+    dotenv = tmp_path / ".env"
+    dotenv.write_text("TEST_SC_VAR1=hello\nTEST_SC_VAR2=world\n", encoding="utf-8")
+
+    # Patch _DOTENV inside run module and reload _load_dotenv behaviour
+    sys.path.insert(0, str(tmp_path.parent.parent))
+
+    # Import run module (already imported earlier in tests, so just call the loader)
+    import run as _run
+    original_dotenv = _run._DOTENV
+    _run._DOTENV = dotenv
+
+    # Remove any pre-existing values
+    os.environ.pop("TEST_SC_VAR1", None)
+    os.environ.pop("TEST_SC_VAR2", None)
+    try:
+        _run._load_dotenv()
+        assert os.environ.get("TEST_SC_VAR1") == "hello"
+        assert os.environ.get("TEST_SC_VAR2") == "world"
+    finally:
+        _run._DOTENV = original_dotenv
+        os.environ.pop("TEST_SC_VAR1", None)
+        os.environ.pop("TEST_SC_VAR2", None)
+
+
+def test_load_dotenv_does_not_overwrite_existing_vars(tmp_path) -> None:
+    """_load_dotenv() does not overwrite existing environment variables."""
+    import os
+    import run as _run
+
+    dotenv = tmp_path / ".env"
+    dotenv.write_text("TEST_SC_NOOVER=original\n", encoding="utf-8")
+
+    os.environ["TEST_SC_NOOVER"] = "already_set"
+    original_dotenv = _run._DOTENV
+    _run._DOTENV = dotenv
+    try:
+        _run._load_dotenv()
+        assert os.environ["TEST_SC_NOOVER"] == "already_set"
+    finally:
+        _run._DOTENV = original_dotenv
+        os.environ.pop("TEST_SC_NOOVER", None)
+
+
+def test_load_dotenv_ignores_comments_and_blank_lines(tmp_path) -> None:
+    """_load_dotenv() skips comment lines and blank lines."""
+    import os
+    import run as _run
+
+    dotenv = tmp_path / ".env"
+    dotenv.write_text(
+        "# This is a comment\n\nTEST_SC_VALID=yes\n# Another comment\n",
+        encoding="utf-8",
+    )
+    os.environ.pop("TEST_SC_VALID", None)
+    original_dotenv = _run._DOTENV
+    _run._DOTENV = dotenv
+    try:
+        _run._load_dotenv()
+        assert os.environ.get("TEST_SC_VALID") == "yes"
+    finally:
+        _run._DOTENV = original_dotenv
+        os.environ.pop("TEST_SC_VALID", None)
+
+
+def test_load_dotenv_strips_quotes(tmp_path) -> None:
+    """_load_dotenv() strips surrounding quotes from values."""
+    import os
+    import run as _run
+
+    dotenv = tmp_path / ".env"
+    dotenv.write_text('TEST_SC_QUOTED="my value"\nTEST_SC_SINGLE=\'other\'\n', encoding="utf-8")
+    os.environ.pop("TEST_SC_QUOTED", None)
+    os.environ.pop("TEST_SC_SINGLE", None)
+    original_dotenv = _run._DOTENV
+    _run._DOTENV = dotenv
+    try:
+        _run._load_dotenv()
+        assert os.environ.get("TEST_SC_QUOTED") == "my value"
+        assert os.environ.get("TEST_SC_SINGLE") == "other"
+    finally:
+        _run._DOTENV = original_dotenv
+        os.environ.pop("TEST_SC_QUOTED", None)
+        os.environ.pop("TEST_SC_SINGLE", None)
+
+
+# ---------------------------------------------------------------------------
+# Tor path detection tests (run.py)
+# ---------------------------------------------------------------------------
+
+def test_find_tor_returns_tor_env_path(tmp_path) -> None:
+    """_find_tor() returns the TOR_PATH env override when it points to a valid file."""
+    import os
+    import run as _run
+
+    fake_tor = tmp_path / "mytor"
+    fake_tor.touch()
+    original = os.environ.get("TOR_PATH")
+    os.environ["TOR_PATH"] = str(fake_tor)
+    try:
+        result = _run._find_tor()
+        assert result == fake_tor
+    finally:
+        if original is None:
+            os.environ.pop("TOR_PATH", None)
+        else:
+            os.environ["TOR_PATH"] = original
+
+
+def test_find_tor_ignores_invalid_tor_env_path(monkeypatch) -> None:
+    """_find_tor() ignores TOR_PATH when it does not point to a real file."""
+    import run as _run
+    monkeypatch.setenv("TOR_PATH", "/nonexistent/path/to/tor")
+    # Should fall through to other detection methods without raising
+    # (result may be None or a real tor; we just assert no exception)
+    try:
+        _run._find_tor()
+    except Exception as exc:  # noqa: BLE001
+        pytest.fail(f"_find_tor raised unexpectedly: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# Shared-file download security headers tests
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_share_download_sets_nosniff_header(ws_client, tmp_path) -> None:
+    """GET /share/download/{token} response includes X-Content-Type-Options: nosniff."""
+    import server as _s
+    import time as _time
+    import secrets as _secrets
+
+    token = _secrets.token_urlsafe(32)
+    td = tmp_path / token
+    td.mkdir()
+    f = td / "test.txt"
+    f.write_bytes(b"hello world")
+
+    _s._share_slots[token] = {
+        "tmp_dir": td,
+        "filename": "test.txt",
+        "size": 11,
+        "passcode_hash": None,
+        "expires_at": _time.time() + 3600,
+    }
+    try:
+        resp = await ws_client.get(f"/share/download/{token}")
+        assert resp.status == 200
+        assert resp.headers.get("X-Content-Type-Options") == "nosniff"
+        assert resp.headers.get("Content-Type") == "application/octet-stream"
+        assert "attachment" in resp.headers.get("Content-Disposition", "")
+    finally:
+        _s._share_slots.pop(token, None)

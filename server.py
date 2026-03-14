@@ -198,6 +198,13 @@ _SHARE_TOKEN_BYTES = 32                      # 256-bit token → 43-char URL-saf
 # Inbox constants
 _INBOX_TOKEN_BYTES = 16                      # 128-bit token → ~22-char URL-safe base64 local part
 MAX_INBOX_MESSAGE_LEN = 65536                # max bytes per message body
+
+# Mesh peer security constants
+# Limit the size of payloads that a remote peer can send to prevent amplification
+# attacks and memory exhaustion.  The payload is a JSON-encoded chat message which
+# is at most a few hundred KiB even for in-chat file transfers.
+MAX_MESH_PAYLOAD_LEN = 100_000_000          # 100 MiB hard cap on the raw payload string
+MAX_MESH_ROOM_ID_LEN = MAX_ROOM_ID_LEN      # reuse same room-id limit
 INBOX_MIN_TTL_MINUTES = 1                    # minimum lifetime in minutes
 INBOX_MAX_TTL_MINUTES = 1440                 # maximum lifetime in minutes (24 h)
 INBOX_DEFAULT_TTL_MINUTES = 60              # default lifetime in minutes
@@ -925,6 +932,7 @@ async def _stream_share_file(
                 "Content-Disposition": f'attachment; filename="{filename}"',
                 "Content-Type": "application/octet-stream",
                 "Content-Length": str(size),
+                "X-Content-Type-Options": "nosniff",
             }
         )
         await response.prepare(request)
@@ -2555,11 +2563,27 @@ async def mesh_peer_forward_handler(request: web.Request) -> web.Response:
             "room_id": "…",
             "payload": "<JSON string of the message>"
         }
+
+    Security controls
+    -----------------
+    * The sender token must match a registered peer — prevents unauthenticated writes.
+    * room_id is validated against ``MAX_MESH_ROOM_ID_LEN`` — prevents oversized keys.
+    * payload is capped at ``MAX_MESH_PAYLOAD_LEN`` bytes — prevents memory exhaustion.
+    * The payload is passed to ``_broadcast_to_room`` with ``_from_peer=True`` which
+      prevents re-forwarding back to peers (no broadcast loops).
+    * The content type of the request body must be ``application/json`` to prevent
+      accidental command injection via other content types.
     """
+    if not request.content_type.startswith("application/json"):
+        raise web.HTTPUnsupportedMediaType(reason="Content-Type must be application/json")
+
     try:
         body = await request.json()
     except Exception:
         raise web.HTTPBadRequest(reason="JSON body required")
+
+    if not isinstance(body, dict):
+        raise web.HTTPBadRequest(reason="JSON object required")
 
     # Verify the sender is a registered peer (their token must match one we know)
     provided_token = str(body.get("token", ""))
@@ -2572,8 +2596,18 @@ async def mesh_peer_forward_handler(request: web.Request) -> web.Response:
 
     room_id = str(body.get("room_id", "")).strip()
     payload = str(body.get("payload", "")).strip()
-    if not room_id or not payload:
-        raise web.HTTPBadRequest(reason="room_id and payload required")
+
+    # Enforce size limits to prevent amplification / memory exhaustion
+    if not room_id or len(room_id) > MAX_MESH_ROOM_ID_LEN:
+        raise web.HTTPBadRequest(reason="Invalid room_id")
+    if not payload or len(payload) > MAX_MESH_PAYLOAD_LEN:
+        raise web.HTTPBadRequest(reason="payload missing or too large")
+
+    # Validate that room_id only contains safe characters (alphanumeric + limited punctuation)
+    # This prevents path traversal and injection via the room identifier.
+    import re as _re  # noqa: PLC0415
+    if not _re.fullmatch(r"[A-Za-z0-9_\-]{1,64}", room_id):
+        raise web.HTTPBadRequest(reason="Invalid room_id format")
 
     await _broadcast_to_room(room_id, payload, _from_peer=True)
     return web.json_response({"ok": True})

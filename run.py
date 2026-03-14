@@ -5,11 +5,12 @@ run.py — secureChat zero-config launcher
 Run this single file.  It handles everything automatically:
 
   1. Installs missing Python dependencies.
-  2. Starts Tor and creates a public .onion hidden service
+  2. Loads optional .env file (if present next to run.py).
+  3. Starts Tor and creates a public .onion hidden service
      (downloads the Tor Expert Bundle on Windows if needed).
-  3. Generates a random RELAY_SECRET for the IP-private SMTP relay endpoint.
-  4. Starts the secureChat server.
-  5. Prints a startup summary with every URL you need.
+  4. Generates a random RELAY_SECRET for the IP-private SMTP relay endpoint.
+  5. Starts the secureChat server.
+  6. Prints a startup summary with every URL you need.
 
 Usage
 -----
@@ -24,6 +25,13 @@ Environment overrides (all optional — every default works out-of-the-box)
     RELAY_SECRET   SMTP relay webhook secret      (auto-generated when not set)
     MAIL_DOMAIN    Your real mail domain for SMTP (optional; needed for port-25 SMTP)
     SMTP_PORT      SMTP listen port               (default: 25)
+    MESH_JOIN      URL of a remote peer to auto-join at startup (optional)
+    MESH_TOKEN     MESH_TOKEN of the remote peer  (required when MESH_JOIN is set)
+    NO_TOR         Set to '1' to skip Tor even if installed (optional)
+    TOR_PATH       Override path to the tor binary (optional)
+
+All of the above can also be set in a .env file placed next to run.py.
+The .env file is loaded once at startup; command-line flags take precedence.
 
 No other configuration is needed.
 """
@@ -49,6 +57,7 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 _HERE = Path(__file__).resolve().parent
 _REQUIREMENTS = _HERE / "requirements.txt"
+_DOTENV       = _HERE / ".env"
 
 # Tor paths (mirrors start_with_tor.py so they share the same downloaded bundle)
 _TOR_DIR      = _HERE / "tor"
@@ -61,6 +70,31 @@ _TOR_BUNDLE_URL = (
     f"https://dist.torproject.org/torbrowser/{_TOR_VERSION}/"
     f"tor-expert-bundle-windows-x86_64-{_TOR_VERSION}.tar.gz"
 )
+
+# ---------------------------------------------------------------------------
+# .env loader — loads KEY=VALUE pairs from .env file (if present)
+# Existing environment variables are NOT overwritten.
+# ---------------------------------------------------------------------------
+
+def _load_dotenv() -> None:
+    """Load a .env file next to run.py into os.environ (non-overwriting)."""
+    if not _DOTENV.is_file():
+        return
+    try:
+        for raw in _DOTENV.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, val = line.partition("=")
+            key = key.strip()
+            val = val.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = val
+    except OSError:
+        pass  # .env unreadable — silently skip
+
+_load_dotenv()
+
 
 # ---------------------------------------------------------------------------
 # Step 1 — Auto-install dependencies
@@ -96,27 +130,65 @@ def _ensure_dependencies() -> None:
 # ---------------------------------------------------------------------------
 
 def _find_tor() -> Path | None:
-    """Return the path to a usable tor executable, or None."""
+    """Return the path to a usable tor executable, or None.
+
+    Search order:
+      1. TOR_PATH env var (absolute path override).
+      2. Local bundle — tor/ sub-directory next to run.py.
+      3. System PATH via shutil.which.
+      4. Common installation locations on Linux, macOS, and Windows.
+    """
+    # 1. Explicit override
+    tor_env = os.environ.get("TOR_PATH", "").strip()
+    if tor_env:
+        p = Path(tor_env)
+        if p.is_file():
+            return p
+
+    # 2. Local bundled tor
     for rel in ["tor/Tor/tor.exe", "tor/tor.exe", "tor/tor"]:
         p = _HERE / rel
         if p.is_file():
             return p
+
+    # 3. PATH
     found = shutil.which("tor")
     if found:
         return Path(found)
-    if platform.system() == "Windows":
+
+    # 4. Common system-wide paths (Linux / macOS / Windows)
+    candidates: list[Path] = []
+    system = platform.system()
+
+    if system in ("Linux", "Darwin"):
+        candidates.extend([
+            Path("/usr/bin/tor"),
+            Path("/usr/local/bin/tor"),
+            Path("/usr/sbin/tor"),
+            Path("/opt/homebrew/bin/tor"),          # Homebrew Apple Silicon
+            Path("/opt/local/bin/tor"),              # MacPorts
+            Path("/snap/bin/tor"),                   # Snap on Ubuntu
+            Path("/usr/lib/tor/tor"),
+            Path("/usr/libexec/tor/tor"),
+        ])
+
+    if system == "Windows":
         home = Path.home()
         username = os.environ.get("USERNAME", "")
-        for c in [
+        candidates.extend([
             home / "Desktop" / "Tor Browser" / "Browser" / "TorBrowser" / "Tor" / "tor.exe",
             Path(f"C:/Users/{username}/Desktop/Tor Browser/Browser/TorBrowser/Tor/tor.exe"),
             Path("C:/Program Files/Tor Browser/Browser/TorBrowser/Tor/tor.exe"),
-        ]:
-            try:
-                if c.is_file():
-                    return c
-            except (OSError, ValueError):
-                pass
+            Path("C:/Program Files (x86)/Tor Browser/Browser/TorBrowser/Tor/tor.exe"),
+        ])
+
+    for c in candidates:
+        try:
+            if c.is_file():
+                return c
+        except (OSError, ValueError):
+            pass
+
     return None
 
 
@@ -131,6 +203,12 @@ def _download_tor_windows() -> Path | None:
         urllib.request.urlretrieve(_TOR_BUNDLE_URL, archive)
     except urllib.error.URLError as exc:
         print(f"  Download failed: {exc}")
+        print("  Tip: ensure you have internet access and torproject.org is not blocked.")
+        print(f"  You can also manually download the Tor Expert Bundle and place tor.exe at:")
+        print(f"    {_TOR_DIR / 'Tor' / 'tor.exe'}  or  {_TOR_DIR / 'tor.exe'}")
+        return None
+    except Exception as exc:  # noqa: BLE001
+        print(f"  Download failed (unexpected error): {exc}")
         return None
 
     # SHA-256 verification
@@ -452,17 +530,22 @@ def _join_mesh_peer(
 def main() -> None:
     parser = argparse.ArgumentParser(description="secureChat zero-config launcher")
     parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", "5000")))
-    parser.add_argument("--no-tor", action="store_true", help="Skip Tor even if installed")
+    parser.add_argument(
+        "--no-tor",
+        action="store_true",
+        default=(os.environ.get("NO_TOR", "").strip() in ("1", "true", "yes")),
+        help="Skip Tor even if installed",
+    )
     parser.add_argument(
         "--mesh-join",
         metavar="URL",
-        default="",
+        default=os.environ.get("MESH_JOIN", ""),
         help="Connect to a remote peer's /mesh/peer/connect URL",
     )
     parser.add_argument(
         "--mesh-token",
         metavar="TOKEN",
-        default="",
+        default=os.environ.get("MESH_TOKEN", ""),
         help="MESH_TOKEN of the remote server (required with --mesh-join)",
     )
     args = parser.parse_args()
@@ -496,7 +579,8 @@ def main() -> None:
     onion: str | None = None
     tor_process = None
 
-    if not args.no_tor:
+    skip_tor = args.no_tor or (os.environ.get("NO_TOR", "").strip() in ("1", "true", "yes"))
+    if not skip_tor:
         print()
         tor_exe = _find_tor()
         if not tor_exe:
@@ -514,6 +598,8 @@ def main() -> None:
         else:
             print("  Tor not available — using LAN access.")
             print("  Install Tor from https://torproject.org for a public .onion address.")
+            print("  On Linux: sudo apt install tor  /  brew install tor  (macOS)")
+            print(f"  Or set TOR_PATH=/path/to/tor in your .env file.")
 
     if not onion:
         # No Tor — bind to all interfaces so LAN devices can connect
