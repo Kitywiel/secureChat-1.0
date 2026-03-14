@@ -976,3 +976,21 @@ select:focus {
   color: #d4a76f;
   border: 1px solid #6a4a2d;
 }
+
+/* ── Slow-mode banner ───────────────────────────────────────────────────── */
+#slow-mode-banner {
+  display: none;
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 9999;
+  background: #b45309;
+  color: #fff;
+  text-align: center;
+  padding: 7px 12px;
+  font-size: 0.85rem;
+  font-family: 'Courier New', monospace;
+  letter-spacing: 0.04em;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.4);
+}

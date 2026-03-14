@@ -97,6 +97,76 @@ _load_dotenv()
 
 
 # ---------------------------------------------------------------------------
+# Step 0 — Auto-update: git pull (opt-in via AUTO_UPDATE=1 in .env)
+# ---------------------------------------------------------------------------
+
+def _auto_update() -> None:
+    """Pull the latest code from the remote git repository.
+
+    Enabled by setting ``AUTO_UPDATE=1`` (or ``true`` / ``yes``) in ``.env``
+    or in the shell environment.  Disabled by default so that users who run
+    from a custom checkout or without git are never surprised.
+
+    The update is a best-effort operation:
+    * If ``git`` is not installed or the working directory is not a git repo,
+      a warning is printed and the server starts normally.
+    * If ``git pull`` fails for any reason (merge conflicts, network error, …)
+      a warning is printed and the server starts normally.
+    * If new files were pulled, the user is notified and asked to restart
+      manually — the server continues with the pre-update code for safety.
+    """
+    enabled = os.environ.get("AUTO_UPDATE", "").strip().lower() in ("1", "true", "yes")
+    if not enabled:
+        return
+
+    print("  AUTO_UPDATE enabled — checking for updates via git …")
+
+    # Confirm we are inside a git repository
+    git_dir = _HERE / ".git"
+    if not git_dir.is_dir():
+        print("  WARNING: AUTO_UPDATE=1 but this directory is not a git repository — skipping.")
+        return
+
+    # Confirm git binary is available
+    git_bin = shutil.which("git")
+    if not git_bin:
+        print("  WARNING: AUTO_UPDATE=1 but 'git' was not found on PATH — skipping.")
+        return
+
+    try:
+        result = subprocess.run(
+            [git_bin, "pull", "--ff-only"],
+            capture_output=True,
+            text=True,
+            cwd=str(_HERE),
+            timeout=30,
+        )
+    except subprocess.TimeoutExpired:
+        print("  WARNING: git pull timed out — starting with existing code.")
+        return
+    except Exception as exc:  # noqa: BLE001
+        print(f"  WARNING: git pull failed ({exc}) — starting with existing code.")
+        return
+
+    if result.returncode != 0:
+        print(
+            "  WARNING: git pull reported an error — starting with existing code.\n"
+            f"           {result.stderr.strip()[:200]}"
+        )
+        return
+
+    output = result.stdout.strip()
+    if output and output != "Already up to date.":
+        print(f"  ✅  Repository updated:\n    {output}")
+        print(
+            "\n  ⚠️  New files were pulled.  Restart run.py to apply the updates.\n"
+            "       The server will now start with the pre-update code.\n"
+        )
+    else:
+        print("  Already up to date.")
+
+
+# ---------------------------------------------------------------------------
 # Step 1 — Auto-install dependencies
 # ---------------------------------------------------------------------------
 
@@ -557,6 +627,9 @@ def main() -> None:
     print("  secureChat — zero-config launcher")
     print("=" * 66)
     print()
+
+    # ── 0. Auto-update (git pull) if enabled ─────────────────────────
+    _auto_update()
 
     # ── 1. Dependencies ──────────────────────────────────────────────
     _ensure_dependencies()

@@ -1727,3 +1727,17 @@ function escHtml(s) {
 
 // On page load, pre-fill the join form from any invite link fragment
 applyFragmentToJoinForm();
+
+// ─── Slow-mode banner ─────────────────────────────────────────────────────────
+// Poll /api/slow-mode every 10 s to show or hide the persistent amber banner.
+const _refreshSlowModeBanner = () => {
+  fetch('/api/slow-mode', { cache: 'no-store' })
+    .then(r => r.ok ? r.json() : null)
+    .then(d => {
+      const b = document.getElementById('slow-mode-banner');
+      if (b) b.style.display = (d && d.active) ? 'block' : 'none';
+    })
+    .catch(() => {});
+};
+_refreshSlowModeBanner();
+setInterval(_refreshSlowModeBanner, 10000);

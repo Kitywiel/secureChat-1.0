@@ -563,6 +563,46 @@ def _spam_get_stats() -> dict:
         "active_mail_senders_tracked": len(_spam_mail_timestamps),
     }
 
+
+# ---------------------------------------------------------------------------
+# Slow mode — admin-controlled global request delay
+# ---------------------------------------------------------------------------
+# Configurable via environment variables:
+#   SLOW_MODE         – start in slow mode ("1" / "true" / "yes"); default off
+#   SLOW_MODE_DELAY   – delay in seconds applied to each request (default 2.0)
+
+SLOW_MODE_DELAY: float = float(os.environ.get("SLOW_MODE_DELAY", "2.0"))
+
+# Current state — can be toggled at runtime via the admin API
+_slow_mode_active: bool = os.environ.get("SLOW_MODE", "").strip().lower() in ("1", "true", "yes")
+
+
+@web.middleware
+async def _slow_mode_middleware(request: web.Request, handler):
+    """Introduce a configurable delay on every non-admin request when slow mode is active."""
+    if not _slow_mode_active:
+        return await handler(request)
+
+    # Let admin routes and static assets pass through undelayed so the admin
+    # panel remains fully usable even when slow mode is active.
+    path = request.path.rstrip("/")
+    admin_prefix = f"/{_ADMIN_PATH}"
+    if path.startswith(admin_prefix) or path == admin_prefix:
+        return await handler(request)
+    if path.startswith("/static"):
+        return await handler(request)
+
+    await asyncio.sleep(SLOW_MODE_DELAY)
+    return await handler(request)
+
+
+def _slow_mode_status() -> dict:
+    """Return a JSON-serialisable snapshot of slow mode state."""
+    return {
+        "active": _slow_mode_active,
+        "delay_sec": SLOW_MODE_DELAY,
+    }
+
 # ---------------------------------------------------------------------------
 # Global statistics counters
 # ---------------------------------------------------------------------------
@@ -2467,6 +2507,45 @@ async def _admin_ddos_unban_handler(request: web.Request) -> web.Response:
     return resp
 
 
+async def _slow_mode_status_handler(request: web.Request) -> web.Response:
+    """GET /api/slow-mode — public endpoint that returns current slow-mode state.
+
+    This endpoint intentionally requires NO authentication so that the chat
+    frontend can poll it to show or hide the slow-mode banner.
+    """
+    resp = web.json_response(_slow_mode_status())
+    _add_admin_security_headers(resp)
+    return resp
+
+
+async def _admin_slow_mode_handler(request: web.Request) -> web.Response:
+    """POST /{admin_path}/api/slow-mode — toggle slow mode on or off.
+
+    Body (optional): ``{"active": true}`` to force a specific state.
+    Without a body the current state is flipped.
+    Requires an active admin session.
+    """
+    global _slow_mode_active  # noqa: PLW0603
+    if not _valid_admin_session(request):
+        raise web.HTTPUnauthorized()
+
+    try:
+        body = await request.json()
+        if "active" in body:
+            _slow_mode_active = bool(body["active"])
+        else:
+            _slow_mode_active = not _slow_mode_active
+    except Exception:
+        # No body or invalid JSON — just toggle
+        _slow_mode_active = not _slow_mode_active
+
+    state = "enabled" if _slow_mode_active else "disabled"
+    logger.warning("SLOW MODE %s via admin panel", state.upper())
+    resp = web.json_response(_slow_mode_status())
+    _add_admin_security_headers(resp)
+    return resp
+
+
 async def _admin_shutdown_handler(request: web.Request) -> web.Response:
     """POST /{path}/api/shutdown — emergency shutdown."""
     if not _valid_admin_session(request):
@@ -2643,6 +2722,7 @@ def _register_admin_routes(app: web.Application) -> None:
     app.router.add_get(f"/{p}/api/lockdown", _admin_lockdown_status_handler)
     app.router.add_get(f"/{p}/api/ddos-stats", _admin_ddos_stats_handler)
     app.router.add_post(f"/{p}/api/ddos-unban", _admin_ddos_unban_handler)
+    app.router.add_post(f"/{p}/api/slow-mode", _admin_slow_mode_handler)
 
 
 # ---------------------------------------------------------------------------
@@ -2784,6 +2864,7 @@ def build_admin_app() -> web.Application:
     app.router.add_get("/admin/api/lockdown", _admin_lockdown_status_handler)
     app.router.add_get("/admin/api/ddos-stats", _admin_ddos_stats_handler)
     app.router.add_post("/admin/api/ddos-unban", _admin_ddos_unban_handler)
+    app.router.add_post("/admin/api/slow-mode", _admin_slow_mode_handler)
     return app
 
 
@@ -2962,7 +3043,7 @@ def build_app(db_path: Path | None = None) -> web.Application:
     # Allow up to MAX_UPLOAD_BYTES for multipart uploads
     app = web.Application(
         client_max_size=MAX_UPLOAD_BYTES,
-        middlewares=[_ddos_middleware, _lockdown_middleware],
+        middlewares=[_ddos_middleware, _slow_mode_middleware, _lockdown_middleware],
     )
     app["db_path"] = resolved_db
 
@@ -3032,6 +3113,7 @@ def build_app(db_path: Path | None = None) -> web.Application:
     app.router.add_post("/room/{room_id}/delete", room_delete_handler)
     app.router.add_get("/api/server-info", server_info_handler)
     app.router.add_get("/api/qrcode", qrcode_handler)
+    app.router.add_get("/api/slow-mode", _slow_mode_status_handler)
     app.router.add_post("/share/upload", share_upload_handler)
     app.router.add_get("/share/download/{token}", share_download_handler)
     app.router.add_post("/share/download/{token}", share_download_post_handler)
