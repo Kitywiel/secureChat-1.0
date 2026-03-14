@@ -47,6 +47,7 @@ import socket
 import subprocess
 import sys
 import tarfile
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -373,9 +374,17 @@ def _start_tor(tor_exe: Path, server_port: int) -> tuple[str, object] | None:
     config.update(_find_geoip_files(tor_exe))
 
     tor_process = None
+    _tmp_data_dir: str | None = None
     for attempt in range(3):
         if attempt > 0:
             config["ControlPort"] = str(_free_port())
+            # On retry use a fresh temp DataDirectory to avoid lock conflicts
+            # (e.g. another Tor instance still holds a lock on the main data dir).
+            # The .onion identity is stored in HiddenServiceDir, not DataDirectory,
+            # so the .onion address is preserved across retries.
+            if _tmp_data_dir is None:
+                _tmp_data_dir = tempfile.mkdtemp(prefix="sc_tor_data_")
+            config["DataDirectory"] = _tmp_data_dir
         try:
             tor_process = stem.process.launch_tor_with_config(
                 tor_cmd=str(tor_exe),

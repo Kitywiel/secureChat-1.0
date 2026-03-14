@@ -288,6 +288,24 @@ async function renderDashboard(){
           // Push dashboard content down so it isn't hidden under the banner
           document.getElementById('app').style.paddingTop='110px';
         }
+        // ── Log panel lockdown overlay ───────────────────────────────
+        const logBox=document.getElementById('log-box');
+        if(logBox&&!document.getElementById('log-lockdown-header')){
+          const lh=document.createElement('div');
+          lh.id='log-lockdown-header';
+          lh.style.cssText='background:#000;border:2px solid #ff0000;border-bottom:none;'+
+            'border-radius:8px 8px 0 0;padding:1rem 1rem .8rem;text-align:center';
+          lh.innerHTML='<div style="font-size:2.5rem;font-weight:900;color:#ff0000;'+
+            'letter-spacing:.2em;text-shadow:0 0 14px #ff0000,0 0 30px #ff0000;'+
+            'font-family:monospace">⚠ LOCKDOWN ⚠</div>'+
+            '<div style="font-size:.78rem;color:#ff6666;margin-top:.25rem;'+
+            'letter-spacing:.08em;text-transform:uppercase">Server in lockdown mode</div>';
+          logBox.parentNode.insertBefore(lh,logBox);
+          logBox.style.borderTopLeftRadius='0';
+          logBox.style.borderTopRightRadius='0';
+          logBox.style.borderTop='none';
+          logBox.style.borderColor='#ff0000';
+        }
         bar.style.display='block';
         bar.style.background='#7f1d1d';
         bar.style.color='#fca5a5';
@@ -300,6 +318,16 @@ async function renderDashboard(){
         if(topBanner)topBanner.remove();
         const appEl=document.getElementById('app');
         if(appEl)appEl.style.paddingTop='';
+        // ── Remove log panel lockdown overlay ───────────────────────
+        const lh=document.getElementById('log-lockdown-header');
+        if(lh)lh.remove();
+        const logBox=document.getElementById('log-box');
+        if(logBox){
+          logBox.style.borderTopLeftRadius='';
+          logBox.style.borderTopRightRadius='';
+          logBox.style.borderTop='';
+          logBox.style.borderColor='';
+        }
         bar.style.display='none';
         btn.textContent='🔴 Activate Lockdown';
         btn.style.background='#b91c1c';
