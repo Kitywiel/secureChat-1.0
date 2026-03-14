@@ -3462,4 +3462,5 @@ def test_print_lockdown_banner_outputs_warning_text(capsys, monkeypatch) -> None
     _s._print_lockdown_console_banner()
     out = capsys.readouterr().out
     # The banner includes both key messages
-    assert "ALL DATA WIPED" in out and "CONNECTIONS CLOSED" in out
+    assert "ALL DATA WIPED" in out
+    assert "CONNECTIONS CLOSED" in out
