@@ -313,6 +313,9 @@ async function sendFile(file, nsfw = false, oneTime = false) {
 /**
  * Upload a large file through the share system and post the download link
  * as an encrypted chat message so all room members can access it.
+ * The file is encrypted client-side before upload (E2EE); the server only
+ * stores the ciphertext.  The decryption key is embedded in the download URL
+ * fragment so it is never sent to the server.
  *
  * @param {File} file
  */
@@ -333,14 +336,28 @@ async function _sendLargeFileViaShare(file) {
     chatProgressTxt.textContent = '';
   }
 
-  appendMessage('📤', `Uploading ${file.name} (${_fmtFileSize(file.size)})…`, 'system');
-  setProgress(0, `${file.name} — 0%`);
+  appendMessage('📤', `Encrypting & uploading ${file.name} (${_fmtFileSize(file.size)})…`, 'system');
+  setProgress(0, `${file.name} — encrypting…`);
 
   try {
-    const formData = new FormData();
-    formData.append('file', file);
+    // ── E2EE: encrypt the file with a fresh random key ────────────────
+    const fileKey = await crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, true, ['encrypt']);
+    const iv      = crypto.getRandomValues(new Uint8Array(12));
+    const bytes   = new Uint8Array(await file.arrayBuffer());
+    const cipherBuf = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, fileKey, bytes);
 
-    const result = await uploadWithProgress('/share/upload?ttl=24', formData, (pct) => {
+    // Export key for embedding in the URL fragment
+    const keyBytes = new Uint8Array(await crypto.subtle.exportKey('raw', fileKey));
+    const keyB64   = bufToBase64(keyBytes);
+    const ivB64    = bufToBase64(iv);
+
+    setProgress(0, `${file.name} — 0%`);
+
+    const formData = new FormData();
+    // Upload the encrypted ciphertext; preserve the original filename for display
+    formData.append('file', new Blob([cipherBuf], { type: 'application/octet-stream' }), file.name);
+
+    const result = await uploadWithProgress('/share/upload?ttl=24&e=1', formData, (pct) => {
       setProgress(pct, `${file.name} — ${pct}%`);
     });
 
@@ -353,13 +370,15 @@ async function _sendLargeFileViaShare(file) {
     }
 
     const data = await result.json();
-    const downloadUrl = `${location.origin}${data.download_url}`;
-    const sizeLabel   = _fmtFileSize(data.size ?? file.size);
+    // Embed key + IV + original filename in the URL fragment (never sent to server)
+    const fragment  = `key=${keyB64}&iv=${ivB64}&name=${encodeURIComponent(file.name)}`;
+    const downloadUrl = `${location.origin}${data.download_url}#${fragment}`;
+    const sizeLabel   = _fmtFileSize(file.size);
 
     // Post the download link as a regular encrypted chat message
     const linkText = `📎 ${file.name} (${sizeLabel}) — ${downloadUrl}`;
-    const { iv, ciphertext } = await encryptMessage(roomKey, linkText);
-    ws.send(JSON.stringify({ type: 'message', iv, ciphertext, sender: displayName }));
+    const { iv: msgIv, ciphertext } = await encryptMessage(roomKey, linkText);
+    ws.send(JSON.stringify({ type: 'message', iv: msgIv, ciphertext, sender: displayName }));
     appendMessage(displayName, linkText, 'outgoing');
   } catch (err) {
     hideProgress();
@@ -1187,16 +1206,28 @@ document.getElementById('share-form').addEventListener('submit', async (e) => {
   for (let i = 0; i < files.length; i++) {
     const file = files[i];
     const fileLabel = `${i + 1} / ${files.length}`;
-    btn.textContent = `Uploading ${fileLabel}…`;
-    setProgress(0, `${fileLabel} — 0%`);
-
-    const formData = new FormData();
-    formData.append('file', file);
-    if (passcode) formData.append('passcode', passcode);
+    btn.textContent = `Encrypting ${fileLabel}…`;
+    setProgress(0, `${fileLabel} — encrypting…`);
 
     try {
+      // ── E2EE: encrypt each file with a fresh random key ────────────
+      const fileKey  = await crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, true, ['encrypt']);
+      const fileIv   = crypto.getRandomValues(new Uint8Array(12));
+      const bytes    = new Uint8Array(await file.arrayBuffer());
+      const cipherBuf = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: fileIv }, fileKey, bytes);
+      const keyBytes = new Uint8Array(await crypto.subtle.exportKey('raw', fileKey));
+      const keyB64   = bufToBase64(keyBytes);
+      const ivB64    = bufToBase64(fileIv);
+
+      btn.textContent = `Uploading ${fileLabel}…`;
+      setProgress(0, `${fileLabel} — 0%`);
+
+      const formData = new FormData();
+      formData.append('file', new Blob([cipherBuf], { type: 'application/octet-stream' }), file.name);
+      // passcode is NOT used with E2EE (key is in the URL fragment)
+
       const resp = await uploadWithProgress(
-        `/share/upload?ttl=${encodeURIComponent(ttl)}`,
+        `/share/upload?ttl=${encodeURIComponent(ttl)}&e=1`,
         formData,
         (pct) => {
           btn.textContent = `Uploading ${fileLabel} (${pct}%)…`;
@@ -1211,7 +1242,10 @@ document.getElementById('share-form').addEventListener('submit', async (e) => {
       }
 
       const data = await resp.json();
-      _appendShareResult(data, passcode);
+      // Append key+IV+filename to the download URL fragment (never sent to server)
+      const fragment = `key=${keyB64}&iv=${ivB64}&name=${encodeURIComponent(file.name)}`;
+      data.download_url = `${data.download_url}#${fragment}`;
+      _appendShareResult(data, '');
       successCount++;
     } catch (err) {
       errEl.textContent += `\n"${file.name}" failed: ${err instanceof Error ? err.message : String(err)}`;

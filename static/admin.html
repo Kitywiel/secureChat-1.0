@@ -267,7 +267,27 @@ async function renderDashboard(){
       const d=await r.json();
       const bar=document.getElementById('lockdown-bar');
       const btn=document.getElementById('lockdown-btn');
+      // ── Full-page lockdown indicator ─────────────────────────────────
+      let topBanner=document.getElementById('lockdown-top-banner');
       if(d.lockdown){
+        // Black background on body
+        document.body.style.background='#000';
+        // Add big top banner if not already present
+        if(!topBanner){
+          topBanner=document.createElement('div');
+          topBanner.id='lockdown-top-banner';
+          topBanner.style.cssText='position:fixed;top:0;left:0;right:0;z-index:9999;'+
+            'background:#000;border-bottom:3px solid #ff0000;padding:1.2rem;'+
+            'text-align:center;pointer-events:none';
+          topBanner.innerHTML='<div style="font-size:3rem;font-weight:900;color:#ff0000;'+
+            'letter-spacing:.15em;text-shadow:0 0 20px #ff0000,0 0 40px #ff0000;font-family:monospace">'+
+            '🔴 LOCKDOWN 🔴</div>'+
+            '<div style="font-size:.85rem;color:#ff6666;margin-top:.3rem">'+
+            'All visitors blocked — all data wiped</div>';
+          document.body.insertBefore(topBanner,document.body.firstChild);
+          // Push dashboard content down so it isn't hidden under the banner
+          document.getElementById('app').style.paddingTop='110px';
+        }
         bar.style.display='block';
         bar.style.background='#7f1d1d';
         bar.style.color='#fca5a5';
@@ -275,6 +295,11 @@ async function renderDashboard(){
         btn.textContent='🟢 Deactivate Lockdown';
         btn.style.background='#166534';
       } else {
+        // Restore normal background
+        document.body.style.background='';
+        if(topBanner)topBanner.remove();
+        const appEl=document.getElementById('app');
+        if(appEl)appEl.style.paddingTop='';
         bar.style.display='none';
         btn.textContent='🔴 Activate Lockdown';
         btn.style.background='#b91c1c';

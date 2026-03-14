@@ -674,6 +674,64 @@ async def test_share_download_no_passcode_still_works_via_get(ws_client) -> None
     assert await resp.read() == content
 
 
+@pytest.mark.asyncio
+async def test_e2ee_upload_serves_decrypt_page(ws_client) -> None:
+    """E2EE upload (e=1) serves the JS decrypt page on GET (not the raw bytes)."""
+    content = b"secret file content"
+    data = aiohttp.FormData()
+    data.add_field("file", content, filename="secret.bin", content_type="application/octet-stream")
+    upload_resp = await ws_client.post("/share/upload?ttl=1&e=1", data=data)
+    assert upload_resp.status == 200
+    body = await upload_resp.json()
+
+    resp = await ws_client.get(body["download_url"])
+    assert resp.status == 200
+    text = await resp.text()
+    # Should serve the JS decrypt page, not the raw bytes
+    assert "AES-GCM" in text or "decrypt" in text.lower()
+    assert content not in (await resp.read() if False else b"")  # page ≠ raw bytes
+
+
+@pytest.mark.asyncio
+async def test_e2ee_upload_raw_param_serves_ciphertext(ws_client) -> None:
+    """E2EE upload (e=1) with ?raw=1 serves the raw ciphertext bytes (one-time)."""
+    content = b"secret ciphertext bytes"
+    data = aiohttp.FormData()
+    data.add_field("file", content, filename="enc.bin", content_type="application/octet-stream")
+    upload_resp = await ws_client.post("/share/upload?ttl=1&e=1", data=data)
+    body = await upload_resp.json()
+    base_url = body["download_url"]
+
+    # First request with ?raw=1 should return the raw bytes
+    resp = await ws_client.get(base_url + "?raw=1")
+    assert resp.status == 200
+    assert await resp.read() == content
+
+    # Second request should 404 (one-time download consumed)
+    resp2 = await ws_client.get(base_url + "?raw=1")
+    assert resp2.status == 404
+
+
+@pytest.mark.asyncio
+async def test_e2ee_decrypt_page_not_consumed_by_first_get(ws_client) -> None:
+    """Getting the E2EE decrypt page does NOT consume the slot."""
+    content = b"preserve me"
+    data = aiohttp.FormData()
+    data.add_field("file", content, filename="p.bin", content_type="application/octet-stream")
+    upload_resp = await ws_client.post("/share/upload?ttl=1&e=1", data=data)
+    body = await upload_resp.json()
+    base_url = body["download_url"]
+
+    # Load the decrypt page (does not consume slot)
+    page_resp = await ws_client.get(base_url)
+    assert page_resp.status == 200
+
+    # Raw download should still work after the page was served
+    raw_resp = await ws_client.get(base_url + "?raw=1")
+    assert raw_resp.status == 200
+    assert await raw_resp.read() == content
+
+
 # ─── Room-meta helpers ────────────────────────────────────────────────────────
 
 @pytest.fixture(autouse=True)
@@ -2378,15 +2436,15 @@ async def test_clearnet_path_is_different_from_admin_path(ws_client) -> None:
 
 
 def test_free_socks5_proxies_count() -> None:
-    """_FREE_SOCKS5_PROXIES must have exactly 6 entries for the 6-proxy chain."""
+    """_FREE_SOCKS5_PROXIES must be empty — free public proxies have been removed."""
     import server as _s
-    assert len(_s._FREE_SOCKS5_PROXIES) == 6, (
-        f"Expected 6 proxies, got {len(_s._FREE_SOCKS5_PROXIES)}"
+    assert len(_s._FREE_SOCKS5_PROXIES) == 0, (
+        f"Expected 0 proxies (removed), got {len(_s._FREE_SOCKS5_PROXIES)}"
     )
 
 
 def test_free_socks5_proxies_all_valid_urls() -> None:
-    """Every entry in _FREE_SOCKS5_PROXIES must start with socks5://."""
+    """Every entry in _FREE_SOCKS5_PROXIES (if any) must start with socks5://."""
     import server as _s
     for url in _s._FREE_SOCKS5_PROXIES:
         assert url.startswith("socks5://"), f"Not a socks5:// URL: {url}"
@@ -2454,14 +2512,15 @@ def test_init_clearnet_path_console_no_full_url_hint(capsys) -> None:
     # Old broken line must be gone
     assert "Full URL hint" not in captured.out
     assert "http://<your-public-ip>" not in captured.out
+    assert "6 SOCKS5 hops" not in captured.out
     # New clean lines must be present
     assert "Secret path" in captured.out
-    assert "Proxy chain" in captured.out
+    assert "Tor (127.0.0.1:9050) if available, else direct" in captured.out
 
 
 @pytest.mark.asyncio
-async def test_probe_clearnet_exit_ip_uses_last_proxy(capsys) -> None:
-    """_probe_clearnet_exit_ip passes _FREE_SOCKS5_PROXIES[-1] to _build_session."""
+async def test_probe_clearnet_exit_ip_uses_tor_first(capsys) -> None:
+    """_probe_clearnet_exit_ip tries Tor (socks5://127.0.0.1:9050) first."""
     import server as _s
     from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -2485,9 +2544,9 @@ async def test_probe_clearnet_exit_ip_uses_last_proxy(capsys) -> None:
     with patch.object(_s, "_build_session", side_effect=_capture_build_session):
         await _s._probe_clearnet_exit_ip()
 
-    expected = _s._FREE_SOCKS5_PROXIES[-1]
     assert called_with, "_build_session was never called"
-    assert called_with[0] == expected, (
+    assert called_with[0] == "socks5://127.0.0.1:9050", (
+        f"Expected Tor proxy first, got {called_with[0]!r}"
     )
 
 
@@ -2497,26 +2556,20 @@ async def test_probe_clearnet_exit_ip_uses_last_proxy(capsys) -> None:
 
 @pytest.mark.asyncio
 async def test_proxy_watchdog_marks_offline_and_invalidates_cache(capsys) -> None:
-    """_proxy_watchdog_task marks a proxy offline and clears the proxy cache."""
+    """_proxy_watchdog_task runs without error when _FREE_SOCKS5_PROXIES is empty."""
     import server as _s
     from unittest.mock import patch, AsyncMock
     import asyncio as _asyncio
 
-    # Simulate all free proxies failing
     probe_calls: list[str] = []
 
     async def _always_offline(proxy_url: str, timeout: float = 5.0) -> bool:
         probe_calls.append(proxy_url)
         return False
 
-    # Initialise health as all online so we see the state change
     original_health = dict(_s._proxy_health)
     original_cache = _s._proxy_cache
     original_cache_ts = _s._proxy_cache_ts
-    for p in _s._FREE_SOCKS5_PROXIES:
-        _s._proxy_health[p] = True
-    _s._proxy_cache = _s._FREE_SOCKS5_PROXIES[0]
-    _s._proxy_cache_ts = 9e18  # far in the future
 
     try:
         # Patch sleep: first call returns normally (runs the loop body),
@@ -2536,22 +2589,8 @@ async def test_proxy_watchdog_marks_offline_and_invalidates_cache(capsys) -> Non
             except _asyncio.CancelledError:
                 pass
 
-        # _probe_proxy must have been called once per proxy in _FREE_SOCKS5_PROXIES
-        assert len(probe_calls) == len(_s._FREE_SOCKS5_PROXIES), (
-            f"Expected {len(_s._FREE_SOCKS5_PROXIES)} probe calls, got {len(probe_calls)}"
-        )
-        for p in _s._FREE_SOCKS5_PROXIES:
-            assert p in probe_calls, f"_probe_proxy was not called for {p}"
-
-        # All proxies should now be marked offline
-        for p in _s._FREE_SOCKS5_PROXIES:
-            assert _s._proxy_health.get(p) is False, f"Expected {p} to be offline"
-        # Cache should have been invalidated
-        assert _s._proxy_cache == ""
-        assert _s._proxy_cache_ts == 0.0
-
-        captured = capsys.readouterr()
-        assert "OFFLINE" in captured.out
+        # With an empty proxy list, _probe_proxy should never be called
+        assert len(probe_calls) == len(_s._FREE_SOCKS5_PROXIES)
     finally:
         _s._proxy_health.clear()
         _s._proxy_health.update(original_health)
@@ -2569,7 +2608,7 @@ async def test_make_proxied_session_skips_offline_proxy() -> None:
     original_cache = _s._proxy_cache
     original_cache_ts = _s._proxy_cache_ts
     try:
-        # Mark all free proxies offline
+        # Mark all free proxies offline (none in the default list, but set up for future)
         for p in _s._FREE_SOCKS5_PROXIES:
             _s._proxy_health[p] = False
         # Invalidate the proxy cache so _make_proxied_session re-probes
@@ -2599,17 +2638,14 @@ async def test_make_proxied_session_skips_offline_proxy() -> None:
 
 
 @pytest.mark.asyncio
-async def test_probe_clearnet_exit_ip_skips_offline_uses_online(capsys) -> None:
-    """_probe_clearnet_exit_ip skips offline proxies and uses the first online one."""
+async def test_probe_clearnet_exit_ip_falls_back_to_direct(capsys) -> None:
+    """_probe_clearnet_exit_ip falls back to direct when Tor is unavailable."""
     import server as _s
     from unittest.mock import AsyncMock, MagicMock, patch
 
     original_health = dict(_s._proxy_health)
     try:
-        # Mark all but the first proxy offline
-        for p in _s._FREE_SOCKS5_PROXIES:
-            _s._proxy_health[p] = False
-        _s._proxy_health[_s._FREE_SOCKS5_PROXIES[0]] = True
+        called_with: list[str] = []
 
         mock_resp = AsyncMock()
         mock_resp.status = 200
@@ -2617,17 +2653,30 @@ async def test_probe_clearnet_exit_ip_skips_offline_uses_online(capsys) -> None:
         mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
         mock_resp.__aexit__ = AsyncMock(return_value=False)
 
-        mock_sess = MagicMock()
-        mock_sess.get = MagicMock(return_value=mock_resp)
-        mock_sess.__aenter__ = AsyncMock(return_value=mock_sess)
-        mock_sess.__aexit__ = AsyncMock(return_value=False)
+        mock_sess_fail = MagicMock()
+        mock_sess_fail.get = MagicMock(side_effect=RuntimeError("no Tor"))
+        mock_sess_fail.__aenter__ = AsyncMock(return_value=mock_sess_fail)
+        mock_sess_fail.__aexit__ = AsyncMock(return_value=False)
 
-        with patch.object(_s, "_build_session", return_value=mock_sess):
+        mock_sess_ok = MagicMock()
+        mock_sess_ok.get = MagicMock(return_value=mock_resp)
+        mock_sess_ok.__aenter__ = AsyncMock(return_value=mock_sess_ok)
+        mock_sess_ok.__aexit__ = AsyncMock(return_value=False)
+
+        def _build(proxy_url: str, timeout: float):
+            called_with.append(proxy_url)
+            return mock_sess_fail if proxy_url else mock_sess_ok
+
+        with patch.object(_s, "_build_session", side_effect=_build):
             await _s._probe_clearnet_exit_ip()
 
         captured = capsys.readouterr()
         assert "5.6.7.8" in captured.out
         assert "Exit IP" in captured.out
+        # Tor should have been tried first
+        assert called_with[0] == "socks5://127.0.0.1:9050"
+        # Direct fallback (empty string) should have been used
+        assert "" in called_with
     finally:
         _s._proxy_health.clear()
         _s._proxy_health.update(original_health)

@@ -300,6 +300,66 @@ button:hover{{background:#00a87e}}
 </html>
 """
 
+# HTML page served when downloading an E2EE-encrypted file.  The page reads the
+# AES-GCM key and IV from the URL fragment (#key=…&iv=…&name=…), fetches the raw
+# ciphertext from ?raw=1, decrypts it in the browser, and triggers a save.
+_E2EE_DECRYPT_PAGE = """\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>secureChat — Secure Download</title>
+<style>
+*,*::before,*::after{{box-sizing:border-box;margin:0;padding:0}}
+body{{background:#0d0d0d;color:#e8e8e8;font-family:"Segoe UI",system-ui,sans-serif;
+      display:flex;align-items:center;justify-content:center;min-height:100vh;padding:1rem}}
+.card{{background:#1a1a1a;border:1px solid #2e2e2e;border-radius:12px;
+       padding:2rem 1.75rem;width:100%;max-width:420px;text-align:center}}
+h1{{font-size:1.2rem;margin-bottom:1rem}}
+#status{{font-size:.9rem;color:#aaa;margin-top:.75rem}}
+.err{{color:#ff5555}}
+.ok{{color:#00c896}}
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>🔒 E2EE Secure Download</h1>
+  <p id="status">Decrypting file…</p>
+</div>
+<script>
+(async()=>{{
+  const p=new URLSearchParams(location.hash.slice(1));
+  const keyB64=p.get('key'),ivB64=p.get('iv'),fname=p.get('name')||'file';
+  const st=document.getElementById('status');
+  if(!keyB64||!ivB64){{
+    st.className='err';
+    st.textContent='⚠️ Missing decryption key. Make sure you are using the full URL including the #fragment.';
+    return;
+  }}
+  try{{
+    const keyBytes=Uint8Array.from(atob(keyB64),c=>c.charCodeAt(0));
+    const ivBytes=Uint8Array.from(atob(ivB64),c=>c.charCodeAt(0));
+    const key=await crypto.subtle.importKey('raw',keyBytes,'AES-GCM',false,['decrypt']);
+    const resp=await fetch(location.pathname+'?raw=1');
+    if(!resp.ok){{st.className='err';st.textContent='⚠️ File not found or already downloaded.';return;}}
+    const cipher=new Uint8Array(await resp.arrayBuffer());
+    const plain=await crypto.subtle.decrypt({{name:'AES-GCM',iv:ivBytes}},key,cipher);
+    const a=document.createElement('a');
+    a.href=URL.createObjectURL(new Blob([plain]));
+    a.download=decodeURIComponent(fname);
+    document.body.appendChild(a);a.click();
+    setTimeout(()=>URL.revokeObjectURL(a.href),15000);
+    st.className='ok';st.textContent='✅ File decrypted and downloaded successfully.';
+  }}catch(err){{
+    st.className='err';st.textContent='⚠️ Decryption failed: '+err.message;
+  }}
+}})();
+</script>
+</body>
+</html>
+"""
+
 # Onion address — admin sets this so generated invite links carry the .onion hostname
 ONION_ADDRESS: str | None = os.environ.get("ONION_ADDRESS")
 
@@ -1138,12 +1198,15 @@ async def share_upload_handler(request: web.Request) -> web.Response:
 
         token = secrets.token_urlsafe(_SHARE_TOKEN_BYTES)
         expires_at = time.time() + ttl_hours * 3600
+        # Mark the slot as E2EE-encrypted if the uploader set the "e=1" query param.
+        encrypted = request.query.get("e", "0") == "1"
         _share_slots[token] = {
             "tmp_dir": tmp_dir,
             "filename": filename,
             "size": total,
             "expires_at": expires_at,
             "passcode_hash": _hash_passcode(passcode) if passcode else None,
+            "encrypted": encrypted,
         }
         _stats["files_uploaded_count"] += 1
         _stats["files_uploaded_bytes"] += total
@@ -1169,8 +1232,12 @@ async def share_upload_handler(request: web.Request) -> web.Response:
 async def share_download_handler(request: web.Request) -> web.StreamResponse:
     """GET /share/download/{token} — one-time download; temp files destroyed afterwards.
 
-    If the slot requires a passcode an HTML gate page is returned instead of the
-    file.  The user then submits the passcode via POST to the same URL.
+    For E2EE-encrypted slots (slot["encrypted"] is True):
+      * Plain GET returns the JS decrypt page (slot not consumed).
+      * GET ?raw=1 returns the raw ciphertext bytes (slot consumed once).
+    For unencrypted slots:
+      * If the slot requires a passcode, an HTML gate page is returned.
+      * Otherwise, the file is streamed immediately (one-time).
     """
     token = request.match_info["token"]
     slot = _share_slots.get(token)
@@ -1183,6 +1250,18 @@ async def share_download_handler(request: web.Request) -> web.StreamResponse:
         await asyncio.to_thread(_rmtree, slot["tmp_dir"])
         raise web.HTTPGone(reason="Download link has expired")
 
+    # ── E2EE encrypted slot ──────────────────────────────────────────────
+    if slot.get("encrypted"):
+        # ?raw=1: serve the raw ciphertext bytes (one-time, consumes the slot)
+        if request.query.get("raw") == "1":
+            return await _stream_share_file(token, slot, request)
+        # Plain GET: serve the client-side decrypt page (slot not consumed)
+        return web.Response(
+            body=_E2EE_DECRYPT_PAGE,
+            content_type="text/html",
+        )
+
+    # ── Plain (unencrypted) slot ─────────────────────────────────────────
     # If the slot is protected by a passcode, return the gate page without
     # consuming the slot (so the user can try the passcode via POST).
     if slot.get("passcode_hash"):
@@ -1325,12 +1404,10 @@ async def _cleanup_expired_share_slots() -> None:
 # Six proxies are listed so the clearnet service always has a full 6-hop chain
 # to fall back to when Tor is unavailable.
 _FREE_SOCKS5_PROXIES: list[str] = [
-    "socks5://67.201.33.10:25283",    # US  — well-known free relay
-    "socks5://72.195.34.58:4145",     # US
-    "socks5://98.162.96.41:4145",     # US
-    "socks5://174.77.111.197:4145",   # US
-    "socks5://192.111.139.165:4145",  # US
-    "socks5://184.178.172.25:15291",  # US  — 6th proxy for the 6-hop clearnet chain
+    # Free public SOCKS5 proxies removed — they are unreliable and frequently offline.
+    # Outbound connections now use Tor (socks5://127.0.0.1:9050) when available,
+    # falling back to direct connections.  Set SOCKS5_PROXY env var to supply your
+    # own proxy (e.g. "socks5://127.0.0.1:9050").
 ]
 
 # In-process cache: last verified proxy URL (or empty string = direct)
@@ -2658,9 +2735,10 @@ def _init_clearnet_path() -> str:
     """Generate (or read from env) the 100-character clearnet URL path segment.
 
     The clearnet path is a security-through-obscurity access URL for the main
-    chat interface over the regular internet.  All outbound connections from
-    the server are routed through the 6-proxy SOCKS5 chain
-    (_FREE_SOCKS5_PROXIES) to avoid exposing the server's real IP.
+    chat interface over the regular internet.  Outbound connections from the
+    server use Tor (if running locally at 127.0.0.1:9050) or direct connection
+    as a fallback.  Set SOCKS5_PROXY in the environment to route through a
+    specific proxy.
 
     The path is printed to the console at startup and must be kept private.
     Set CLEARNET_PATH in the environment to pin a specific path across restarts.
@@ -2678,7 +2756,7 @@ def _init_clearnet_path() -> str:
     print("  CLEARNET ACCESS URL — share only over a secure channel", flush=True)
     print("=" * 72, flush=True)
     print(f"  Secret path    : /{path}/", flush=True)
-    print(f"  Proxy chain    : 6 SOCKS5 hops  (exit IP printed below at startup)", flush=True)
+    print(f"  Proxy          : Tor (127.0.0.1:9050) if available, else direct", flush=True)
     print("=" * 72, flush=True)
     print("", flush=True)
     logger.info("clearnet access path ready  (printed to console at startup)")
@@ -2687,14 +2765,13 @@ def _init_clearnet_path() -> str:
 
 
 async def _probe_clearnet_exit_ip() -> None:
-    """Fetch and print the public exit IP through the best available SOCKS5 proxy.
+    """Fetch and print the public exit IP through Tor or direct connection.
 
-    Iterates _FREE_SOCKS5_PROXIES from last to first, skipping any proxy
-    already known to be offline (_proxy_health).  Prints the exit IP and the
-    proxy that was used so the operator can verify which relay is live.
+    Tries Tor (127.0.0.1:9050) first, then direct.  Prints the exit IP so the
+    operator can verify how outbound traffic is routed.
 
     This runs as a background task from on_startup so it does not delay server
-    boot.  If every proxy is unreachable a clear warning is printed.
+    boot.  If no connection is available a warning is printed.
     """
     # ip-reflection services that return just the raw IP text
     ip_services = [
@@ -2702,10 +2779,8 @@ async def _probe_clearnet_exit_ip() -> None:
         "https://checkip.amazonaws.com",
         "https://icanhazip.com",
     ]
-    # Try proxies from last to first so we still show the furthest-hop IP
-    candidates = [p for p in reversed(_FREE_SOCKS5_PROXIES) if _proxy_health.get(p, True)]
-    if not candidates:
-        candidates = list(reversed(_FREE_SOCKS5_PROXIES))  # all marked offline — try anyway
+    # Try Tor first, then direct
+    candidates = ["socks5://127.0.0.1:9050", ""]
 
     exit_ip: str | None = None
     used_proxy: str = ""
@@ -2726,14 +2801,14 @@ async def _probe_clearnet_exit_ip() -> None:
 
     print("", flush=True)
     print("=" * 72, flush=True)
-    print("  CLEARNET EXIT IP (via SOCKS5 proxy)", flush=True)
+    print("  CLEARNET EXIT IP", flush=True)
     print("=" * 72, flush=True)
     if exit_ip:
         print(f"  Exit IP        : {exit_ip}", flush=True)
-        print(f"  Via proxy      : {used_proxy}", flush=True)
+        via = used_proxy if used_proxy else "direct (no Tor)"
+        print(f"  Via            : {via}", flush=True)
     else:
-        print(f"  Exit IP        : (could not reach any IP service via proxy chain)", flush=True)
-        print(f"                   All proxies may be offline — check _FREE_SOCKS5_PROXIES.", flush=True)
+        print(f"  Exit IP        : (could not reach any IP service)", flush=True)
     print("=" * 72, flush=True)
     print("", flush=True)
 
