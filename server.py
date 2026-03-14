@@ -573,13 +573,40 @@ def _spam_get_stats() -> dict:
 
 SLOW_MODE_DELAY: float = float(os.environ.get("SLOW_MODE_DELAY", "2.0"))
 
+# Valid service-target tokens for per-service slow mode.
+# "all" means every non-admin, non-static request is delayed.
+SLOW_MODE_ALL_TARGETS: frozenset[str] = frozenset(
+    {"all", "chat", "chat_creation", "file_sharing", "mail"}
+)
+
 # Current state — can be toggled at runtime via the admin API
 _slow_mode_active: bool = os.environ.get("SLOW_MODE", "").strip().lower() in ("1", "true", "yes")
+
+# Which service targets are currently slowed.  Empty set == same as {"all"}.
+_slow_mode_targets: set[str] = set()
+
+
+def _path_matches_slow_targets(path: str, targets: set[str]) -> bool:
+    """Return True if the request path falls within one of the active slow targets."""
+    effective = targets if targets else {"all"}
+    if "all" in effective:
+        return True
+    if "chat" in effective and path == "/ws":
+        return True
+    if "chat_creation" in effective and (
+        path == "/room/create" or path.startswith("/room/")
+    ):
+        return True
+    if "file_sharing" in effective and path.startswith("/share"):
+        return True
+    if "mail" in effective and path.startswith("/inbox"):
+        return True
+    return False
 
 
 @web.middleware
 async def _slow_mode_middleware(request: web.Request, handler):
-    """Introduce a configurable delay on every non-admin request when slow mode is active."""
+    """Introduce a configurable delay on matching requests when slow mode is active."""
     if not _slow_mode_active:
         return await handler(request)
 
@@ -592,7 +619,8 @@ async def _slow_mode_middleware(request: web.Request, handler):
     if path.startswith("/static"):
         return await handler(request)
 
-    await asyncio.sleep(SLOW_MODE_DELAY)
+    if _path_matches_slow_targets(path, _slow_mode_targets):
+        await asyncio.sleep(SLOW_MODE_DELAY)
     return await handler(request)
 
 
@@ -601,6 +629,7 @@ def _slow_mode_status() -> dict:
     return {
         "active": _slow_mode_active,
         "delay_sec": SLOW_MODE_DELAY,
+        "targets": sorted(_slow_mode_targets) if _slow_mode_targets else ["all"],
     }
 
 # ---------------------------------------------------------------------------
@@ -2521,11 +2550,16 @@ async def _slow_mode_status_handler(request: web.Request) -> web.Response:
 async def _admin_slow_mode_handler(request: web.Request) -> web.Response:
     """POST /{admin_path}/api/slow-mode — toggle slow mode on or off.
 
-    Body (optional): ``{"active": true}`` to force a specific state.
-    Without a body the current state is flipped.
+    Body (optional JSON):
+      ``{"active": true}``              — force enable/disable
+      ``{"targets": ["chat", "mail"]}`` — restrict which services are slowed
+      Valid target tokens: "all", "chat", "chat_creation", "file_sharing", "mail"
+      An empty targets list or omitting targets means "all" services.
+
+    Without a body the current active state is flipped.
     Requires an active admin session.
     """
-    global _slow_mode_active  # noqa: PLW0603
+    global _slow_mode_active, _slow_mode_targets  # noqa: PLW0603
     if not _valid_admin_session(request):
         raise web.HTTPUnauthorized()
 
@@ -2535,6 +2569,11 @@ async def _admin_slow_mode_handler(request: web.Request) -> web.Response:
             _slow_mode_active = bool(body["active"])
         else:
             _slow_mode_active = not _slow_mode_active
+        if "targets" in body:
+            raw = body["targets"]
+            if isinstance(raw, list):
+                valid = {str(t).strip().lower() for t in raw} & SLOW_MODE_ALL_TARGETS
+                _slow_mode_targets = valid
     except Exception:
         # No body or invalid JSON — just toggle
         _slow_mode_active = not _slow_mode_active
@@ -2699,6 +2738,29 @@ async def _probe_clearnet_exit_ip() -> None:
     print("", flush=True)
 
 
+def _print_lockdown_console_banner() -> None:
+    """Clear the terminal and render a large, unmistakable LOCKDOWN banner."""
+    # Clear the screen (works on both POSIX and Windows terminals).
+    os.system("cls" if os.name == "nt" else "clear")  # noqa: S605, S607
+    RED = "\033[1;31m"
+    RESET = "\033[0m"
+    banner = r"""
+██╗      ██████╗  ██████╗██╗  ██╗██████╗  ██████╗ ██╗    ██╗███╗   ██╗
+██║     ██╔═══██╗██╔════╝██║ ██╔╝██╔══██╗██╔═══██╗██║    ██║████╗  ██║
+██║     ██║   ██║██║     █████╔╝ ██║  ██║██║   ██║██║ █╗ ██║██╔██╗ ██║
+██║     ██║   ██║██║     ██╔═██╗ ██║  ██║██║   ██║██║███╗██║██║╚██╗██║
+███████╗╚██████╔╝╚██████╗██║  ██╗██████╔╝╚██████╔╝╚███╔███╔╝██║ ╚████║
+╚══════╝ ╚═════╝  ╚═════╝╚═╝  ╚═╝╚═════╝  ╚═════╝  ╚══╝╚══╝ ╚═╝  ╚═══╝
+"""
+    width = 72
+    print("\n" * 2, flush=True)
+    print(RED + "=" * width + RESET, flush=True)
+    print(RED + banner + RESET, flush=True)
+    print(RED + "  !! ALL DATA WIPED — ALL CONNECTIONS CLOSED !!" + RESET, flush=True)
+    print(RED + "=" * width + RESET, flush=True)
+    print("\n" * 2, flush=True)
+
+
 async def _lockdown_broadcast_task() -> None:
     """Background task: while lockdown is active, emit a warning log every 5 seconds."""
     while True:
@@ -2781,6 +2843,8 @@ async def _admin_lockdown_handler(request: web.Request) -> web.Response:
         rooms.clear()
 
         logger.warning("🔴 LOCKDOWN ACTIVATED — all data wiped, all connections closed")
+        # Print unmistakable lockdown banner to the operator's console.
+        _print_lockdown_console_banner()
     elif action == "deactivate":
         _lockdown_active = False
         logger.info("🟢 LOCKDOWN DEACTIVATED")

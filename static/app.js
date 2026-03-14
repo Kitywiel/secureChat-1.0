@@ -1735,7 +1735,19 @@ const _refreshSlowModeBanner = () => {
     .then(r => r.ok ? r.json() : null)
     .then(d => {
       const b = document.getElementById('slow-mode-banner');
-      if (b) b.style.display = (d && d.active) ? 'block' : 'none';
+      if (!b) return;
+      if (d && d.active) {
+        const targets = Array.isArray(d.targets) && d.targets.length
+          ? d.targets
+          : ['all'];
+        const label = targets.includes('all')
+          ? 'all services'
+          : targets.map(t => t.replace(/_/g, ' ')).join(', ');
+        b.textContent = `🐢 SLOW MODE ACTIVE — rate-limiting: ${label}`;
+        b.style.display = 'block';
+      } else {
+        b.style.display = 'none';
+      }
     })
     .catch(() => {});
 };

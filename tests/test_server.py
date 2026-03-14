@@ -3327,3 +3327,139 @@ def test_auto_update_runs_git_pull(tmp_path, monkeypatch) -> None:
         assert any("pull" in " ".join(c) for c in calls)
     finally:
         _run._HERE = original_here
+
+
+# ---------------------------------------------------------------------------
+# Per-service slow mode tests
+# ---------------------------------------------------------------------------
+
+def test_slow_mode_status_includes_targets() -> None:
+    """_slow_mode_status now includes a 'targets' key."""
+    import server as _s
+    status = _s._slow_mode_status()
+    assert "targets" in status
+    assert isinstance(status["targets"], list)
+
+
+def test_slow_mode_status_targets_defaults_to_all() -> None:
+    """When _slow_mode_targets is empty, status reports ['all']."""
+    import server as _s
+    original = _s._slow_mode_targets.copy()
+    try:
+        _s._slow_mode_targets.clear()
+        assert _s._slow_mode_status()["targets"] == ["all"]
+    finally:
+        _s._slow_mode_targets.update(original)
+
+
+def test_slow_mode_status_reports_set_targets() -> None:
+    """When specific targets are set, they appear in status."""
+    import server as _s
+    original = _s._slow_mode_targets.copy()
+    try:
+        _s._slow_mode_targets.clear()
+        _s._slow_mode_targets.add("chat")
+        _s._slow_mode_targets.add("mail")
+        result = _s._slow_mode_status()["targets"]
+        assert sorted(result) == ["chat", "mail"]
+    finally:
+        _s._slow_mode_targets.clear()
+        _s._slow_mode_targets.update(original)
+
+
+def test_path_matches_slow_targets_all() -> None:
+    """target='all' matches any path."""
+    import server as _s
+    assert _s._path_matches_slow_targets("/room/create", {"all"}) is True
+    assert _s._path_matches_slow_targets("/ws", {"all"}) is True
+    assert _s._path_matches_slow_targets("/share/upload", {"all"}) is True
+
+
+def test_path_matches_slow_targets_chat() -> None:
+    """target='chat' matches /ws only."""
+    import server as _s
+    assert _s._path_matches_slow_targets("/ws", {"chat"}) is True
+    assert _s._path_matches_slow_targets("/room/create", {"chat"}) is False
+    assert _s._path_matches_slow_targets("/share/upload", {"chat"}) is False
+
+
+def test_path_matches_slow_targets_chat_creation() -> None:
+    """target='chat_creation' matches /room/* paths."""
+    import server as _s
+    assert _s._path_matches_slow_targets("/room/create", {"chat_creation"}) is True
+    assert _s._path_matches_slow_targets("/room/abc123/delete", {"chat_creation"}) is True
+    assert _s._path_matches_slow_targets("/ws", {"chat_creation"}) is False
+
+
+def test_path_matches_slow_targets_file_sharing() -> None:
+    """target='file_sharing' matches /share/* paths."""
+    import server as _s
+    assert _s._path_matches_slow_targets("/share/upload", {"file_sharing"}) is True
+    assert _s._path_matches_slow_targets("/share/download/tok", {"file_sharing"}) is True
+    assert _s._path_matches_slow_targets("/ws", {"file_sharing"}) is False
+
+
+def test_path_matches_slow_targets_mail() -> None:
+    """target='mail' matches /inbox/* paths."""
+    import server as _s
+    assert _s._path_matches_slow_targets("/inbox/create", {"mail"}) is True
+    assert _s._path_matches_slow_targets("/inbox/tok/read", {"mail"}) is True
+    assert _s._path_matches_slow_targets("/ws", {"mail"}) is False
+
+
+def test_path_matches_slow_targets_empty_is_all() -> None:
+    """Empty target set behaves like 'all'."""
+    import server as _s
+    assert _s._path_matches_slow_targets("/room/create", set()) is True
+    assert _s._path_matches_slow_targets("/ws", set()) is True
+
+
+def test_slow_mode_set_targets_via_module_state() -> None:
+    """Setting _slow_mode_targets directly changes _slow_mode_status output."""
+    import server as _s
+    original = _s._slow_mode_targets.copy()
+    try:
+        _s._slow_mode_targets.clear()
+        _s._slow_mode_targets.update({"chat", "mail"})
+        result = _s._slow_mode_status()
+        assert result["active"] == _s._slow_mode_active
+        assert sorted(result["targets"]) == ["chat", "mail"]
+    finally:
+        _s._slow_mode_targets.clear()
+        _s._slow_mode_targets.update(original)
+
+
+def test_slow_mode_invalid_targets_not_in_allowed_set() -> None:
+    """Invalid target tokens are not in SLOW_MODE_ALL_TARGETS."""
+    import server as _s
+    assert "invalid_service" not in _s.SLOW_MODE_ALL_TARGETS
+    assert "bogus" not in _s.SLOW_MODE_ALL_TARGETS
+    # Valid ones are present
+    for t in ("all", "chat", "chat_creation", "file_sharing", "mail"):
+        assert t in _s.SLOW_MODE_ALL_TARGETS
+
+
+# ---------------------------------------------------------------------------
+# Lockdown console banner tests
+# ---------------------------------------------------------------------------
+
+def test_print_lockdown_console_banner_callable() -> None:
+    """_print_lockdown_console_banner is callable and does not raise."""
+    import server as _s
+    original_system = _s.os.system
+    try:
+        _s.os.system = lambda _cmd: None  # type: ignore[assignment]
+        # Should not raise
+        _s._print_lockdown_console_banner()
+    finally:
+        _s.os.system = original_system  # type: ignore[assignment]
+
+
+def test_print_lockdown_banner_outputs_warning_text(capsys, monkeypatch) -> None:
+    """The banner outputs a clear warning about data wipe."""
+    import server as _s
+    monkeypatch.setattr(_s.os, "system", lambda _cmd: None)
+    _s._print_lockdown_console_banner()
+    out = capsys.readouterr().out
+    # The banner includes both key messages
+    assert "ALL DATA WIPED" in out and "CONNECTIONS CLOSED" in out
