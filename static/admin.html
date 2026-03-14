@@ -416,13 +416,25 @@ async function renderDashboard(){
     const ts0=data[0].ts, ts1=data[data.length-1].ts;
     const tsR=ts1-ts0||1;
     const hasRooms=data.some(d=>d.active_rooms!=null);
-    const roomsMax=hasRooms
-      ?Math.max(Math.ceil(Math.max(...data.filter(d=>d.active_rooms!=null).map(d=>d.active_rooms))*1.2),1)
-      :1;
+    const hasShares=data.some(d=>d.active_shares!=null);
+    const hasInbox=data.some(d=>d.inbox_msgs!=null);
+    const hasMesh=data.some(d=>d.mesh_peers!=null);
+    const hasServices=hasRooms||hasShares||hasInbox||hasMesh;
+    function _svcMax(key){
+      const vals=data.filter(d=>d[key]!=null).map(d=>d[key]);
+      return vals.length?Math.max(Math.ceil(Math.max(...vals)*1.2),1):0;
+    }
+    const svcMax=Math.max(
+      hasRooms  ?_svcMax('active_rooms') :0,
+      hasShares ?_svcMax('active_shares'):0,
+      hasInbox  ?_svcMax('inbox_msgs')   :0,
+      hasMesh   ?_svcMax('mesh_peers')   :0,
+      1
+    );
 
     const toX=ts=>PL+((ts-ts0)/tsR)*cW;
     const toY=pct=>PT+cH-(pct/100)*cH;
-    const toYR=v=>PT+cH-(v/roomsMax)*cH;
+    const toYS=v=>PT+cH-(v/svcMax)*cH;
 
     ctx.clearRect(0,0,W,H);
 
@@ -444,17 +456,17 @@ async function renderDashboard(){
     ctx.textAlign='center'; ctx.fillStyle='#555'; ctx.font='10px system-ui,sans-serif';
     ctx.fillText('Usage %',0,0); ctx.restore();
 
-    // Right Y axis labels (rooms) — only if there are room samples
-    if(hasRooms){
-      ctx.fillStyle='#00c896'; ctx.textAlign='left'; ctx.textBaseline='middle';
+    // Right Y axis labels (service counts) — only if there are service samples
+    if(hasServices){
+      ctx.fillStyle='#aaa'; ctx.textAlign='left'; ctx.textBaseline='middle';
       ctx.font='10px monospace';
       for(let i=0;i<=4;i++){
-        const v=roomsMax-(roomsMax/4)*i;
+        const v=svcMax-(svcMax/4)*i;
         ctx.fillText(Math.round(v),PL+cW+4,PT+(cH/4)*i);
       }
       ctx.save(); ctx.translate(W-10,PT+cH/2); ctx.rotate(Math.PI/2);
-      ctx.textAlign='center'; ctx.fillStyle='#00c896'; ctx.font='10px system-ui,sans-serif';
-      ctx.fillText('Rooms',0,0); ctx.restore();
+      ctx.textAlign='center'; ctx.fillStyle='#aaa'; ctx.font='10px system-ui,sans-serif';
+      ctx.fillText('Services →',0,0); ctx.restore();
     }
 
     // X axis tick labels
@@ -492,10 +504,13 @@ async function renderDashboard(){
       return r+','+g+','+b;
     }
 
-    drawSeries(d=>d.cpu_pct,  toY,  '#ff5555',0.07);
-    drawSeries(d=>d.ram_pct,  toY,  '#60a5fa',0.07);
-    drawSeries(d=>d.disk_pct, toY,  '#ffb347',0.07);
-    if(hasRooms) drawSeries(d=>d.active_rooms,toYR,'#00c896',0.05);
+    drawSeries(d=>d.cpu_pct,      toY,  '#ff5555',0.07);
+    drawSeries(d=>d.ram_pct,      toY,  '#60a5fa',0.07);
+    drawSeries(d=>d.disk_pct,     toY,  '#ffb347',0.07);
+    if(hasRooms)   drawSeries(d=>d.active_rooms,  toYS,'#00c896',0.05);
+    if(hasShares)  drawSeries(d=>d.active_shares, toYS,'#c084fc',0.05);
+    if(hasInbox)   drawSeries(d=>d.inbox_msgs,    toYS,'#fb923c',0.05);
+    if(hasMesh)    drawSeries(d=>d.mesh_peers,    toYS,'#22d3ee',0.05);
 
     // Legend
     const legend=[
@@ -503,7 +518,10 @@ async function renderDashboard(){
       {label:'RAM %',color:'#60a5fa'},
       {label:'Disk %',color:'#ffb347'},
     ];
-    if(hasRooms) legend.push({label:'Active Rooms →',color:'#00c896'});
+    if(hasRooms)  legend.push({label:'Rooms →',color:'#00c896'});
+    if(hasShares) legend.push({label:'Files →',color:'#c084fc'});
+    if(hasInbox)  legend.push({label:'Inbox →',color:'#fb923c'});
+    if(hasMesh)   legend.push({label:'Mesh →',color:'#22d3ee'});
     ctx.font='11px system-ui,sans-serif'; ctx.textBaseline='middle';
     let lx=PL;
     legend.forEach(({label,color})=>{

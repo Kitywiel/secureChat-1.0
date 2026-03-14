@@ -764,13 +764,25 @@ def _init_db_sync(path: Path) -> None:
                 cpu_pct      REAL,
                 ram_pct      REAL,
                 disk_pct     REAL,
-                active_rooms INTEGER
+                active_rooms INTEGER,
+                active_shares INTEGER,
+                inbox_msgs    INTEGER,
+                mesh_peers    INTEGER
             )
             """
         )
         con.execute(
             "CREATE INDEX IF NOT EXISTS idx_metrics_ts ON metrics_history(ts)"
         )
+        # Migration: add per-service columns if they are missing from an older DB.
+        existing_cols = {row[1] for row in con.execute("PRAGMA table_info(metrics_history)")}
+        for col, ddl in [
+            ("active_shares", "INTEGER"),
+            ("inbox_msgs",    "INTEGER"),
+            ("mesh_peers",    "INTEGER"),
+        ]:
+            if col not in existing_cols:
+                con.execute(f"ALTER TABLE metrics_history ADD COLUMN {col} {ddl}")
         con.commit()
     finally:
         con.close()
@@ -2870,13 +2882,17 @@ def _store_metrics_sample_sync(
     ram: float | None,
     disk: float | None,
     active_rooms: int,
+    active_shares: int = 0,
+    inbox_msgs: int = 0,
+    mesh_peers: int = 0,
 ) -> None:
     con = sqlite3.connect(path)
     try:
         con.execute(
-            "INSERT INTO metrics_history (ts, cpu_pct, ram_pct, disk_pct, active_rooms)"
-            " VALUES (?, ?, ?, ?, ?)",
-            (ts, cpu, ram, disk, active_rooms),
+            "INSERT INTO metrics_history"
+            " (ts, cpu_pct, ram_pct, disk_pct, active_rooms, active_shares, inbox_msgs, mesh_peers)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (ts, cpu, ram, disk, active_rooms, active_shares, inbox_msgs, mesh_peers),
         )
         con.commit()
     finally:
@@ -2899,7 +2915,8 @@ def _query_metrics_sync(
     con.row_factory = sqlite3.Row
     try:
         rows = con.execute(
-            "SELECT ts, cpu_pct, ram_pct, disk_pct, active_rooms"
+            "SELECT ts, cpu_pct, ram_pct, disk_pct, active_rooms,"
+            " active_shares, inbox_msgs, mesh_peers"
             " FROM metrics_history"
             " WHERE ts >= ? AND ts <= ?"
             " ORDER BY ts ASC",
@@ -2928,13 +2945,19 @@ def _query_metrics_sync(
             vals = [r[key] for r in bucket if r[key] is not None]
             return round(sum(vals) / len(vals), 1) if vals else None
 
-        rooms_avg = _avg("active_rooms")
+        def _avg_int(key: str) -> int | None:
+            avg = _avg(key)
+            return round(avg) if avg is not None else None
+
         result.append({
-            "ts":           bucket[len(bucket) // 2]["ts"],
-            "cpu_pct":      _avg("cpu_pct"),
-            "ram_pct":      _avg("ram_pct"),
-            "disk_pct":     _avg("disk_pct"),
-            "active_rooms": round(rooms_avg) if rooms_avg is not None else None,
+            "ts":             bucket[len(bucket) // 2]["ts"],
+            "cpu_pct":        _avg("cpu_pct"),
+            "ram_pct":        _avg("ram_pct"),
+            "disk_pct":       _avg("disk_pct"),
+            "active_rooms":   _avg_int("active_rooms"),
+            "active_shares":  _avg_int("active_shares"),
+            "inbox_msgs":     _avg_int("inbox_msgs"),
+            "mesh_peers":     _avg_int("mesh_peers"),
         })
     return result
 
@@ -2959,6 +2982,9 @@ async def _metrics_collector_task(db_path: Path) -> None:
                 m.get("sys_ram_percent"),
                 m.get("sys_disk_percent"),
                 len(rooms),
+                len(_share_slots),
+                len(_inbox_slots),
+                len(_mesh_peers),
             )
             if now - last_prune >= _PRUNE_EVERY:
                 await asyncio.to_thread(_prune_metrics_sync, db_path, now - _RETENTION)
@@ -3114,7 +3140,7 @@ async def _lockdown_middleware(request: web.Request, handler):
 # the real server mounts admin under _ADMIN_PATH via _register_admin_routes().
 # ---------------------------------------------------------------------------
 
-def build_admin_app() -> web.Application:
+def build_admin_app(db_path: Path | None = None) -> web.Application:
     """Build a standalone admin Application using fixed /admin/* paths (used by tests)."""
     global _ADMIN_PASSCODE, _ADMIN_PATH, _ADMIN_WEBHOOK_TOKEN  # noqa: PLW0603
     if not _ADMIN_PASSCODE:
@@ -3124,7 +3150,7 @@ def build_admin_app() -> web.Application:
 
     app = web.Application()
 
-    async def on_startup(app: web.Application) -> None:  # noqa: ARG001
+    async def on_startup(app: web.Application) -> None:
         global _admin_event_loop  # noqa: PLW0603
         _admin_event_loop = asyncio.get_running_loop()
         handler = _SseLogHandler()
@@ -3133,6 +3159,17 @@ def build_admin_app() -> web.Application:
             datefmt="%Y-%m-%dT%H:%M:%SZ",
         ))
         logging.root.addHandler(handler)
+        # Provide a real DB path (initialised on startup); fall back to a secure temp file.
+        if db_path is not None:
+            resolved = db_path
+        else:
+            import tempfile as _tempfile
+            _fd, _tmp = _tempfile.mkstemp(suffix=".db")
+            import os as _os
+            _os.close(_fd)
+            resolved = Path(_tmp)
+        await init_db(resolved)
+        app["db_path"] = resolved
         logger.info("admin panel ready  (credentials printed to console at startup)")
 
     app.on_startup.append(on_startup)

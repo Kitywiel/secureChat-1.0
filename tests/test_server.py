@@ -1230,9 +1230,9 @@ import server as _srv_mod
 
 
 @pytest.fixture
-def admin_app():
-    """Return a freshly-built admin application."""
-    return build_admin_app()
+def admin_app(tmp_path):
+    """Return a freshly-built admin application backed by a temp database."""
+    return build_admin_app(db_path=tmp_path / "admin_test.db")
 
 
 @pytest_asyncio.fixture
@@ -3536,14 +3536,17 @@ def test_store_and_query_metrics(tmp_db: Path) -> None:
     """Store two samples and retrieve them via _query_metrics_sync."""
     from server import _store_metrics_sample_sync, _query_metrics_sync
     now = time.time()
-    _store_metrics_sample_sync(tmp_db, now - 10, 10.0, 20.0, 30.0, 1)
-    _store_metrics_sample_sync(tmp_db, now,       12.0, 22.0, 32.0, 2)
+    _store_metrics_sample_sync(tmp_db, now - 10, 10.0, 20.0, 30.0, 1, 2, 3, 4)
+    _store_metrics_sample_sync(tmp_db, now,       12.0, 22.0, 32.0, 2, 0, 1, 0)
     rows = _query_metrics_sync(tmp_db, now - 60, now + 1, 300)
     assert len(rows) == 2
     assert rows[0]["cpu_pct"] == 10.0
     assert rows[0]["ram_pct"] == 20.0
     assert rows[0]["disk_pct"] == 30.0
     assert rows[0]["active_rooms"] == 1
+    assert rows[0]["active_shares"] == 2
+    assert rows[0]["inbox_msgs"] == 3
+    assert rows[0]["mesh_peers"] == 4
     assert rows[1]["cpu_pct"] == 12.0
     assert rows[1]["active_rooms"] == 2
 
