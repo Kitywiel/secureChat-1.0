@@ -3513,3 +3513,86 @@ def test_print_lockdown_banner_outputs_warning_text(capsys, monkeypatch) -> None
     # The banner includes both key messages
     assert "ALL DATA WIPED" in out
     assert "CONNECTIONS CLOSED" in out
+
+
+# ─── Metrics history — DB helpers and API endpoint ──────────────────────────
+
+def test_metrics_table_created(tmp_db: Path) -> None:
+    """_init_db_sync creates the metrics_history table and ts index."""
+    import sqlite3
+    con = sqlite3.connect(tmp_db)
+    tables = {r[0] for r in con.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'"
+    ).fetchall()}
+    indexes = {r[0] for r in con.execute(
+        "SELECT name FROM sqlite_master WHERE type='index'"
+    ).fetchall()}
+    con.close()
+    assert "metrics_history" in tables
+    assert "idx_metrics_ts" in indexes
+
+
+def test_store_and_query_metrics(tmp_db: Path) -> None:
+    """Store two samples and retrieve them via _query_metrics_sync."""
+    from server import _store_metrics_sample_sync, _query_metrics_sync
+    now = time.time()
+    _store_metrics_sample_sync(tmp_db, now - 10, 10.0, 20.0, 30.0, 1)
+    _store_metrics_sample_sync(tmp_db, now,       12.0, 22.0, 32.0, 2)
+    rows = _query_metrics_sync(tmp_db, now - 60, now + 1, 300)
+    assert len(rows) == 2
+    assert rows[0]["cpu_pct"] == 10.0
+    assert rows[0]["ram_pct"] == 20.0
+    assert rows[0]["disk_pct"] == 30.0
+    assert rows[0]["active_rooms"] == 1
+    assert rows[1]["cpu_pct"] == 12.0
+    assert rows[1]["active_rooms"] == 2
+
+
+def test_query_metrics_empty(tmp_db: Path) -> None:
+    """_query_metrics_sync returns [] when no data exists."""
+    from server import _query_metrics_sync
+    rows = _query_metrics_sync(tmp_db, 0, time.time(), 300)
+    assert rows == []
+
+
+def test_prune_metrics(tmp_db: Path) -> None:
+    """_prune_metrics_sync removes rows older than cutoff."""
+    from server import _store_metrics_sample_sync, _prune_metrics_sync, _query_metrics_sync
+    now = time.time()
+    _store_metrics_sample_sync(tmp_db, now - 1000, 1.0, 1.0, 1.0, 0)
+    _store_metrics_sample_sync(tmp_db, now - 10,   2.0, 2.0, 2.0, 0)
+    _prune_metrics_sync(tmp_db, now - 100)
+    rows = _query_metrics_sync(tmp_db, 0, now + 1, 300)
+    assert len(rows) == 1
+    assert rows[0]["cpu_pct"] == 2.0
+
+
+def test_query_metrics_downsampling(tmp_db: Path) -> None:
+    """_query_metrics_sync downsamples to max_points when data exceeds it."""
+    from server import _store_metrics_sample_sync, _query_metrics_sync
+    now = time.time()
+    for i in range(50):
+        _store_metrics_sample_sync(tmp_db, now - 500 + i * 10, float(i), 0.0, 0.0, 0)
+    rows = _query_metrics_sync(tmp_db, now - 600, now + 1, 10)
+    assert len(rows) <= 10
+    assert len(rows) > 0
+
+
+@pytest.mark.asyncio
+async def test_metrics_history_endpoint_requires_auth(admin_client) -> None:
+    """GET /admin/api/metrics-history without auth returns 401."""
+    resp = await admin_client.get("/admin/api/metrics-history")
+    assert resp.status == 401
+
+
+@pytest.mark.asyncio
+async def test_metrics_history_endpoint_returns_list(admin_client) -> None:
+    """Authenticated GET /admin/api/metrics-history returns a JSON array."""
+    await admin_client.post(
+        "/admin/login",
+        json={"passcode": srv._ADMIN_PASSCODE},
+    )
+    resp = await admin_client.get("/admin/api/metrics-history?range=60")
+    assert resp.status == 200
+    data = await resp.json()
+    assert isinstance(data, list)

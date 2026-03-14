@@ -756,6 +756,21 @@ def _init_db_sync(path: Path) -> None:
         con.execute(
             "CREATE INDEX IF NOT EXISTS idx_messages_room_id ON messages(room, id)"
         )
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS metrics_history (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts           REAL    NOT NULL,
+                cpu_pct      REAL,
+                ram_pct      REAL,
+                disk_pct     REAL,
+                active_rooms INTEGER
+            )
+            """
+        )
+        con.execute(
+            "CREATE INDEX IF NOT EXISTS idx_metrics_ts ON metrics_history(ts)"
+        )
         con.commit()
     finally:
         con.close()
@@ -2844,6 +2859,138 @@ async def _lockdown_broadcast_task() -> None:
             logger.warning("🔴 LOCKDOWN ACTIVE — server is in lockdown mode")
 
 
+# ---------------------------------------------------------------------------
+# Metrics history — sampled every 10 s, retained 12 months
+# ---------------------------------------------------------------------------
+
+def _store_metrics_sample_sync(
+    path: Path,
+    ts: float,
+    cpu: float | None,
+    ram: float | None,
+    disk: float | None,
+    active_rooms: int,
+) -> None:
+    con = sqlite3.connect(path)
+    try:
+        con.execute(
+            "INSERT INTO metrics_history (ts, cpu_pct, ram_pct, disk_pct, active_rooms)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (ts, cpu, ram, disk, active_rooms),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def _prune_metrics_sync(path: Path, cutoff: float) -> None:
+    con = sqlite3.connect(path)
+    try:
+        con.execute("DELETE FROM metrics_history WHERE ts < ?", (cutoff,))
+        con.commit()
+    finally:
+        con.close()
+
+
+def _query_metrics_sync(
+    path: Path, since: float, until: float, max_points: int
+) -> list[dict]:
+    con = sqlite3.connect(path)
+    con.row_factory = sqlite3.Row
+    try:
+        rows = con.execute(
+            "SELECT ts, cpu_pct, ram_pct, disk_pct, active_rooms"
+            " FROM metrics_history"
+            " WHERE ts >= ? AND ts <= ?"
+            " ORDER BY ts ASC",
+            (since, until),
+        ).fetchall()
+    finally:
+        con.close()
+
+    if not rows:
+        return []
+
+    if len(rows) <= max_points:
+        return [dict(r) for r in rows]
+
+    # Bucket-average down to max_points
+    step = len(rows) / max_points
+    result: list[dict] = []
+    for i in range(max_points):
+        s = int(i * step)
+        e = int((i + 1) * step)
+        bucket = rows[s:e]
+        if not bucket:
+            continue
+
+        def _avg(key: str) -> float | None:
+            vals = [r[key] for r in bucket if r[key] is not None]
+            return round(sum(vals) / len(vals), 1) if vals else None
+
+        rooms_avg = _avg("active_rooms")
+        result.append({
+            "ts":           bucket[len(bucket) // 2]["ts"],
+            "cpu_pct":      _avg("cpu_pct"),
+            "ram_pct":      _avg("ram_pct"),
+            "disk_pct":     _avg("disk_pct"),
+            "active_rooms": round(rooms_avg) if rooms_avg is not None else None,
+        })
+    return result
+
+
+async def _metrics_collector_task(db_path: Path) -> None:
+    """Sample CPU / RAM / Disk every 10 s and persist for up to 12 months."""
+    _SAMPLE_INTERVAL = 10
+    _PRUNE_EVERY     = 3600
+    _RETENTION       = 365 * 24 * 3600  # 12 months
+
+    last_prune = 0.0
+    while True:
+        try:
+            await asyncio.sleep(_SAMPLE_INTERVAL)
+            now = time.time()
+            m = _get_sys_metrics()
+            await asyncio.to_thread(
+                _store_metrics_sample_sync,
+                db_path,
+                now,
+                m.get("sys_cpu_percent"),
+                m.get("sys_ram_percent"),
+                m.get("sys_disk_percent"),
+                len(rooms),
+            )
+            if now - last_prune >= _PRUNE_EVERY:
+                await asyncio.to_thread(_prune_metrics_sync, db_path, now - _RETENTION)
+                last_prune = now
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # pragma: no cover  # noqa: BLE001
+            pass
+
+
+async def _admin_metrics_history_handler(request: web.Request) -> web.Response:
+    """GET /{admin}/api/metrics-history?range=<seconds> — historical resource metrics."""
+    if not _valid_admin_session(request):
+        raise web.HTTPUnauthorized()
+    try:
+        range_secs = int(request.rel_url.query.get("range", "3600"))
+    except (ValueError, TypeError):
+        range_secs = 3600
+    range_secs = max(5, min(range_secs, 365 * 24 * 3600))
+    now = time.time()
+    rows = await asyncio.to_thread(
+        _query_metrics_sync,
+        request.app["db_path"],
+        now - range_secs,
+        now,
+        300,
+    )
+    resp = web.json_response(rows)
+    _add_admin_security_headers(resp)
+    return resp
+
+
 def _register_admin_routes(app: web.Application) -> None:
     """Add admin-panel routes to *app* under the secret path prefix."""
     p = _ADMIN_PATH
@@ -2860,6 +3007,7 @@ def _register_admin_routes(app: web.Application) -> None:
     app.router.add_get(f"/{p}/api/ddos-stats", _admin_ddos_stats_handler)
     app.router.add_post(f"/{p}/api/ddos-unban", _admin_ddos_unban_handler)
     app.router.add_post(f"/{p}/api/slow-mode", _admin_slow_mode_handler)
+    app.router.add_get(f"/{p}/api/metrics-history", _admin_metrics_history_handler)
 
 
 # ---------------------------------------------------------------------------
@@ -3004,6 +3152,7 @@ def build_admin_app() -> web.Application:
     app.router.add_get("/admin/api/ddos-stats", _admin_ddos_stats_handler)
     app.router.add_post("/admin/api/ddos-unban", _admin_ddos_unban_handler)
     app.router.add_post("/admin/api/slow-mode", _admin_slow_mode_handler)
+    app.router.add_get("/admin/api/metrics-history", _admin_metrics_history_handler)
     return app
 
 
@@ -3207,6 +3356,9 @@ def build_app(db_path: Path | None = None) -> web.Application:
         app["_lockdown_broadcast_task"] = asyncio.create_task(_lockdown_broadcast_task())
         app["_mailtm_poll_task"] = asyncio.create_task(_mailtm_poll_all_inboxes())
         app["_proxy_watchdog_task"] = asyncio.create_task(_proxy_watchdog_task())
+        app["_metrics_collector_task"] = asyncio.create_task(
+            _metrics_collector_task(app["db_path"])
+        )
         logger.info("admin panel ready  (credentials printed to console at startup)")
         # Probe and print the clearnet exit IP through the last SOCKS5 proxy
         asyncio.create_task(_probe_clearnet_exit_ip())
@@ -3231,7 +3383,7 @@ def build_app(db_path: Path | None = None) -> web.Application:
 
     async def on_cleanup(app: web.Application) -> None:
         global _smtp_controller  # noqa: PLW0603
-        for key in ("_cleanup_share_task", "_cleanup_inbox_task", "_cleanup_rooms_task", "_lockdown_broadcast_task", "_mailtm_poll_task", "_proxy_watchdog_task"):
+        for key in ("_cleanup_share_task", "_cleanup_inbox_task", "_cleanup_rooms_task", "_lockdown_broadcast_task", "_mailtm_poll_task", "_proxy_watchdog_task", "_metrics_collector_task"):
             task = app.get(key)
             if task:
                 task.cancel()
