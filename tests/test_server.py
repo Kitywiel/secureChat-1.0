@@ -2591,6 +2591,139 @@ def test_persist_new_env_vars_skips_commented_out_keys(tmp_path: Path) -> None:
     assert "COMMENTED=new" in content
 
 
+# ---------------------------------------------------------------------------
+# _persist_vars_to_bat
+# ---------------------------------------------------------------------------
+
+def test_persist_vars_to_bat_returns_false_when_no_bat(tmp_path: Path) -> None:
+    """Returns False when the target bat file does not exist."""
+    import server as _s
+
+    result = _s._persist_vars_to_bat({"FOO": "bar"}, bat_path=tmp_path / "missing.bat")
+    assert result is False
+
+
+def test_persist_vars_to_bat_inserts_before_python_run(tmp_path: Path) -> None:
+    """SET lines are inserted right before the 'python run.py' call."""
+    import server as _s
+
+    bat = tmp_path / "start_server.bat"
+    bat.write_text(
+        "@echo off\n"
+        "cd /d \"%~dp0\"\n"
+        "python run.py\n"
+        "pause\n",
+        encoding="utf-8",
+    )
+
+    result = _s._persist_vars_to_bat({"CLEARNET_PATH": "mycustompath"}, bat_path=bat)
+
+    assert result is True
+    content = bat.read_text(encoding="utf-8")
+    assert "SET CLEARNET_PATH=mycustompath" in content
+    # The SET line must appear before 'python run.py'
+    set_idx = content.index("SET CLEARNET_PATH=mycustompath")
+    run_idx = content.index("python run.py")
+    assert set_idx < run_idx
+
+
+def test_persist_vars_to_bat_skips_existing_keys(tmp_path: Path) -> None:
+    """Does not add a SET line for a key already present in the bat file."""
+    import server as _s
+
+    bat = tmp_path / "start_server.bat"
+    bat.write_text(
+        "@echo off\n"
+        "SET CLEARNET_PATH=existingvalue\n"
+        "python run.py\n",
+        encoding="utf-8",
+    )
+
+    result = _s._persist_vars_to_bat({"CLEARNET_PATH": "newvalue"}, bat_path=bat)
+
+    assert result is True
+    content = bat.read_text(encoding="utf-8")
+    # Old value must be preserved
+    assert "SET CLEARNET_PATH=existingvalue" in content
+    assert "SET CLEARNET_PATH=newvalue" not in content
+
+
+def test_persist_vars_to_bat_returns_true_when_all_present(tmp_path: Path) -> None:
+    """Returns True (up-to-date) when all keys are already in the bat file."""
+    import server as _s
+
+    bat = tmp_path / "start_server.bat"
+    bat.write_text(
+        "@echo off\n"
+        "SET CLEARNET_PATH=abc\n"
+        "SET ADMIN_PATH=def\n"
+        "python run.py\n",
+        encoding="utf-8",
+    )
+    mtime_before = bat.stat().st_mtime
+
+    result = _s._persist_vars_to_bat(
+        {"CLEARNET_PATH": "x", "ADMIN_PATH": "y"}, bat_path=bat
+    )
+
+    assert result is True
+    # File must not have been modified
+    assert bat.stat().st_mtime == mtime_before
+
+
+def test_persist_vars_to_bat_idempotent(tmp_path: Path) -> None:
+    """Calling twice with the same values does not duplicate SET entries."""
+    import server as _s
+
+    bat = tmp_path / "start_server.bat"
+    bat.write_text("@echo off\npython run.py\npause\n", encoding="utf-8")
+
+    _s._persist_vars_to_bat({"MYKEY": "val"}, bat_path=bat)
+    _s._persist_vars_to_bat({"MYKEY": "val"}, bat_path=bat)
+
+    content = bat.read_text(encoding="utf-8")
+    assert content.count("SET MYKEY=val") == 1
+
+
+def test_persist_vars_to_bat_multiple_keys(tmp_path: Path) -> None:
+    """All new keys are written as individual SET lines."""
+    import server as _s
+
+    bat = tmp_path / "start_server.bat"
+    bat.write_text("@echo off\npython run.py\npause\n", encoding="utf-8")
+
+    result = _s._persist_vars_to_bat(
+        {"CLEARNET_PATH": "path1", "ADMIN_PATH": "path2", "ADMIN_PASSCODE": "secret"},
+        bat_path=bat,
+    )
+
+    assert result is True
+    content = bat.read_text(encoding="utf-8")
+    assert "SET CLEARNET_PATH=path1" in content
+    assert "SET ADMIN_PATH=path2" in content
+    assert "SET ADMIN_PASSCODE=secret" in content
+
+
+def test_persist_vars_to_bat_case_insensitive_key_check(tmp_path: Path) -> None:
+    """Key detection in the bat file is case-insensitive (set vs SET vs Set)."""
+    import server as _s
+
+    bat = tmp_path / "start_server.bat"
+    bat.write_text(
+        "@echo off\n"
+        "set clearnet_path=existing\n"   # lowercase 'set'
+        "python run.py\n",
+        encoding="utf-8",
+    )
+
+    _s._persist_vars_to_bat({"CLEARNET_PATH": "new"}, bat_path=bat)
+
+    content = bat.read_text(encoding="utf-8")
+    # Should not have added a new line since the key was already there
+    assert "SET CLEARNET_PATH=new" not in content
+    assert "clearnet_path=existing" in content
+
+
 @pytest.mark.asyncio
 async def test_probe_clearnet_exit_ip_uses_tor_first(capsys) -> None:
     """_probe_clearnet_exit_ip tries Tor (socks5://127.0.0.1:9050) first."""

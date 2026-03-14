@@ -2778,6 +2778,82 @@ def _persist_new_env_vars(
         pass  # best-effort; if we cannot write, just continue
 
 
+def _persist_vars_to_bat(
+    pairs: dict[str, str],
+    bat_path: Path | None = None,
+) -> bool:
+    """Write new ``SET KEY=VALUE`` entries into the Windows ``.bat`` launcher.
+
+    Only writes keys that are **not already present** as ``SET`` commands in
+    the file.  Existing ``SET`` lines — including user-edited ones — are never
+    modified.  New lines are inserted right before the ``python run.py`` call
+    so they are active as environment variables when the server starts next
+    time via double-click.
+
+    Args:
+        pairs:    Mapping of ``ENV_VAR_NAME`` → value to persist.
+        bat_path: Path to the ``.bat`` file.  Defaults to ``start_server.bat``
+                  next to *this* file (``server.py``).
+
+    Returns:
+        ``True`` if the file was written (or no new keys were needed),
+        ``False`` if the bat file does not exist or could not be read/written.
+    """
+    target = bat_path if bat_path is not None else (_HERE / "start_server.bat")
+    if not target.is_file():
+        return False
+
+    try:
+        content = target.read_text(encoding="utf-8")
+    except OSError:
+        return False
+
+    # Collect keys already present as SET commands (case-insensitive).
+    existing_keys: set[str] = set()
+    for line in content.splitlines():
+        stripped = line.strip()
+        upper = stripped.upper()
+        if upper.startswith("SET ") and "=" in stripped:
+            key = stripped[4:].partition("=")[0].strip().upper()
+            existing_keys.add(key)
+
+    new_lines = [
+        f"SET {k}={v}\n"
+        for k, v in pairs.items()
+        if k.upper() not in existing_keys
+    ]
+    if not new_lines:
+        return True  # nothing to add, already up-to-date
+
+    header = (
+        "\n"
+        ":: Auto-generated secrets — kept so URLs/tokens survive restarts.\n"
+        ":: To use a custom value, update the SET line below and restart.\n"
+    )
+    block = header + "".join(new_lines)
+
+    # Insert right before the 'python run.py' invocation line.
+    lines = content.splitlines(keepends=True)
+    insert_idx: int | None = None
+    for i, line in enumerate(lines):
+        if "run.py" in line and line.strip().lower().startswith("python"):
+            insert_idx = i
+            break
+
+    if insert_idx is not None:
+        lines.insert(insert_idx, block)
+        new_content = "".join(lines)
+    else:
+        # Fallback: append at the end of the file.
+        new_content = content.rstrip("\n") + "\n" + block
+
+    try:
+        target.write_text(new_content, encoding="utf-8")
+        return True
+    except OSError:
+        return False
+
+
 def _init_admin_credentials() -> tuple[str, str]:
     """Generate (or read from env) admin path and passcode; print both to console.
 
@@ -3547,12 +3623,14 @@ if __name__ == "__main__":
     _CLEARNET_PATH = _init_clearnet_path()
 
     # Persist auto-generated secrets so they survive restarts.
-    _persist_new_env_vars({
+    _secrets_to_persist = {
         "CLEARNET_PATH":       _CLEARNET_PATH,
         "ADMIN_PATH":          _ADMIN_PATH,
         "ADMIN_PASSCODE":      _ADMIN_PASSCODE,
         "ADMIN_WEBHOOK_TOKEN": _ADMIN_WEBHOOK_TOKEN,
-    })
+    }
+    if not _persist_vars_to_bat(_secrets_to_persist):
+        _persist_new_env_vars(_secrets_to_persist)
 
     logger.info("secureChat starting  host=%s  port=%d", host, port)
     logger.info(

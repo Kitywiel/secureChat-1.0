@@ -707,15 +707,21 @@ def main() -> None:
     srv._MESH_TOKEN = _secrets.token_urlsafe(32)
     srv._CLEARNET_PATH = srv._init_clearnet_path()
 
-    # Persist auto-generated secrets to .env so they survive restarts.
-    # Keys the user has already set in .env are never overwritten.
-    srv._persist_new_env_vars({
+    # Persist auto-generated secrets so they survive restarts.
+    # On Windows the .bat launcher is updated with SET commands so the values
+    # are available before Python starts.  On other platforms (or when the bat
+    # file is absent) the secrets fall back to the .env file.
+    _secrets_to_persist = {
         "CLEARNET_PATH":       srv._CLEARNET_PATH,
         "ADMIN_PATH":          srv._ADMIN_PATH,
         "ADMIN_PASSCODE":      srv._ADMIN_PASSCODE,
         "ADMIN_WEBHOOK_TOKEN": srv._ADMIN_WEBHOOK_TOKEN,
         "MESH_TOKEN":          srv._MESH_TOKEN,
-    })
+    }
+    wrote_bat = srv._persist_vars_to_bat(_secrets_to_persist)
+    if not wrote_bat:
+        # Fallback: write to .env for non-Windows or missing bat file.
+        srv._persist_new_env_vars(_secrets_to_persist)
 
     mail_domain: str = srv.MAIL_DOMAIN
     smtp_enabled: bool = bool(mail_domain)
