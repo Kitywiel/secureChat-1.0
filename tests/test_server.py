@@ -2518,6 +2518,79 @@ def test_init_clearnet_path_console_no_full_url_hint(capsys) -> None:
     assert "Tor (127.0.0.1:9050) if available, else direct" in captured.out
 
 
+# ---------------------------------------------------------------------------
+# _persist_new_env_vars
+# ---------------------------------------------------------------------------
+
+def test_persist_new_env_vars_creates_file(tmp_path: Path) -> None:
+    """Creates .env and writes all pairs when the file does not yet exist."""
+    import server as _s
+
+    dotenv = tmp_path / ".env"
+    _s._persist_new_env_vars({"FOO": "bar", "BAZ": "qux"}, dotenv_path=dotenv)
+
+    assert dotenv.is_file()
+    content = dotenv.read_text()
+    assert "FOO=bar" in content
+    assert "BAZ=qux" in content
+
+
+def test_persist_new_env_vars_appends_missing_only(tmp_path: Path) -> None:
+    """Only appends keys not already present; never duplicates or overwrites."""
+    import server as _s
+
+    dotenv = tmp_path / ".env"
+    dotenv.write_text("EXISTING=old\n", encoding="utf-8")
+
+    _s._persist_new_env_vars({"EXISTING": "NEW", "NEWKEY": "val"}, dotenv_path=dotenv)
+
+    content = dotenv.read_text()
+    # Old value preserved
+    assert "EXISTING=old" in content
+    assert "EXISTING=NEW" not in content
+    # New key added
+    assert "NEWKEY=val" in content
+
+
+def test_persist_new_env_vars_no_write_when_all_present(tmp_path: Path) -> None:
+    """Does not touch the file when all keys are already present."""
+    import server as _s
+
+    dotenv = tmp_path / ".env"
+    dotenv.write_text("K1=v1\nK2=v2\n", encoding="utf-8")
+    mtime_before = dotenv.stat().st_mtime
+
+    _s._persist_new_env_vars({"K1": "x", "K2": "y"}, dotenv_path=dotenv)
+
+    # mtime must be unchanged (no write happened)
+    assert dotenv.stat().st_mtime == mtime_before
+
+
+def test_persist_new_env_vars_idempotent(tmp_path: Path) -> None:
+    """Calling twice with the same values does not duplicate entries."""
+    import server as _s
+
+    dotenv = tmp_path / ".env"
+    _s._persist_new_env_vars({"X": "1"}, dotenv_path=dotenv)
+    _s._persist_new_env_vars({"X": "1"}, dotenv_path=dotenv)
+
+    content = dotenv.read_text()
+    assert content.count("X=1") == 1
+
+
+def test_persist_new_env_vars_skips_commented_out_keys(tmp_path: Path) -> None:
+    """A commented-out key (# KEY=...) is NOT treated as already present."""
+    import server as _s
+
+    dotenv = tmp_path / ".env"
+    dotenv.write_text("# COMMENTED=old\n", encoding="utf-8")
+
+    _s._persist_new_env_vars({"COMMENTED": "new"}, dotenv_path=dotenv)
+
+    content = dotenv.read_text()
+    assert "COMMENTED=new" in content
+
+
 @pytest.mark.asyncio
 async def test_probe_clearnet_exit_ip_uses_tor_first(capsys) -> None:
     """_probe_clearnet_exit_ip tries Tor (socks5://127.0.0.1:9050) first."""

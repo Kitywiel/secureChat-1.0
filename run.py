@@ -705,6 +705,17 @@ def main() -> None:
     srv._ADMIN_PATH, srv._ADMIN_PASSCODE = srv._init_admin_credentials()
     srv._ADMIN_WEBHOOK_TOKEN = _secrets.token_urlsafe(32)
     srv._MESH_TOKEN = _secrets.token_urlsafe(32)
+    srv._CLEARNET_PATH = srv._init_clearnet_path()
+
+    # Persist auto-generated secrets to .env so they survive restarts.
+    # Keys the user has already set in .env are never overwritten.
+    srv._persist_new_env_vars({
+        "CLEARNET_PATH":       srv._CLEARNET_PATH,
+        "ADMIN_PATH":          srv._ADMIN_PATH,
+        "ADMIN_PASSCODE":      srv._ADMIN_PASSCODE,
+        "ADMIN_WEBHOOK_TOKEN": srv._ADMIN_WEBHOOK_TOKEN,
+        "MESH_TOKEN":          srv._MESH_TOKEN,
+    })
 
     mail_domain: str = srv.MAIL_DOMAIN
     smtp_enabled: bool = bool(mail_domain)

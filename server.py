@@ -2725,6 +2725,59 @@ async def _admin_incoming_webhook_handler(request: web.Request) -> web.Response:
     return resp
 
 
+def _persist_new_env_vars(
+    pairs: dict[str, str],
+    dotenv_path: Path | None = None,
+) -> None:
+    """Append *new* key=value entries to the .env file next to server.py.
+
+    Only writes keys that are **not already present** in the file.  Existing
+    entries — including user-set values and comments — are never modified.
+    Creates the file (with a header comment) if it does not yet exist.
+
+    This lets auto-generated secrets (admin path, clearnet path, …) survive
+    server restarts without any manual configuration.  Users who prefer a
+    custom value can simply set it in ``.env`` before the first run, or
+    overwrite the auto-generated line afterwards.
+
+    Args:
+        pairs:        Mapping of ``ENV_VAR_NAME`` → ``value`` to persist.
+        dotenv_path:  Path to the ``.env`` file.  Defaults to ``.env`` next
+                      to *this* file (``server.py``).
+    """
+    target = dotenv_path if dotenv_path is not None else (_HERE / ".env")
+
+    # Collect keys already present so we never duplicate them.
+    existing_keys: set[str] = set()
+    if target.is_file():
+        try:
+            for raw in target.read_text(encoding="utf-8").splitlines():
+                line = raw.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    key, _, _ = line.partition("=")
+                    existing_keys.add(key.strip())
+        except OSError:
+            return  # can't read — bail out silently
+
+    new_lines = [
+        f"{k}={v}\n"
+        for k, v in pairs.items()
+        if k not in existing_keys
+    ]
+    if not new_lines:
+        return
+
+    try:
+        with target.open("a", encoding="utf-8") as fh:
+            fh.write(
+                "\n# Auto-generated secrets — kept so URLs/tokens survive restarts.\n"
+                "# To use a custom value, replace the line below and restart.\n"
+            )
+            fh.writelines(new_lines)
+    except OSError:
+        pass  # best-effort; if we cannot write, just continue
+
+
 def _init_admin_credentials() -> tuple[str, str]:
     """Generate (or read from env) admin path and passcode; print both to console.
 
@@ -3492,6 +3545,14 @@ if __name__ == "__main__":
     _ADMIN_WEBHOOK_TOKEN = secrets.token_urlsafe(32)
     print(f"  Admin webhook  : /{_ADMIN_PATH}/webhook/{_ADMIN_WEBHOOK_TOKEN}", flush=True)
     _CLEARNET_PATH = _init_clearnet_path()
+
+    # Persist auto-generated secrets so they survive restarts.
+    _persist_new_env_vars({
+        "CLEARNET_PATH":       _CLEARNET_PATH,
+        "ADMIN_PATH":          _ADMIN_PATH,
+        "ADMIN_PASSCODE":      _ADMIN_PASSCODE,
+        "ADMIN_WEBHOOK_TOKEN": _ADMIN_WEBHOOK_TOKEN,
+    })
 
     logger.info("secureChat starting  host=%s  port=%d", host, port)
     logger.info(
