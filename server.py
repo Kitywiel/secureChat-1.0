@@ -335,6 +335,235 @@ _lockdown_active: bool = False
 _smtp_controller: _SmtpController | None = None
 
 # ---------------------------------------------------------------------------
+# DDoS protection — IP-based sliding-window rate limiter
+# ---------------------------------------------------------------------------
+# Configurable via environment variables:
+#   DDOS_REQ_LIMIT   – max requests per window (default 200)
+#   DDOS_WINDOW_SEC  – sliding window in seconds (default 10)
+#   DDOS_BAN_SEC     – how long an IP stays banned (default 300)
+#   DDOS_AUTO_LOCKDOWN_THRESHOLD – unique IPs banned before auto-lockdown (default 50)
+#   DDOS_ENABLED     – set to "0" to disable (default enabled)
+
+DDOS_ENABLED: bool = os.environ.get("DDOS_ENABLED", "1") not in ("0", "false", "no")
+DDOS_REQ_LIMIT: int = int(os.environ.get("DDOS_REQ_LIMIT", "200"))
+DDOS_WINDOW_SEC: float = float(os.environ.get("DDOS_WINDOW_SEC", "10"))
+DDOS_BAN_SEC: float = float(os.environ.get("DDOS_BAN_SEC", "300"))
+DDOS_AUTO_LOCKDOWN_THRESHOLD: int = int(os.environ.get("DDOS_AUTO_LOCKDOWN_THRESHOLD", "50"))
+
+# IP → deque of request timestamps (sliding window)
+_ddos_req_timestamps: dict[str, collections.deque] = collections.defaultdict(
+    lambda: collections.deque()
+)
+# IP → ban expiry timestamp
+_ddos_banned: dict[str, float] = {}
+# Total DDoS events ever detected (for stats)
+_ddos_events_total: int = 0
+# IP → ban count (to detect repeat offenders)
+_ddos_ban_count: dict[str, int] = collections.defaultdict(int)
+
+
+def _ddos_check_ip(ip: str) -> bool:
+    """Return True if the request from *ip* should be blocked.
+
+    Also updates the sliding window and issues a ban when the threshold is
+    exceeded.  Thread-safe enough for CPython (GIL protects dict mutations).
+    """
+    global _ddos_events_total, _lockdown_active  # noqa: PLW0603
+    if not DDOS_ENABLED:
+        return False
+
+    now = time.time()
+
+    # Check existing ban first
+    ban_exp = _ddos_banned.get(ip)
+    if ban_exp is not None:
+        if now < ban_exp:
+            return True   # still banned
+        # Ban expired — lift it
+        del _ddos_banned[ip]
+        _ddos_req_timestamps.pop(ip, None)
+
+    # Slide the window: remove timestamps older than DDOS_WINDOW_SEC
+    dq = _ddos_req_timestamps[ip]
+    cutoff = now - DDOS_WINDOW_SEC
+    while dq and dq[0] < cutoff:
+        dq.popleft()
+
+    dq.append(now)
+
+    if len(dq) > DDOS_REQ_LIMIT:
+        # Ban this IP
+        _ddos_banned[ip] = now + DDOS_BAN_SEC
+        _ddos_ban_count[ip] += 1
+        _ddos_events_total += 1
+        logger.warning(
+            "🛡️  DDoS detected — ip=%s  reqs_in_window=%d  ban_count=%d  ban_until=%s",
+            ip, len(dq), _ddos_ban_count[ip],
+            time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now + DDOS_BAN_SEC)),
+        )
+
+        # Auto-lockdown when too many unique IPs are banned simultaneously
+        active_bans = sum(1 for exp in _ddos_banned.values() if exp > now)
+        if active_bans >= DDOS_AUTO_LOCKDOWN_THRESHOLD and not _lockdown_active:
+            _lockdown_active = True
+            logger.warning(
+                "🔴 AUTO-LOCKDOWN triggered — %d IPs simultaneously banned "
+                "(threshold=%d)",
+                active_bans, DDOS_AUTO_LOCKDOWN_THRESHOLD,
+            )
+
+        return True
+
+    return False
+
+
+@web.middleware
+async def _ddos_middleware(request: web.Request, handler):
+    """Drop requests from banned / rate-exceeded IPs with HTTP 429."""
+    ip = request.remote or "unknown"
+    # Normalise IPv6-mapped IPv4 addresses (e.g. ::ffff:1.2.3.4 → 1.2.3.4)
+    if ip.startswith("::ffff:"):
+        ip = ip[7:]
+
+    if _ddos_check_ip(ip):
+        raise web.HTTPTooManyRequests(
+            reason="Too many requests — you have been temporarily banned"
+        )
+    return await handler(request)
+
+
+def _ddos_get_stats() -> dict:
+    """Return a snapshot of current DDoS protection statistics."""
+    now = time.time()
+    active_bans = {ip: exp for ip, exp in _ddos_banned.items() if exp > now}
+    return {
+        "enabled": DDOS_ENABLED,
+        "req_limit_per_window": DDOS_REQ_LIMIT,
+        "window_sec": DDOS_WINDOW_SEC,
+        "ban_duration_sec": DDOS_BAN_SEC,
+        "auto_lockdown_threshold": DDOS_AUTO_LOCKDOWN_THRESHOLD,
+        "total_ddos_events": _ddos_events_total,
+        "currently_banned_count": len(active_bans),
+        "currently_banned_ips": [
+            {"ip": ip, "expires_at": exp, "ban_count": _ddos_ban_count[ip]}
+            for ip, exp in sorted(active_bans.items(), key=lambda kv: -kv[1])
+        ],
+    }
+
+
+def _ddos_unban_ip(ip: str) -> bool:
+    """Remove *ip* from the ban list.  Returns True if the IP was banned."""
+    if ip in _ddos_banned:
+        del _ddos_banned[ip]
+        _ddos_req_timestamps.pop(ip, None)
+        logger.info("🛡️  DDoS ban lifted manually  ip=%s", ip)
+        return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Spam detection — chat messages and inbound SMTP
+# ---------------------------------------------------------------------------
+# Configurable via environment variables:
+#   SPAM_MSG_LIMIT    – max chat messages per window per session (default 20)
+#   SPAM_MSG_WINDOW   – window in seconds (default 10)
+#   SPAM_MAIL_LIMIT   – max inbound emails per sender per window (default 5)
+#   SPAM_MAIL_WINDOW  – window in seconds (default 60)
+#   SPAM_ENABLED      – set to "0" to disable (default enabled)
+
+SPAM_ENABLED: bool = os.environ.get("SPAM_ENABLED", "1") not in ("0", "false", "no")
+SPAM_MSG_LIMIT: int = int(os.environ.get("SPAM_MSG_LIMIT", "20"))
+SPAM_MSG_WINDOW: float = float(os.environ.get("SPAM_MSG_WINDOW", "10"))
+SPAM_MAIL_LIMIT: int = int(os.environ.get("SPAM_MAIL_LIMIT", "5"))
+SPAM_MAIL_WINDOW: float = float(os.environ.get("SPAM_MAIL_WINDOW", "60"))
+
+# session_id (object id of the WebSocket) → deque of message timestamps
+_spam_msg_timestamps: dict[int, collections.deque] = collections.defaultdict(
+    lambda: collections.deque()
+)
+# email sender address → deque of receipt timestamps
+_spam_mail_timestamps: dict[str, collections.deque] = collections.defaultdict(
+    lambda: collections.deque()
+)
+# Total spam events detected
+_spam_msg_events_total: int = 0
+_spam_mail_events_total: int = 0
+
+
+def _spam_check_chat(ws_id: int) -> bool:
+    """Return True (and log) if the WebSocket session identified by *ws_id* is spamming.
+
+    Uses a sliding window over SPAM_MSG_WINDOW seconds.
+    """
+    global _spam_msg_events_total  # noqa: PLW0603
+    if not SPAM_ENABLED:
+        return False
+
+    now = time.time()
+    dq = _spam_msg_timestamps[ws_id]
+    cutoff = now - SPAM_MSG_WINDOW
+    while dq and dq[0] < cutoff:
+        dq.popleft()
+    dq.append(now)
+
+    if len(dq) > SPAM_MSG_LIMIT:
+        _spam_msg_events_total += 1
+        logger.warning(
+            "🚫 Chat spam detected  ws_id=%d  msgs_in_window=%d",
+            ws_id, len(dq),
+        )
+        return True
+    return False
+
+
+def _spam_check_mail(sender: str) -> bool:
+    """Return True (and log) if *sender* is sending too many inbound emails.
+
+    Uses a sliding window over SPAM_MAIL_WINDOW seconds.
+    """
+    global _spam_mail_events_total  # noqa: PLW0603
+    if not SPAM_ENABLED:
+        return False
+
+    # Normalise the sender key — lower-cased, strip display-name
+    key = sender.lower()
+    # Strip display-name like "Alice <alice@example.com>"
+    m = re.search(r"<([^>]+)>", key)
+    if m:
+        key = m.group(1)
+
+    now = time.time()
+    dq = _spam_mail_timestamps[key]
+    cutoff = now - SPAM_MAIL_WINDOW
+    while dq and dq[0] < cutoff:
+        dq.popleft()
+    dq.append(now)
+
+    if len(dq) > SPAM_MAIL_LIMIT:
+        _spam_mail_events_total += 1
+        logger.warning(
+            "🚫 Mail spam detected  sender=%s  mails_in_window=%d",
+            key, len(dq),
+        )
+        return True
+    return False
+
+
+def _spam_get_stats() -> dict:
+    """Return a snapshot of current spam detection statistics."""
+    return {
+        "enabled": SPAM_ENABLED,
+        "chat_msg_limit_per_window": SPAM_MSG_LIMIT,
+        "chat_msg_window_sec": SPAM_MSG_WINDOW,
+        "mail_limit_per_window": SPAM_MAIL_LIMIT,
+        "mail_window_sec": SPAM_MAIL_WINDOW,
+        "total_chat_spam_events": _spam_msg_events_total,
+        "total_mail_spam_events": _spam_mail_events_total,
+        "active_chat_sessions_tracked": len(_spam_msg_timestamps),
+        "active_mail_senders_tracked": len(_spam_mail_timestamps),
+    }
+
+# ---------------------------------------------------------------------------
 # Global statistics counters
 # ---------------------------------------------------------------------------
 
@@ -614,6 +843,17 @@ async def ws_handler(request: web.Request) -> web.WebSocketResponse:
 
             # ── message ───────────────────────────────────────────────────
             elif msg_type == "message" and room_id is not None:
+                # Spam detection — drop messages from sessions that exceed the
+                # configured rate limit.  The WebSocket object id is used as the
+                # session key; it is unique for the lifetime of the connection.
+                if _spam_check_chat(id(ws)):
+                    await ws.send_str(json.dumps({
+                        "type": "error",
+                        "reason": "rate_limited",
+                        "detail": "Too many messages — slow down",
+                    }))
+                    continue
+
                 iv = str(data.get("iv", ""))
                 ciphertext = str(data.get("ciphertext", ""))
                 sender = str(data.get("sender", ""))[:MAX_DISPLAY_NAME_LEN]
@@ -645,6 +885,15 @@ async def ws_handler(request: web.Request) -> web.WebSocketResponse:
 
             # ── file (in-chat attachment) ──────────────────────────────────
             elif msg_type == "file" and room_id is not None:
+                # Spam detection for file uploads (share the same chat limiter)
+                if _spam_check_chat(id(ws)):
+                    await ws.send_str(json.dumps({
+                        "type": "error",
+                        "reason": "rate_limited",
+                        "detail": "Too many file uploads — slow down",
+                    }))
+                    continue
+
                 iv         = str(data.get("iv", ""))
                 ciphertext = str(data.get("ciphertext", ""))
                 sender     = str(data.get("sender", ""))[:MAX_DISPLAY_NAME_LEN]
@@ -1301,6 +1550,10 @@ class InboxSmtpHandler:
 
         subject = str(msg.get("Subject", "(no subject)"))
         from_addr = str(msg.get("From", "(unknown sender)"))
+
+        # Spam detection — drop messages from senders that exceed the rate limit
+        if _spam_check_mail(from_addr):
+            return "450 4.7.1 Too many messages from this sender — try again later"
 
         body_text = ""
         body_html = ""
@@ -2182,6 +2435,38 @@ async def _admin_logs_sse_handler(request: web.Request) -> web.StreamResponse:
     return response
 
 
+async def _admin_ddos_stats_handler(request: web.Request) -> web.Response:
+    """GET /{path}/api/ddos-stats — return DDoS protection statistics."""
+    if not _valid_admin_session(request):
+        raise web.HTTPUnauthorized()
+    resp = web.json_response({
+        "ddos": _ddos_get_stats(),
+        "spam": _spam_get_stats(),
+    })
+    _add_admin_security_headers(resp)
+    return resp
+
+
+async def _admin_ddos_unban_handler(request: web.Request) -> web.Response:
+    """POST /{path}/api/ddos-unban — manually lift a DDoS ban.
+
+    Body: ``{"ip": "1.2.3.4"}``
+    """
+    if not _valid_admin_session(request):
+        raise web.HTTPUnauthorized()
+    try:
+        body = await request.json()
+    except Exception:
+        raise web.HTTPBadRequest(reason="Invalid JSON")
+    ip = str(body.get("ip", "")).strip()
+    if not ip:
+        raise web.HTTPBadRequest(reason="'ip' field is required")
+    unbanned = _ddos_unban_ip(ip)
+    resp = web.json_response({"unbanned": unbanned, "ip": ip})
+    _add_admin_security_headers(resp)
+    return resp
+
+
 async def _admin_shutdown_handler(request: web.Request) -> web.Response:
     """POST /{path}/api/shutdown — emergency shutdown."""
     if not _valid_admin_session(request):
@@ -2356,6 +2641,8 @@ def _register_admin_routes(app: web.Application) -> None:
     app.router.add_post(f"/{p}/webhook/{{token}}", _admin_incoming_webhook_handler)
     app.router.add_post(f"/{p}/api/lockdown", _admin_lockdown_handler)
     app.router.add_get(f"/{p}/api/lockdown", _admin_lockdown_status_handler)
+    app.router.add_get(f"/{p}/api/ddos-stats", _admin_ddos_stats_handler)
+    app.router.add_post(f"/{p}/api/ddos-unban", _admin_ddos_unban_handler)
 
 
 # ---------------------------------------------------------------------------
@@ -2495,6 +2782,8 @@ def build_admin_app() -> web.Application:
     app.router.add_post("/admin/webhook/{token}", _admin_incoming_webhook_handler)
     app.router.add_post("/admin/api/lockdown", _admin_lockdown_handler)
     app.router.add_get("/admin/api/lockdown", _admin_lockdown_status_handler)
+    app.router.add_get("/admin/api/ddos-stats", _admin_ddos_stats_handler)
+    app.router.add_post("/admin/api/ddos-unban", _admin_ddos_unban_handler)
     return app
 
 
@@ -2671,7 +2960,10 @@ def build_app(db_path: Path | None = None) -> web.Application:
     resolved_db = db_path if db_path is not None else DB_PATH
 
     # Allow up to MAX_UPLOAD_BYTES for multipart uploads
-    app = web.Application(client_max_size=MAX_UPLOAD_BYTES, middlewares=[_lockdown_middleware])
+    app = web.Application(
+        client_max_size=MAX_UPLOAD_BYTES,
+        middlewares=[_ddos_middleware, _lockdown_middleware],
+    )
     app["db_path"] = resolved_db
 
     async def on_startup(app: web.Application) -> None:
