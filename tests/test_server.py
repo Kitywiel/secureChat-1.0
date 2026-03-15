@@ -3053,6 +3053,36 @@ def test_join_mesh_peer_onion_aborts_on_proxy_unreachable(capsys) -> None:
     assert "start Tor" in captured.out.lower() or "tor" in captured.out.lower()
 
 
+def test_socks_port_for_tor_returns_9050_when_port_is_free() -> None:
+    """_socks_port_for_tor returns '9050' when nothing is bound to 127.0.0.1:9050."""
+    import socket
+    import run as _run
+
+    # Confirm 9050 is free by binding it ourselves, then releasing before the call.
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        try:
+            probe.bind(("127.0.0.1", 9050))
+        except OSError:
+            pytest.skip("Port 9050 already in use on this machine — cannot test free-port path")
+
+    # Port was free (and is now released again).
+    result = _run._socks_port_for_tor()
+    assert result == "9050"
+
+
+def test_socks_port_for_tor_returns_0_when_port_is_occupied() -> None:
+    """_socks_port_for_tor returns '0' when 127.0.0.1:9050 is already in use."""
+    import socket
+    import run as _run
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as occupier:
+        try:
+            occupier.bind(("127.0.0.1", 9050))
+        except OSError:
+            pytest.skip("Cannot bind 9050 to simulate occupation — skipping")
+        # While the socket holds the port, our helper must return "0".
+        result = _run._socks_port_for_tor()
+    assert result == "0"
 
 
 @pytest.mark.asyncio

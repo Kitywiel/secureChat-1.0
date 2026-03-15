@@ -355,6 +355,26 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
+def _socks_port_for_tor() -> str:
+    """Return ``"9050"`` if that port is free, else ``"0"``.
+
+    When we start our own Tor process we want it to expose a SOCKS5 proxy on
+    the standard port 9050 so that outbound .onion requests (e.g. mesh peer
+    joins) can route through Tor without needing a separate system-level Tor
+    installation.
+
+    If port 9050 is already occupied (e.g. a system Tor daemon is running),
+    return ``"0"`` to disable the SocksPort in our process — the existing
+    listener at 9050 will serve SOCKS5 requests just fine.
+    """
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", 9050))
+        return "9050"
+    except OSError:
+        return "0"
+
+
 def _tor_log(line: str) -> None:
     if "Bootstrapped" in line or "[err]" in line.lower() or "[warn]" in line.lower():
         print(f"  [Tor] {line.rstrip()}")
@@ -377,7 +397,7 @@ def _start_tor(tor_exe: Path, server_port: int) -> tuple[str, object] | None:
     print("\n  Starting Tor …  (may take up to 90 s on first run)")
 
     config: dict = {
-        "SocksPort":        "0",
+        "SocksPort":        _socks_port_for_tor(),
         "ControlPort":      str(_free_port()),
         "DataDirectory":    str(_TOR_DATA_DIR),
         "HiddenServiceDir": str(_HS_DIR),
