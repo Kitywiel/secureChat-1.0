@@ -2279,12 +2279,22 @@ async def test_lockdown_bad_action_returns_400(ws_client) -> None:
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
+async def test_mesh_path_is_50_chars(ws_client) -> None:
+    """_MESH_PATH is exactly 50 URL-safe characters after build_app() runs."""
+    import server as _s
+    assert len(_s._MESH_PATH) == 50, f"Expected 50 chars, got {len(_s._MESH_PATH)}"
+    import re as _re
+    assert _re.fullmatch(r"[A-Za-z0-9_-]+", _s._MESH_PATH), \
+        "MESH_PATH contains non-URL-safe characters"
+
+
+@pytest.mark.asyncio
 async def test_mesh_connect_rejects_wrong_token(ws_client) -> None:
-    """POST /mesh/peer/connect returns 403 with wrong token."""
+    """POST /<mesh_path>/mesh/connect returns 403 with wrong token."""
     import server as _s
     _s._MESH_TOKEN = "correct-token"
     resp = await ws_client.post(
-        "/mesh/peer/connect",
+        f"/{_s._MESH_PATH}/mesh/connect",
         json={"token": "wrong", "peer_url": "http://peer.onion", "peer_token": "x"},
     )
     assert resp.status == 403
@@ -2292,31 +2302,129 @@ async def test_mesh_connect_rejects_wrong_token(ws_client) -> None:
 
 @pytest.mark.asyncio
 async def test_mesh_connect_registers_peer(ws_client) -> None:
-    """POST /mesh/peer/connect registers a peer and returns peer_id."""
+    """POST /<mesh_path>/mesh/connect registers a peer and returns peer_id, mesh_path, peers."""
     import server as _s
     _s._MESH_TOKEN = "test-mesh-secret"
+    _s._mesh_peers.clear()
     resp = await ws_client.post(
-        "/mesh/peer/connect",
-        json={"token": "test-mesh-secret", "peer_url": "http://peer.onion", "peer_token": "pt"},
+        f"/{_s._MESH_PATH}/mesh/connect",
+        json={
+            "token":          "test-mesh-secret",
+            "peer_url":       "http://peer.onion",
+            "peer_token":     "pt",
+            "peer_mesh_path": "a" * 50,
+        },
     )
     assert resp.status == 200
     data = await resp.json()
     assert data["ok"] is True
     assert "peer_id" in data
+    assert "mesh_path" in data
+    assert data["mesh_path"] == _s._MESH_PATH
+    assert "peers" in data
+    assert isinstance(data["peers"], list)
     # Clean up
     _s._mesh_peers.clear()
 
 
 @pytest.mark.asyncio
 async def test_mesh_forward_rejects_unknown_token(ws_client) -> None:
-    """POST /mesh/peer/forward returns 403 for unregistered peer token."""
+    """POST /<mesh_path>/mesh/forward returns 403 for unregistered peer token."""
     import server as _s
     _s._mesh_peers.clear()
     resp = await ws_client.post(
-        "/mesh/peer/forward",
+        f"/{_s._MESH_PATH}/mesh/forward",
         json={"token": "unknown", "room_id": "room1", "payload": "{}"},
     )
     assert resp.status == 403
+
+
+@pytest.mark.asyncio
+async def test_mesh_link_handler_rejects_wrong_token(ws_client) -> None:
+    """POST /<mesh_path>/mesh/link returns 403 with wrong token."""
+    import server as _s
+    _s._MESH_TOKEN = "link-correct-token"
+    resp = await ws_client.post(
+        f"/{_s._MESH_PATH}/mesh/link",
+        json={
+            "token":          "wrong-token",
+            "peer_url":       "http://newpeer.onion",
+            "peer_token":     "np_token",
+            "peer_mesh_path": "b" * 50,
+        },
+    )
+    assert resp.status == 403
+
+
+@pytest.mark.asyncio
+async def test_mesh_link_handler_registers_peer(ws_client) -> None:
+    """POST /<mesh_path>/mesh/link registers the announced peer."""
+    import server as _s
+    _s._MESH_TOKEN = "link-correct-token"
+    _s._mesh_peers.clear()
+    resp = await ws_client.post(
+        f"/{_s._MESH_PATH}/mesh/link",
+        json={
+            "token":          "link-correct-token",
+            "peer_url":       "http://newpeer.onion",
+            "peer_token":     "np_token",
+            "peer_mesh_path": "c" * 50,
+        },
+    )
+    assert resp.status == 200
+    data = await resp.json()
+    assert data["ok"] is True
+    assert "peer_id" in data
+    # The announced peer should now be in _mesh_peers
+    registered = [
+        p for p in _s._mesh_peers.values()
+        if p["url"] == "http://newpeer.onion"
+    ]
+    assert registered, "Announced peer not found in _mesh_peers"
+    assert registered[0]["token"] == "np_token"
+    assert registered[0]["mesh_path"] == "c" * 50
+    _s._mesh_peers.clear()
+
+
+@pytest.mark.asyncio
+async def test_forward_to_peers_skips_peers_without_mesh_path(ws_client) -> None:
+    """_forward_to_peers does NOT attempt to deliver to peers with no mesh_path.
+
+    Peers registered without a mesh_path (e.g. legacy peers) have no known
+    secret forward endpoint, so they must be skipped to avoid sending to
+    a predictable public URL or raising an error.
+    """
+    import server as _s
+    from unittest.mock import patch, AsyncMock, MagicMock
+
+    posted_urls: list[str] = []
+
+    async def _fake_proxied_session(timeout=5.0):
+        sess = MagicMock()
+        async def _post(url, **kwargs):
+            posted_urls.append(url)
+            resp = AsyncMock()
+            resp.__aenter__ = AsyncMock(return_value=resp)
+            resp.__aexit__ = AsyncMock(return_value=False)
+            return resp
+        sess.__aenter__ = AsyncMock(return_value=sess)
+        sess.__aexit__ = AsyncMock(return_value=False)
+        sess.post = _post
+        return sess
+
+    # Register one peer WITH a mesh_path, one WITHOUT
+    _s._mesh_peers.clear()
+    _s._mesh_peers["peer_with_path"]    = {"url": "http://good.onion",   "token": "t1", "mesh_path": "x" * 50, "connected_at": 0}
+    _s._mesh_peers["peer_without_path"] = {"url": "http://legacy.onion", "token": "t2", "mesh_path": "",       "connected_at": 0}
+    try:
+        with patch.object(_s, "_make_proxied_session", side_effect=_fake_proxied_session):
+            await _s._forward_to_peers("testroom", '{"msg":"hi"}')
+        # Only the peer with a path should have been contacted
+        assert len(posted_urls) == 1
+        assert "x" * 50 in posted_urls[0]
+        assert "good.onion" in posted_urls[0]
+    finally:
+        _s._mesh_peers.clear()
 
 
 @pytest.mark.asyncio
@@ -2991,6 +3099,7 @@ def test_join_mesh_peer_onion_uses_tor(capsys) -> None:
     # Mock aiohttp and ProxyConnector
     mock_sess = MagicMock()
     mock_resp = AsyncMock()
+    mock_resp.status = 200  # new status check in _post_via_tor requires this
     mock_resp.json = AsyncMock(return_value=mock_resp_data)
     mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
     mock_resp.__aexit__ = AsyncMock(return_value=False)
@@ -3149,11 +3258,11 @@ def test_socks_port_for_tor_returns_0_when_port_is_occupied() -> None:
 
 @pytest.mark.asyncio
 async def test_mesh_forward_rejects_non_json_content_type(ws_client) -> None:
-    """POST /mesh/peer/forward returns 415 when Content-Type is not application/json."""
+    """POST /<mesh_path>/mesh/forward returns 415 when Content-Type is not application/json."""
     import server as _s
     _s._mesh_peers.clear()
     resp = await ws_client.post(
-        "/mesh/peer/forward",
+        f"/{_s._MESH_PATH}/mesh/forward",
         data=b'{"token":"x","room_id":"r1","payload":"{}"}',
         headers={"Content-Type": "text/plain"},
     )
@@ -3162,14 +3271,14 @@ async def test_mesh_forward_rejects_non_json_content_type(ws_client) -> None:
 
 @pytest.mark.asyncio
 async def test_mesh_forward_rejects_invalid_room_id(ws_client) -> None:
-    """POST /mesh/peer/forward returns 400 when room_id contains illegal characters."""
+    """POST /<mesh_path>/mesh/forward returns 400 when room_id contains illegal characters."""
     import server as _s
     # Register a fake peer so the token check passes
     fake_token = "test_token_for_room_id_test_12345"
-    _s._mesh_peers["fakepeer"] = {"token": fake_token, "url": "http://x", "connected_at": 0}
+    _s._mesh_peers["fakepeer"] = {"token": fake_token, "url": "http://x", "mesh_path": "", "connected_at": 0}
     try:
         resp = await ws_client.post(
-            "/mesh/peer/forward",
+            f"/{_s._MESH_PATH}/mesh/forward",
             json={"token": fake_token, "room_id": "../../etc/passwd", "payload": "{}"},
         )
         assert resp.status == 400
@@ -3179,13 +3288,13 @@ async def test_mesh_forward_rejects_invalid_room_id(ws_client) -> None:
 
 @pytest.mark.asyncio
 async def test_mesh_forward_rejects_oversized_room_id(ws_client) -> None:
-    """POST /mesh/peer/forward returns 400 when room_id exceeds MAX_MESH_ROOM_ID_LEN."""
+    """POST /<mesh_path>/mesh/forward returns 400 when room_id exceeds MAX_MESH_ROOM_ID_LEN."""
     import server as _s
     fake_token = "test_token_for_long_room_id_12345"
-    _s._mesh_peers["fakepeer2"] = {"token": fake_token, "url": "http://x", "connected_at": 0}
+    _s._mesh_peers["fakepeer2"] = {"token": fake_token, "url": "http://x", "mesh_path": "", "connected_at": 0}
     try:
         resp = await ws_client.post(
-            "/mesh/peer/forward",
+            f"/{_s._MESH_PATH}/mesh/forward",
             json={"token": fake_token, "room_id": "a" * 200, "payload": "{}"},
         )
         assert resp.status == 400
