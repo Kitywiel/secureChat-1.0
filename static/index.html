@@ -1,0 +1,400 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self' ws: wss:; img-src 'self' blob:; object-src 'none';"
+    />
+    <title>secureChat</title>
+    <link rel="stylesheet" href="/static/style.css" />
+  </head>
+  <body>
+    <!-- ── Lobby ─────────────────────────────────────────────────────── -->
+    <div id="lobby" class="screen">
+      <div class="card">
+        <h1>🔒 secureChat</h1>
+        <p class="subtitle">
+          End-to-end encrypted. The server only routes ciphertext — it never
+          sees your messages.
+        </p>
+
+        <form id="join-form" novalidate>
+          <label for="display-name">Display Name</label>
+          <input
+            type="text"
+            id="display-name"
+            placeholder="Anonymous"
+            maxlength="32"
+            autocomplete="off"
+            spellcheck="false"
+          />
+
+          <label for="room-id">
+            Room ID
+            <span class="hint"> — alphanumeric, hyphens, underscores</span>
+          </label>
+          <input
+            type="text"
+            id="room-id"
+            placeholder="my-secret-room"
+            required
+            maxlength="64"
+            pattern="[A-Za-z0-9_\-]+"
+            autocomplete="off"
+            spellcheck="false"
+          />
+
+          <label for="passphrase">
+            Passphrase
+            <span class="hint"> — shared secret used to derive the key</span>
+          </label>
+          <input
+            type="password"
+            id="passphrase"
+            placeholder="Strong shared passphrase"
+            required
+            autocomplete="off"
+          />
+
+          <label for="room-passcode">
+            Room Passcode
+            <span class="hint"> — leave blank if the room has no passcode</span>
+          </label>
+          <input
+            type="password"
+            id="room-passcode"
+            placeholder="Leave blank if none"
+            autocomplete="off"
+          />
+
+          <div id="join-error" class="field-error" aria-live="polite"></div>
+
+          <button type="submit" id="join-btn">Join Room →</button>
+        </form>
+
+        <p class="notice">
+          ⚠️ Both parties must use the <strong>same Room ID</strong> and
+          <strong>same Passphrase</strong> to communicate.
+        </p>
+
+        <div class="lobby-actions">
+          <button type="button" id="create-room-btn" class="btn-secondary">
+            🔐 Create Room
+          </button>
+          <button type="button" id="share-files-btn" class="btn-secondary">
+            📎 Share Files
+          </button>
+          <button type="button" id="inbox-btn" class="btn-secondary">
+            📬 Inbox
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── Chat ──────────────────────────────────────────────────────── -->
+    <div id="chat" class="screen hidden">
+      <header class="chat-header">
+        <span id="room-label" class="room-label"></span>
+        <span id="destruct-timer" class="destruct-timer hidden" aria-live="polite"></span>
+        <span id="user-count" class="user-count">👤 1</span>
+        <button id="delete-room-btn" type="button" class="btn-danger-sm" title="Delete room and all its data">🗑 Delete</button>
+        <button id="leave-btn" type="button">Leave</button>
+      </header>
+
+      <main id="messages" class="messages" role="log" aria-live="polite"></main>
+
+      <!-- File preview area — only visible when files are queued -->
+      <div id="file-preview-area" class="file-preview-area hidden">
+        <div id="file-preview-list" class="file-preview-list"></div>
+        <div class="file-options">
+          <label class="file-opt-label">
+            <input type="checkbox" id="file-nsfw-check" />
+            <span>🔞 NSFW</span>
+          </label>
+          <label class="file-opt-label">
+            <input type="checkbox" id="file-once-check" />
+            <span>👁 One-time view</span>
+          </label>
+        </div>
+      </div>
+
+      <!-- Progress bar shown while uploading a large file via the share system -->
+      <div id="chat-upload-progress" class="upload-progress hidden" role="progressbar"
+           aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+        <div id="chat-upload-progress-bar" class="upload-progress-fill"></div>
+        <span id="chat-upload-progress-text" class="upload-progress-text"></span>
+      </div>
+
+      <form id="message-form" class="message-bar">
+        <input type="file" id="chat-file-input" multiple class="hidden" aria-hidden="true" />
+        <button type="button" id="attach-btn" class="btn-attach" aria-label="Attach file" disabled>📎</button>
+        <textarea
+          id="message-input"
+          placeholder="Type a message… (Enter to send, Shift+Enter for new line, paste or drag files to attach)"
+          maxlength="2048"
+          autocomplete="off"
+          spellcheck="true"
+          aria-label="Message"
+          rows="1"
+        ></textarea>
+        <button type="submit" id="send-btn" aria-label="Send message">↑</button>
+      </form>
+    </div>
+
+    <!-- ── Create Room ─────────────────────────────────────────────────── -->
+    <div id="create-room" class="screen hidden">
+      <div class="card">
+        <div class="card-header">
+          <button type="button" id="create-back-btn" class="btn-back">← Back</button>
+          <h1>🔐 Create Room</h1>
+        </div>
+        <p class="subtitle">
+          Create a private encrypted room and share the generated link with
+          anyone you want to invite.
+        </p>
+
+        <div id="create-room-form-area">
+          <form id="create-room-form" novalidate>
+            <label for="create-display-name">Your Display Name</label>
+            <input
+              type="text"
+              id="create-display-name"
+              placeholder="Anonymous"
+              maxlength="32"
+              autocomplete="off"
+              spellcheck="false"
+            />
+
+            <label for="create-passphrase">
+              Encryption Passphrase
+              <span class="hint"> — auto-generated; share this separately with your contact</span>
+            </label>
+            <div class="gen-row">
+              <input
+                type="text"
+                id="create-passphrase"
+                required
+                autocomplete="off"
+                spellcheck="false"
+              />
+              <button
+                type="button"
+                id="refresh-passphrase-btn"
+                class="btn-icon"
+                title="Generate new passphrase"
+              >↻</button>
+            </div>
+
+            <div class="checkbox-row">
+              <input type="checkbox" id="create-passcode-check" />
+              <label for="create-passcode-check">Require a room passcode</label>
+            </div>
+
+            <div id="create-passcode-row" class="gen-row hidden">
+              <input
+                type="text"
+                id="create-passcode"
+                placeholder="Room passcode"
+                autocomplete="off"
+                spellcheck="false"
+                maxlength="64"
+              />
+              <button
+                type="button"
+                id="refresh-passcode-btn"
+                class="btn-icon"
+                title="Generate new passcode"
+              >↻</button>
+            </div>
+
+            <label for="create-destruct">Self-destruct timer</label>
+            <select id="create-destruct">
+              <option value="0">Never</option>
+              <option value="30">30 minutes</option>
+              <option value="60">1 hour</option>
+              <option value="120">2 hours</option>
+              <option value="240">4 hours</option>
+              <option value="480">8 hours</option>
+              <option value="1440">24 hours</option>
+            </select>
+
+            <div class="checkbox-row">
+              <input type="checkbox" id="create-webhook-check" />
+              <label for="create-webhook-check">Add a webhook (notified on join/leave)</label>
+            </div>
+
+            <div id="create-webhook-row" class="hidden">
+              <input
+                type="url"
+                id="create-webhook-url"
+                placeholder="https://your-webhook-endpoint.example"
+                autocomplete="off"
+                spellcheck="false"
+                maxlength="512"
+              />
+            </div>
+
+            <div id="create-error" class="field-error" aria-live="polite"></div>
+
+            <button type="submit" id="create-room-submit-btn">Create Room →</button>
+          </form>
+        </div>
+
+        <div id="create-room-result" class="share-result hidden">
+          <p class="share-result-label">🔗 Invite link — share this with your contact:</p>
+          <div class="share-link-row">
+            <code id="create-invite-link" class="share-link"></code>
+            <button type="button" id="create-copy-btn" class="btn-copy">Copy</button>
+          </div>
+          <p class="share-result-label share-result-label--mt">
+            🔑 Passphrase — <strong>share this separately</strong> (NOT in the link):
+          </p>
+          <div class="share-link-row">
+            <code id="create-passphrase-display" class="share-link"></code>
+            <button type="button" id="create-copy-passphrase-btn" class="btn-copy">Copy</button>
+          </div>
+          <p class="share-result-label share-result-label--mt">
+            🗑 Delete code — <strong>keep private</strong>, required to delete this room:
+          </p>
+          <div class="share-link-row">
+            <code id="create-delete-code-display" class="share-link"></code>
+            <button type="button" id="create-copy-delete-code-btn" class="btn-copy">Copy</button>
+          </div>
+          <div class="qr-row">
+            <button type="button" id="create-qr-btn" class="btn-secondary btn-qr">
+              📱 Show QR Code
+            </button>
+            <div id="create-qr-container" class="qr-container hidden">
+              <img id="create-qr-img" class="qr-code" alt="QR code for invite link" />
+              <p class="qr-note">Scan to open the invite link (includes passphrase)</p>
+            </div>
+          </div>
+          <p id="create-expiry" class="notice"></p>
+          <button type="button" id="create-join-btn">
+            Join This Room →
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── Share Files ────────────────────────────────────────────────── -->
+    <div id="share" class="screen hidden">
+      <div class="card">
+        <div class="card-header">
+          <button type="button" id="share-back-btn" class="btn-back">← Back</button>
+          <h1>📎 Share a File</h1>
+        </div>
+        <p class="subtitle">
+          Upload a file and get a one-time download link. The file and link are
+          permanently deleted after the first download or when the link expires.
+        </p>
+
+        <div id="share-upload-area">
+          <form id="share-form" novalidate>
+            <label for="share-file">
+              Select file(s) <span class="hint">— max 10 GB each</span>
+            </label>
+            <input type="file" id="share-file" required multiple />
+
+            <label for="share-ttl">Link expires after</label>
+            <select id="share-ttl">
+              <option value="1">1 hour</option>
+              <option value="2">2 hours</option>
+              <option value="4">4 hours</option>
+              <option value="8">8 hours</option>
+              <option value="12">12 hours</option>
+              <option value="24">24 hours</option>
+            </select>
+
+            <div class="checkbox-row">
+              <input type="checkbox" id="share-passcode-check" />
+              <label for="share-passcode-check">Protect with a passcode</label>
+            </div>
+
+            <div id="share-passcode-row" class="gen-row hidden">
+              <input
+                type="text"
+                id="share-passcode"
+                placeholder="Passcode"
+                autocomplete="off"
+                spellcheck="false"
+                maxlength="64"
+              />
+              <button
+                type="button"
+                id="refresh-share-passcode-btn"
+                class="btn-icon"
+                title="Generate new passcode"
+              >↻</button>
+            </div>
+
+            <div id="share-error" class="field-error" aria-live="polite"></div>
+
+            <button type="submit" id="share-btn">Upload &amp; Generate Link</button>
+
+            <div id="share-progress" class="upload-progress hidden" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+              <div id="share-progress-bar" class="upload-progress-fill"></div>
+              <span id="share-progress-text" class="upload-progress-text"></span>
+            </div>
+          </form>
+        </div>
+
+        <div id="share-result" class="share-result hidden">
+          <p class="share-result-label">Your one-time download link(s):</p>
+          <div id="share-links-container"></div>
+          <button type="button" id="share-again-btn" class="btn-secondary" style="margin-top:1rem">
+            Share More Files
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── Inbox ─────────────────────────────────────────────────────────── -->
+    <div id="inbox" class="screen hidden">
+      <div class="card">
+        <div class="card-header">
+          <button type="button" id="inbox-back-btn" class="btn-back">← Back</button>
+          <h1>📬 Inbox</h1>
+        </div>
+        <p class="subtitle">
+          Create temporary inboxes that receive real email (Discord, GitHub, etc.) and messages
+          from the drop link. Each inbox self-destructs at expiry. You can create as many as you need.
+        </p>
+        <!-- Badge shown when the server has SMTP enabled -->
+        <p id="inbox-smtp-badge" class="notice hidden" style="background:#1a2e1a;border-color:#2d6a2d;color:#6fcf6f;margin-bottom:.75rem">
+          ✅ <strong>Real email enabled</strong> — addresses below work with Discord, GitHub, and any service.
+          Point your domain's MX record to this server's IP to activate.
+        </p>
+
+        <!-- Create form (always visible) -->
+        <div id="inbox-create-area">
+          <label for="inbox-ttl">Inbox expires after</label>
+          <select id="inbox-ttl">
+            <option value="5">5 minutes</option>
+            <option value="15">15 minutes</option>
+            <option value="30">30 minutes</option>
+            <option value="60" selected>1 hour</option>
+            <option value="180">3 hours</option>
+            <option value="360">6 hours</option>
+            <option value="720">12 hours</option>
+            <option value="1440">24 hours</option>
+          </select>
+
+          <div id="inbox-create-error" class="field-error" aria-live="polite"></div>
+          <button type="button" id="inbox-create-btn">Create Inbox →</button>
+        </div>
+
+        <!-- Active inboxes list — one card per inbox -->
+        <div id="inbox-list" style="margin-top:1.25rem"></div>
+      </div>
+    </div>
+
+    <!-- ── Slow-mode banner ─────────────────────────────────────────── -->
+    <div id="slow-mode-banner">
+      🐢 SLOW MODE ACTIVE — requests are being rate-limited by the server
+    </div>
+    <script src="/static/app.js"></script>
+  </body>
+</html>

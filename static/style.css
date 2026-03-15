@@ -1,0 +1,1034 @@
+/* secureChat — minimal dark theme */
+
+/* ── Reset & variables ─────────────────────────────────────────────────────── */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+:root {
+  --bg: #0d0d0d;
+  --surface: #1a1a1a;
+  --surface-2: #242424;
+  --border: #2e2e2e;
+  --accent: #00c896;
+  --accent-hover: #00a87e;
+  --text: #e8e8e8;
+  --text-dim: #888;
+  --error-color: #ff5555;
+  --outgoing-bg: #003d2e;
+  --incoming-bg: #1e1e1e;
+  --system-color: #555;
+  --font: "Segoe UI", system-ui, -apple-system, sans-serif;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font);
+  font-size: 16px;
+  line-height: 1.5;
+  display: flex;
+  flex-direction: column;
+}
+
+/* ── General hidden utility ────────────────────────────────────────────────── */
+.hidden {
+  display: none !important;
+}
+
+/* ── Screens ───────────────────────────────────────────────────────────────── */
+.screen {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+}
+
+.screen.hidden {
+  display: none;
+}
+
+/* ── Lobby / card ──────────────────────────────────────────────────────────── */
+#lobby {
+  align-items: center;
+  justify-content: center;
+  padding: 1.5rem 1rem;
+  overflow-y: auto;
+}
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 2rem 2rem 1.75rem;
+  width: 100%;
+  max-width: 420px;
+}
+
+h1 {
+  font-size: 1.5rem;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  margin-bottom: 0.35rem;
+}
+
+.subtitle {
+  color: var(--text-dim);
+  font-size: 0.85rem;
+  margin-bottom: 1.5rem;
+}
+
+form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.85rem;
+}
+
+label {
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: var(--text-dim);
+  display: block;
+  margin-bottom: 0.3rem;
+}
+
+.hint {
+  font-weight: 400;
+  color: var(--text-dim);
+  opacity: 0.7;
+}
+
+input[type="text"],
+input[type="password"] {
+  width: 100%;
+  padding: 0.55rem 0.75rem;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  color: var(--text);
+  font-size: 0.95rem;
+  font-family: var(--font);
+  outline: none;
+  transition: border-color 0.15s;
+}
+
+input:focus {
+  border-color: var(--accent);
+}
+
+.field-error {
+  color: var(--error-color);
+  font-size: 0.82rem;
+  min-height: 1.2em;
+}
+
+button[type="submit"] {
+  margin-top: 0.4rem;
+  padding: 0.65rem 1.25rem;
+  background: var(--accent);
+  border: none;
+  border-radius: 8px;
+  color: #000;
+  font-size: 1rem;
+  font-weight: 600;
+  font-family: var(--font);
+  cursor: pointer;
+  transition: background 0.15s, opacity 0.15s;
+}
+
+button[type="submit"]:hover {
+  background: var(--accent-hover);
+}
+
+button[type="submit"]:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.notice {
+  margin-top: 1rem;
+  font-size: 0.78rem;
+  color: var(--text-dim);
+  opacity: 0.8;
+}
+
+/* ── Chat screen ───────────────────────────────────────────────────────────── */
+#chat {
+  overflow: hidden;
+}
+
+.chat-header {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.6rem 1rem;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.room-label {
+  font-size: 0.9rem;
+  font-weight: 600;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.user-count {
+  font-size: 0.82rem;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+/* ── Self-destruct countdown badge ────────────────────────────────────────── */
+.destruct-timer {
+  font-size: 0.78rem;
+  font-weight: 700;
+  color: #ff5555;
+  background: rgba(255, 85, 85, 0.12);
+  border: 1px solid rgba(255, 85, 85, 0.35);
+  border-radius: 6px;
+  padding: 0.15rem 0.5rem;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.chat-header button {
+  flex-shrink: 0;
+  padding: 0.3rem 0.75rem;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text-dim);
+  font-size: 0.82rem;
+  font-family: var(--font);
+  cursor: pointer;
+  transition: border-color 0.15s, color 0.15s;
+}
+
+.chat-header button:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+/* ── Messages ──────────────────────────────────────────────────────────────── */
+.messages {
+  flex: 1;
+  overflow-y: auto;
+  padding: 1rem 1.25rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.message {
+  max-width: 75%;
+  padding: 0.5rem 0.75rem;
+  border-radius: 10px;
+  font-size: 0.9rem;
+  word-break: break-word;
+  line-height: 1.4;
+}
+
+.message .text {
+  display: block;
+  white-space: pre-wrap;
+}
+
+.message.outgoing {
+  background: var(--outgoing-bg);
+  border: 1px solid #00533e;
+  align-self: flex-end;
+  border-bottom-right-radius: 3px;
+}
+
+.message.incoming {
+  background: var(--incoming-bg);
+  border: 1px solid var(--border);
+  align-self: flex-start;
+  border-bottom-left-radius: 3px;
+}
+
+.message.system {
+  background: transparent;
+  align-self: center;
+  font-size: 0.775rem;
+  color: var(--system-color);
+  font-style: italic;
+  max-width: 100%;
+  text-align: center;
+  padding: 0.2rem 0;
+}
+
+.message.error {
+  background: transparent;
+  align-self: center;
+  font-size: 0.8rem;
+  color: var(--error-color);
+  max-width: 100%;
+  text-align: center;
+}
+
+.sender {
+  font-size: 0.72rem;
+  color: var(--accent);
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.msg-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.5rem;
+  margin-bottom: 0.25rem;
+}
+
+.timestamp {
+  font-size: 0.68rem;
+  color: var(--text-dim);
+  font-style: normal;
+  opacity: 0.7;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+/* ── Message input bar ─────────────────────────────────────────────────────── */
+.message-bar {
+  display: flex;
+  gap: 0.5rem;
+  padding: 0.7rem 1rem;
+  background: var(--surface);
+  border-top: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.message-bar textarea {
+  flex: 1;
+  resize: none;
+  min-height: 2.4rem;
+  max-height: 10rem;
+  overflow-y: auto;
+  line-height: 1.4;
+  padding: 0.5rem 0.75rem;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  color: var(--text);
+  font-size: 0.95rem;
+  font-family: var(--font);
+  outline: none;
+  transition: border-color 0.15s;
+}
+
+.message-bar textarea:focus {
+  border-color: var(--accent);
+}
+
+.message-bar textarea:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.message-bar button {
+  flex-shrink: 0;
+  align-self: flex-end;
+  width: 2.4rem;
+  height: 2.4rem;
+  background: var(--accent);
+  border: none;
+  border-radius: 50%;
+  color: #000;
+  font-size: 1.1rem;
+  font-weight: 700;
+  font-family: var(--font);
+  cursor: pointer;
+  transition: background 0.15s, opacity 0.15s;
+  line-height: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+}
+
+.message-bar button:hover {
+  background: var(--accent-hover);
+}
+
+.message-bar button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* ── Responsive ────────────────────────────────────────────────────────────── */
+@media (max-width: 480px) {
+  .card {
+    padding: 1.5rem 1.25rem 1.25rem;
+  }
+
+  .message {
+    max-width: 88%;
+  }
+}
+
+/* ── Lobby actions ─────────────────────────────────────────────────────────── */
+.lobby-actions {
+  margin-top: 1rem;
+  display: flex;
+  justify-content: center;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
+/* ── Secondary / back buttons ──────────────────────────────────────────────── */
+.btn-secondary {
+  padding: 0.55rem 1.1rem;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text-dim);
+  font-size: 0.9rem;
+  font-family: var(--font);
+  cursor: pointer;
+  transition: border-color 0.15s, color 0.15s;
+}
+
+.btn-secondary:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.btn-back {
+  padding: 0.3rem 0.6rem;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text-dim);
+  font-size: 0.82rem;
+  font-family: var(--font);
+  cursor: pointer;
+  transition: border-color 0.15s, color 0.15s;
+  flex-shrink: 0;
+}
+
+.btn-back:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+/* ── Share screen ──────────────────────────────────────────────────────────── */
+#share {
+  align-items: center;
+  justify-content: center;
+  padding: 1.5rem 1rem;
+  overflow-y: auto;
+}
+
+.card-header {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin-bottom: 0.5rem;
+}
+
+.card-header h1 {
+  margin-bottom: 0;
+}
+
+input[type="file"] {
+  width: 100%;
+  padding: 0.5rem 0;
+  color: var(--text);
+  font-size: 0.9rem;
+  font-family: var(--font);
+  cursor: pointer;
+}
+
+input[type="file"]::file-selector-button {
+  padding: 0.4rem 0.8rem;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  font-size: 0.85rem;
+  font-family: var(--font);
+  cursor: pointer;
+  margin-right: 0.75rem;
+  transition: border-color 0.15s;
+}
+
+input[type="file"]::file-selector-button:hover {
+  border-color: var(--accent);
+}
+
+select {
+  width: 100%;
+  padding: 0.55rem 0.75rem;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  color: var(--text);
+  font-size: 0.95rem;
+  font-family: var(--font);
+  outline: none;
+  appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath fill='%23888' d='M1 1l5 5 5-5' stroke='none'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 0.75rem center;
+  cursor: pointer;
+  transition: border-color 0.15s;
+}
+
+select:focus {
+  border-color: var(--accent);
+}
+
+/* ── Upload progress bar ───────────────────────────────────────────────────── */
+.upload-progress {
+  position: relative;
+  margin-top: 0.75rem;
+  height: 22px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.upload-progress-fill {
+  position: absolute;
+  inset: 0;
+  width: 0%;
+  background: var(--accent);
+  transition: width 0.15s ease;
+}
+
+.upload-progress-text {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: var(--text);
+  pointer-events: none;
+}
+
+/* ── Share result ──────────────────────────────────────────────────────────── */
+.share-result {
+  margin-top: 1.5rem;
+}
+
+.share-result-label {
+  font-size: 0.85rem;
+  color: var(--text-dim);
+  margin-bottom: 0.5rem;
+}
+
+.share-result-label--mt {
+  margin-top: 1rem;
+}
+
+.share-link-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.75rem;
+}
+
+.share-link {
+  flex: 1;
+  display: block;
+  padding: 0.5rem 0.75rem;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  color: var(--accent);
+  font-size: 0.8rem;
+  font-family: monospace;
+  word-break: break-all;
+  overflow-wrap: anywhere;
+}
+
+.btn-copy {
+  flex-shrink: 0;
+  padding: 0.4rem 0.75rem;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  font-size: 0.82rem;
+  font-family: var(--font);
+  cursor: pointer;
+  transition: border-color 0.15s, color 0.15s;
+  white-space: nowrap;
+}
+
+.btn-copy:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+/* ── Create Room screen ────────────────────────────────────────────────────── */
+#create-room {
+  align-items: center;
+  justify-content: center;
+  padding: 1.5rem 1rem;
+  overflow-y: auto;
+}
+
+/* ── Inbox screen ──────────────────────────────────────────────────────────── */
+#inbox {
+  align-items: center;
+  justify-content: center;
+  padding: 1.5rem 1rem;
+  overflow-y: auto;
+}
+
+#inbox-create-area {
+  display: flex;
+  flex-direction: column;
+  gap: 0.85rem;
+}
+
+#inbox-create-btn {
+  width: 100%;
+  margin-top: 0.4rem;
+  padding: 0.65rem 1.25rem;
+  background: var(--accent);
+  border: none;
+  border-radius: 8px;
+  color: #000;
+  font-size: 1rem;
+  font-weight: 600;
+  font-family: var(--font);
+  cursor: pointer;
+  transition: background 0.15s, opacity 0.15s;
+}
+
+#inbox-create-btn:hover {
+  background: var(--accent-hover);
+}
+
+#inbox-create-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* ── gen-row (generated value + refresh button) ────────────────────────────── */
+.gen-row {
+  display: flex;
+  gap: 0.4rem;
+  align-items: center;
+}
+
+.gen-row input {
+  flex: 1;
+  min-width: 0;
+}
+
+.btn-icon {
+  flex-shrink: 0;
+  width: 2.2rem;
+  height: 2.2rem;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  color: var(--text-dim);
+  font-size: 1rem;
+  font-family: var(--font);
+  cursor: pointer;
+  transition: border-color 0.15s, color 0.15s;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+}
+
+.btn-icon:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+/* ── Checkbox row ──────────────────────────────────────────────────────────── */
+.checkbox-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.checkbox-row input[type="checkbox"] {
+  width: auto;
+  accent-color: var(--accent);
+  cursor: pointer;
+  margin: 0;
+}
+
+.checkbox-row label {
+  font-size: 0.88rem;
+  color: var(--text);
+  font-weight: 500;
+  margin: 0;
+  cursor: pointer;
+}
+
+/* ── Create Room result (reuses .share-result styles) ─────────────────────── */
+#create-join-btn {
+  margin-top: 0.75rem;
+  padding: 0.65rem 1.25rem;
+  background: var(--accent);
+  border: none;
+  border-radius: 8px;
+  color: #000;
+  font-size: 1rem;
+  font-weight: 600;
+  font-family: var(--font);
+  cursor: pointer;
+  width: 100%;
+  transition: background 0.15s;
+}
+
+#create-join-btn:hover {
+  background: var(--accent-hover);
+}
+
+#create-join-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* ── QR code ───────────────────────────────────────────────────────────────── */
+.qr-row {
+  margin-top: 1rem;
+}
+
+.btn-qr {
+  font-size: 0.85rem;
+  padding: 0.45rem 0.9rem;
+}
+
+.qr-container {
+  margin-top: 0.75rem;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.qr-code {
+  width: 200px;
+  height: 200px;
+  border-radius: 8px;
+  background: #fff;
+  padding: 0.5rem;
+  display: block;
+}
+
+.qr-note {
+  font-size: 0.75rem;
+  color: var(--text-dim);
+  text-align: center;
+}
+
+/* ── In-chat file / image attachments ─────────────────────────────────────── */
+.btn-attach {
+  flex-shrink: 0;
+  align-self: flex-end;
+  width: 2.4rem;
+  height: 2.4rem;
+  background: var(--surface-2) !important;
+  border: 1px solid var(--border) !important;
+  border-radius: 50%;
+  color: var(--text-dim) !important;
+  font-size: 1.1rem;
+  font-family: var(--font);
+  cursor: pointer;
+  transition: border-color 0.15s, color 0.15s, opacity 0.15s;
+  line-height: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+}
+
+.btn-attach:hover:not(:disabled) {
+  border-color: var(--accent) !important;
+  color: var(--accent) !important;
+}
+
+.btn-attach:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.message-img {
+  display: block;
+  max-width: 100%;
+  max-height: 280px;
+  border-radius: 6px;
+  margin-top: 0.35rem;
+  cursor: pointer;
+  object-fit: contain;
+}
+
+.message-img:hover {
+  opacity: 0.9;
+}
+
+.message-img.nsfw {
+  filter: blur(18px);
+  transition: filter 0.3s;
+}
+
+.message-img.nsfw:hover {
+  opacity: 1;
+}
+
+.nsfw-wrapper {
+  position: relative;
+  display: inline-block;
+  margin-top: 0.35rem;
+}
+
+.nsfw-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.25);
+  user-select: none;
+}
+
+.nsfw-overlay span {
+  background: rgba(0, 0, 0, 0.65);
+  color: #fff;
+  font-size: 0.75rem;
+  font-weight: 700;
+  padding: 0.25rem 0.6rem;
+  border-radius: 4px;
+  letter-spacing: 0.04em;
+}
+
+.once-badge {
+  display: inline-block;
+  font-size: 0.68rem;
+  color: #fff;
+  background: #6a4fcf;
+  border-radius: 4px;
+  padding: 0.1rem 0.4rem;
+  margin-left: 0.4rem;
+  vertical-align: middle;
+  font-weight: 600;
+}
+
+.message-file {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  margin-top: 0.35rem;
+  padding: 0.35rem 0.65rem;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  text-decoration: none;
+  color: var(--accent);
+  font-size: 0.85rem;
+  font-family: var(--font);
+  word-break: break-all;
+}
+
+.message-file:hover {
+  border-color: var(--accent);
+}
+
+/* ── File preview area ─────────────────────────────────────────────────────── */
+.file-preview-area {
+  padding: 0.5rem 1rem 0;
+  background: var(--surface);
+  border-top: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.file-preview-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  margin-bottom: 0.4rem;
+}
+
+.file-preview-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.25rem 0.55rem;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 0.8rem;
+  color: var(--text);
+  max-width: 180px;
+  overflow: hidden;
+}
+
+.file-preview-item span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+  min-width: 0;
+}
+
+.file-preview-item button {
+  flex-shrink: 0;
+  background: transparent;
+  border: none;
+  color: var(--text-dim);
+  font-size: 0.85rem;
+  cursor: pointer;
+  padding: 0;
+  line-height: 1;
+  width: auto;
+  height: auto;
+  border-radius: 0;
+}
+
+.file-preview-item button:hover {
+  color: var(--error-color);
+  background: transparent;
+}
+
+.file-options {
+  display: flex;
+  gap: 1rem;
+  margin-bottom: 0.45rem;
+}
+
+.file-opt-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.8rem;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+
+.file-opt-label input[type="checkbox"] {
+  width: auto;
+  accent-color: var(--accent);
+  margin: 0;
+}
+
+/* ── Danger (delete) button in chat header ─────────────────────────────────── */
+.btn-danger-sm {
+  flex-shrink: 0;
+  padding: 0.3rem 0.75rem;
+  background: transparent;
+  border: 1px solid rgba(255, 85, 85, 0.4);
+  border-radius: 6px;
+  color: #ff5555;
+  font-size: 0.82rem;
+  font-family: var(--font);
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+}
+
+.btn-danger-sm:hover {
+  border-color: #ff5555;
+  background: rgba(255, 85, 85, 0.12);
+}
+
+/* ── One-time view message ─────────────────────────────────────────────────── */
+.message.one-time-msg {
+  background: #000 !important;
+  border-color: #333 !important;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.message.one-time-msg .text {
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.message.one-time-msg .message-img {
+  user-select: none;
+  -webkit-user-drag: none;
+}
+
+.message.one-time-msg .message-file {
+  pointer-events: auto; /* allow clicking to download */
+}
+
+/* ── Drag-and-drop drop zone ────────────────────────────────────────────────── */
+#chat.drag-over::after {
+  content: 'Drop files to attach';
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 1.4rem;
+  font-weight: 700;
+  color: var(--accent);
+  background: rgba(0, 0, 0, 0.55);
+  border: 3px dashed var(--accent);
+  border-radius: 12px;
+  pointer-events: none;
+  z-index: 100;
+}
+
+/* ── In-chat upload progress bar ────────────────────────────────────────────── */
+#chat-upload-progress {
+  margin: 0.25rem 0.75rem;
+}
+
+/* ── Inbox clearnet-deliverable status badge ───────────────────────────────── */
+.inbox-badge {
+  display: inline-block;
+  margin-bottom: .55rem;
+  padding: .25rem .6rem;
+  border-radius: 6px;
+  font-size: .78rem;
+  font-weight: 600;
+}
+.inbox-badge--real {
+  background: #1a3a1a;
+  color: #6fcf6f;
+  border: 1px solid #2d6a2d;
+}
+.inbox-badge--drop {
+  background: #3a2a1a;
+  color: #d4a76f;
+  border: 1px solid #6a4a2d;
+}
+
+/* ── Slow-mode banner ───────────────────────────────────────────────────── */
+#slow-mode-banner {
+  display: none;
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 9999;
+  background: #b45309;
+  color: #fff;
+  text-align: center;
+  padding: 7px 12px;
+  font-size: 0.85rem;
+  font-family: 'Courier New', monospace;
+  letter-spacing: 0.04em;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.4);
+}

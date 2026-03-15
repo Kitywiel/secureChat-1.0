@@ -1,0 +1,653 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>secureChat Admin</title>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{--bg:#0d0d0d;--surface:#1a1a1a;--border:#2e2e2e;--accent:#00c896;--red:#ff5555;
+      --text:#e8e8e8;--dim:#888;--font:"Segoe UI",system-ui,sans-serif}
+body{background:var(--bg);color:var(--text);font-family:var(--font);font-size:16px;line-height:1.5}
+header{background:var(--surface);border-bottom:1px solid var(--border);padding:.75rem 1.5rem;
+       display:flex;align-items:center;justify-content:space-between}
+header h1{font-size:1.1rem;font-weight:700}
+header span{font-size:.8rem;color:var(--dim)}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:1rem;
+      padding:1.5rem}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:10px;
+      padding:1.25rem 1.5rem}
+.card h2{font-size:.78rem;color:var(--dim);font-weight:600;text-transform:uppercase;
+         letter-spacing:.06em;margin-bottom:.4rem}
+.card .val{font-size:1.9rem;font-weight:700;color:var(--accent)}
+.card .sub{font-size:.75rem;color:var(--dim);margin-top:.2rem}
+section{padding:0 1.5rem 1.5rem}
+section h2{font-size:1rem;font-weight:700;margin-bottom:.75rem;padding-bottom:.4rem;
+           border-bottom:1px solid var(--border)}
+#log-box{background:#000;border:1px solid var(--border);border-radius:8px;height:320px;
+         overflow-y:auto;padding:.75rem;font-family:monospace;font-size:.78rem;
+         color:#aaa;white-space:pre-wrap;word-break:break-all}
+.log-line.err     {color:var(--red)}
+.log-line.warn    {color:#ffb347}
+.log-line.info    {color:#aaa}
+/* Semantic colours — mirror _ColourFormatter in server.py */
+.log-line.created {color:#00c896}
+.log-line.joined  {color:#f5c518}
+.log-line.deleted {color:var(--red)}
+.log-line.dl      {color:#c084fc}
+.log-line.ul      {color:#ff9de2}
+.log-line.inactive{color:#60a5fa}
+.log-line.chatfile{color:#22d3ee}
+.log-line.inbox-created{color:#00c896}
+.log-line.inbox-msg    {color:#fb923c}
+.log-line.inbox-read   {color:#c084fc}
+#shutdown-btn{padding:.6rem 1.4rem;background:var(--red);border:none;border-radius:8px;
+              color:#fff;font-size:.95rem;font-weight:700;cursor:pointer;margin-top:1rem;
+              font-family:var(--font)}
+#shutdown-btn:hover{background:#cc3333}
+#shutdown-msg{margin-top:.5rem;font-size:.85rem;color:var(--dim)}
+#login-wrap{display:flex;align-items:center;justify-content:center;min-height:100vh}
+#login-card{background:var(--surface);border:1px solid var(--border);border-radius:12px;
+            padding:2rem 1.75rem;width:100%;max-width:400px}
+#login-card h1{font-size:1.2rem;margin-bottom:1.25rem}
+#login-card input{width:100%;padding:.6rem .75rem;background:var(--bg);
+                  border:1px solid var(--border);border-radius:8px;color:var(--text);
+                  font-size:.95rem;font-family:monospace;margin-bottom:.75rem;outline:none}
+#login-card input:focus{border-color:var(--accent)}
+#login-card button{width:100%;padding:.65rem;background:var(--accent);border:none;
+                   border-radius:8px;color:#000;font-size:1rem;font-weight:700;cursor:pointer}
+#login-card button:hover{background:#00a87e}
+.err-msg{color:var(--red);font-size:.82rem;margin-bottom:.5rem}
+.webhook-url-row{display:flex;gap:.5rem;align-items:center;margin-top:.5rem}
+.webhook-url-row input{flex:1;padding:.5rem .75rem;background:#000;border:1px solid var(--border);
+                       border-radius:8px;color:#aaa;font-family:monospace;font-size:.78rem;
+                       outline:none;cursor:text}
+.webhook-url-row button{padding:.5rem .9rem;background:var(--surface);border:1px solid var(--border);
+                        border-radius:8px;color:var(--text);font-size:.82rem;cursor:pointer;
+                        white-space:nowrap}
+.webhook-url-row button:hover{border-color:var(--accent);color:var(--accent)}
+/* ── System resource cards ── */
+.res-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:1rem;
+          padding:0 1.5rem 1.5rem}
+.res-card{background:var(--surface);border:1px solid var(--border);border-radius:10px;
+          padding:1.1rem 1.4rem}
+.res-card h3{font-size:.78rem;color:var(--dim);font-weight:600;text-transform:uppercase;
+             letter-spacing:.06em;margin-bottom:.6rem}
+.res-row{display:flex;justify-content:space-between;align-items:baseline;
+         font-size:.82rem;margin-bottom:.35rem}
+.res-row .res-label{color:var(--dim)}
+.res-row .res-val{font-weight:700;color:var(--accent)}
+.res-bar-wrap{background:#111;border-radius:999px;height:8px;overflow:hidden;margin-bottom:.5rem}
+.res-bar{height:100%;border-radius:999px;background:var(--accent);
+         transition:width .4s ease,background .4s ease}
+.res-bar.warn{background:#ffb347}
+.res-bar.crit{background:var(--red)}
+.res-sub{font-size:.72rem;color:var(--dim)}
+.res-na{font-size:.82rem;color:#444;padding:.5rem 0}
+/* ── Metrics history chart ── */
+#metrics-range{background:#111;border:1px solid var(--border);color:var(--text);
+               border-radius:6px;padding:.3rem .6rem;font-size:.82rem;cursor:pointer;outline:none}
+#metrics-range:focus{border-color:var(--accent)}
+#metrics-chart-wrap{position:relative;height:280px;background:#000;
+                    border:1px solid var(--border);border-radius:8px;padding:.5rem}
+</style>
+</head>
+<body>
+<div id="app">
+<div id="login-wrap"><div id="login-card">
+  <h1>🔒 Admin Login</h1>
+  <form id="lf">
+    <input type="password" id="pc" placeholder="Admin passcode" autocomplete="off" autofocus/>
+    <button type="submit">Login →</button>
+  </form>
+</div></div>
+</div>
+<script>
+// _AP is injected by the server at serve time — it is the 200-char secret path prefix.
+const _AP='/__ADMIN_PATH__';
+
+async function fetchStats(){
+  const r=await fetch(_AP+'/api/stats');
+  if(!r.ok)return null;
+  return r.json();
+}
+
+function fmtBytes(b){
+  if(b<1024)return b+' B';
+  if(b<1048576)return (b/1024).toFixed(1)+' KB';
+  if(b<1073741824)return (b/1048576).toFixed(1)+' MB';
+  return (b/1073741824).toFixed(2)+' GB';
+}
+
+function renderLogin(errMsg=''){
+  document.getElementById('app').innerHTML=`
+    <div id="login-wrap"><div id="login-card">
+      <h1>🔒 Admin Login</h1>
+      ${errMsg?`<div class="err-msg">${errMsg}</div>`:''}
+      <form id="lf">
+        <input type="password" id="pc" placeholder="Admin passcode" autocomplete="off" autofocus/>
+        <button type="submit">Login →</button>
+      </form>
+    </div></div>`;
+  document.getElementById('lf').addEventListener('submit',async e=>{
+    e.preventDefault();
+    const pc=document.getElementById('pc').value;
+    const r=await fetch(_AP+'/login',{method:'POST',headers:{'Content-Type':'application/json'},
+                                      body:JSON.stringify({passcode:pc})});
+    if(r.ok){await renderDashboard().catch(()=>renderLogin('Load error. Please refresh.'));}
+    else{renderLogin(r.status===429?'Too many attempts — wait before retrying.':'Wrong passcode.');}
+  });
+}
+
+/** Render a single resource bar card and return its HTML string. */
+function resCard(icon, title, pct, valLabel, subLabel){
+  const cls = pct>=90?'crit':pct>=75?'warn':'';
+  return `<div class="res-card">
+    <h3>${icon} ${title}</h3>
+    <div class="res-row"><span class="res-label">Usage</span><span class="res-val">${pct.toFixed(1)}%</span></div>
+    <div class="res-bar-wrap"><div class="res-bar ${cls}" style="width:${Math.min(pct,100)}%"></div></div>
+    ${valLabel?`<div class="res-sub">${valLabel}</div>`:''}
+    ${subLabel?`<div class="res-sub">${subLabel}</div>`:''}
+  </div>`;
+}
+
+/** Build the HTML for the System Resources section from a stats object. */
+function renderSysResources(s){
+  if(s.sys_cpu_percent===undefined&&s.sys_ram_percent===undefined&&!s.sys_gpus){
+    return '<p class="res-na">Server process metrics unavailable (psutil not installed).</p>';
+  }
+  let html='<div class="res-grid">';
+  if(s.sys_cpu_percent!==undefined){
+    html+=resCard('🖥️','CPU',s.sys_cpu_percent,'','');
+  }
+  if(s.sys_ram_percent!==undefined){
+    html+=resCard('🧠','RAM',s.sys_ram_percent,
+      `${fmtBytes(s.sys_ram_used)} / ${fmtBytes(s.sys_ram_total)}`,'');
+  }
+  if(s.sys_disk_percent!==undefined){
+    html+=resCard('💾','Disk',s.sys_disk_percent,
+      `${fmtBytes(s.sys_disk_used)} / ${fmtBytes(s.sys_disk_total)}`,'');
+  }
+  if(s.sys_gpus&&s.sys_gpus.length){
+    s.sys_gpus.forEach((g,i)=>{
+      const lbl=s.sys_gpus.length>1?`GPU ${i}: ${g.name}`:g.name;
+      const sub=g.temp_c!=null?`Temp: ${g.temp_c}°C`:'';
+      html+=resCard('⚡',lbl,g.load_percent,
+        `VRAM: ${fmtBytes(g.mem_used)} / ${fmtBytes(g.mem_total)} (${g.mem_percent}%)`,sub);
+    });
+  }
+  html+='</div>';
+  return html;
+}
+
+async function renderDashboard(){
+  const stats=await fetchStats();
+  if(!stats){renderLogin('Session expired.');return;}
+  const whInfo=await fetch(_AP+'/api/webhook-info').then(r=>r.ok?r.json():null).catch(()=>null);
+  const webhookToken=whInfo?whInfo.webhook_token:'';
+  const webhookUrl=webhookToken?`${location.origin}${_AP}/webhook/${webhookToken}`:'(unavailable)';
+  const inactive=stats.inactive_rooms;
+  const open=stats.open_rooms;
+  document.getElementById('app').innerHTML=`
+    <header>
+      <h1>🛡 secureChat Admin</h1>
+      <span>Admin Panel</span>
+    </header>
+    <div class="grid">
+      <div class="card"><h2>Total Rooms Created</h2>
+        <div class="val">${stats.rooms_created_total}</div></div>
+      <div class="card"><h2>Open Chats</h2>
+        <div class="val">${open}</div></div>
+      <div class="card"><h2>Inactive Chats</h2>
+        <div class="val">${inactive}</div></div>
+      <div class="card"><h2>Rooms w/ Invite</h2>
+        <div class="val">${stats.invite_rooms}</div></div>
+      <div class="card"><h2>Open File Transfers</h2>
+        <div class="val">${stats.open_file_transfers}</div></div>
+      <div class="card"><h2>Files Uploaded</h2>
+        <div class="val">${stats.files_uploaded_count}</div>
+        <div class="sub">${fmtBytes(stats.files_uploaded_bytes)}</div></div>
+      <div class="card"><h2>Files Downloaded</h2>
+        <div class="val">${stats.files_downloaded_count}</div>
+        <div class="sub">${fmtBytes(stats.files_downloaded_bytes)}</div></div>
+      <div class="card"><h2>Chat Files Shared</h2>
+        <div class="val">${stats.chat_files_shared}</div></div>
+    </div>
+    <section>
+      <h2>Server Process Resources</h2>
+    </section>
+    <div id="sys-res-area">${renderSysResources(stats)}</div>
+    <section>
+      <h2>Server Load History</h2>
+      <div style="display:flex;align-items:center;gap:.75rem;margin-bottom:.75rem">
+        <label for="metrics-range" style="font-size:.82rem;color:var(--dim)">Time range:</label>
+        <select id="metrics-range">
+          <option value="5">Last 5 s</option>
+          <option value="30">Last 30 s</option>
+          <option value="60">Last 1 min</option>
+          <option value="300">Last 5 min</option>
+          <option value="900">Last 15 min</option>
+          <option value="1800">Last 30 min</option>
+          <option value="3600" selected>Last 1 h</option>
+          <option value="21600">Last 6 h</option>
+          <option value="43200">Last 12 h</option>
+          <option value="86400">Last 1 day</option>
+          <option value="604800">Last 7 days</option>
+          <option value="2592000">Last 30 days</option>
+          <option value="7776000">Last 3 months</option>
+          <option value="15552000">Last 6 months</option>
+          <option value="31536000">Last 12 months</option>
+        </select>
+      </div>
+      <div id="metrics-chart-wrap">
+        <canvas id="metrics-chart"></canvas>
+        <div id="metrics-no-data" style="display:none;position:absolute;inset:0;
+            align-items:center;justify-content:center;color:var(--dim);font-size:.85rem">
+          No data yet — samples recorded every 10 s
+        </div>
+      </div>
+    </section>
+    <section>
+      <h2>Chats by Self-Destruct Timer</h2>
+      <div id="timer-breakdown">${renderTimerBreakdown(stats.rooms_by_destruct)}</div>
+    </section>
+    <section>
+      <h2>Incoming Webhook</h2>
+      <p style="font-size:.82rem;color:var(--dim);margin-bottom:.5rem">
+        POST JSON to this URL from any external service to log events in the admin panel.
+        The token in the URL acts as the authentication secret — keep it private.
+      </p>
+      <div class="webhook-url-row">
+        <input id="webhook-url-input" type="text" readonly value="${webhookUrl}"/>
+        <button id="copy-webhook-btn">Copy</button>
+      </div>
+      <p style="font-size:.75rem;color:var(--dim);margin-top:.4rem">
+        Example: <code style="color:#aaa">{"event":"deploy","version":"1.2.3"}</code>
+      </p>
+    </section>
+    <section>
+      <h2>Live Logs</h2>
+      <div id="log-box"></div>
+    </section>
+    <section>
+      <h2>Emergency Controls</h2>
+      <div id="lockdown-bar" style="margin-bottom:1rem;padding:.8rem 1rem;border-radius:8px;font-weight:700;font-size:.95rem;display:none"></div>
+      <button id="lockdown-btn" style="padding:.6rem 1.4rem;background:#b91c1c;border:none;border-radius:8px;color:#fff;font-size:.95rem;font-weight:700;cursor:pointer;font-family:var(--font);margin-right:.5rem">🔴 Activate Lockdown</button>
+      <button id="shutdown-btn">⚠️ Emergency Shutdown</button>
+      <div id="shutdown-msg"></div>
+    </section>`;
+
+  document.getElementById('copy-webhook-btn').addEventListener('click',()=>{
+    const inp=document.getElementById('webhook-url-input');
+    inp.select();
+    navigator.clipboard.writeText(inp.value).then(()=>{
+      const btn=document.getElementById('copy-webhook-btn');
+      btn.textContent='Copied!';
+      setTimeout(()=>{btn.textContent='Copy';},2000);
+    }).catch(()=>{
+      document.execCommand('copy');
+    });
+  });
+
+  document.getElementById('shutdown-btn').addEventListener('click',async()=>{
+    if(!confirm('Shutdown the secureChat server immediately?'))return;
+    const r=await fetch(_AP+'/api/shutdown',{method:'POST'});
+    document.getElementById('shutdown-msg').textContent=r.ok?'Server is shutting down…':'Shutdown failed.';
+  });
+
+  // ── Lockdown ────────────────────────────────────────────────────────────
+  async function refreshLockdownState(){
+    try{
+      const r=await fetch(_AP+'/api/lockdown');
+      if(!r.ok)return;
+      const d=await r.json();
+      const bar=document.getElementById('lockdown-bar');
+      const btn=document.getElementById('lockdown-btn');
+      // ── Full-page lockdown indicator ─────────────────────────────────
+      let topBanner=document.getElementById('lockdown-top-banner');
+      if(d.lockdown){
+        // Black background on body
+        document.body.style.background='#000';
+        // Add big top banner if not already present
+        if(!topBanner){
+          topBanner=document.createElement('div');
+          topBanner.id='lockdown-top-banner';
+          topBanner.style.cssText='position:fixed;top:0;left:0;right:0;z-index:9999;'+
+            'background:#000;border-bottom:3px solid #ff0000;padding:1.2rem;'+
+            'text-align:center;pointer-events:none';
+          topBanner.innerHTML='<div style="font-size:3rem;font-weight:900;color:#ff0000;'+
+            'letter-spacing:.15em;text-shadow:0 0 20px #ff0000,0 0 40px #ff0000;font-family:monospace">'+
+            '🔴 LOCKDOWN 🔴</div>'+
+            '<div style="font-size:.85rem;color:#ff6666;margin-top:.3rem">'+
+            'All visitors blocked — all data wiped</div>';
+          document.body.insertBefore(topBanner,document.body.firstChild);
+          // Push dashboard content down so it isn't hidden under the banner
+          document.getElementById('app').style.paddingTop='110px';
+        }
+        // ── Log panel lockdown overlay ───────────────────────────────
+        const logBox=document.getElementById('log-box');
+        if(logBox&&!document.getElementById('log-lockdown-header')){
+          const lh=document.createElement('div');
+          lh.id='log-lockdown-header';
+          lh.style.cssText='background:#000;border:2px solid #ff0000;border-bottom:none;'+
+            'border-radius:8px 8px 0 0;padding:1rem 1rem .8rem;text-align:center';
+          lh.innerHTML='<div style="font-size:2.5rem;font-weight:900;color:#ff0000;'+
+            'letter-spacing:.2em;text-shadow:0 0 14px #ff0000,0 0 30px #ff0000;'+
+            'font-family:monospace">⚠ LOCKDOWN ⚠</div>'+
+            '<div style="font-size:.78rem;color:#ff6666;margin-top:.25rem;'+
+            'letter-spacing:.08em;text-transform:uppercase">Server in lockdown mode</div>';
+          logBox.parentNode.insertBefore(lh,logBox);
+          logBox.style.borderTopLeftRadius='0';
+          logBox.style.borderTopRightRadius='0';
+          logBox.style.borderTop='none';
+          logBox.style.borderColor='#ff0000';
+        }
+        bar.style.display='block';
+        bar.style.background='#7f1d1d';
+        bar.style.color='#fca5a5';
+        bar.textContent='🔴 LOCKDOWN IS ACTIVE — all data wiped, all visitors see lockdown screen';
+        btn.textContent='🟢 Deactivate Lockdown';
+        btn.style.background='#166534';
+      } else {
+        // Restore normal background
+        document.body.style.background='';
+        if(topBanner)topBanner.remove();
+        const appEl=document.getElementById('app');
+        if(appEl)appEl.style.paddingTop='';
+        // ── Remove log panel lockdown overlay ───────────────────────
+        const lh=document.getElementById('log-lockdown-header');
+        if(lh)lh.remove();
+        const logBox=document.getElementById('log-box');
+        if(logBox){
+          logBox.style.borderTopLeftRadius='';
+          logBox.style.borderTopRightRadius='';
+          logBox.style.borderTop='';
+          logBox.style.borderColor='';
+        }
+        bar.style.display='none';
+        btn.textContent='🔴 Activate Lockdown';
+        btn.style.background='#b91c1c';
+      }
+    } catch(_){}
+  }
+
+  document.getElementById('lockdown-btn').addEventListener('click',async()=>{
+    const active=document.getElementById('lockdown-btn').textContent.includes('Deactivate');
+    const action=active?'deactivate':'activate';
+    if(action==='activate'){
+      if(!confirm('⚠️ ACTIVATE LOCKDOWN?\n\nThis will:\n• Wipe ALL chats, inboxes, and files immediately\n• Block all visitors with a lockdown screen\n• Close all active connections\n\nThis cannot be undone. Continue?'))return;
+    }
+    const r=await fetch(_AP+'/api/lockdown',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action})});
+    if(r.ok)refreshLockdownState();
+  });
+
+  refreshLockdownState();
+  setInterval(refreshLockdownState,5000);
+
+  // ── Metrics history chart (pure-canvas, no external dependencies) ────────
+  function _fmtChartTime(ts,rangeSecs){
+    const d=new Date(ts*1000);
+    if(rangeSecs<=3600)
+      return d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',second:'2-digit'});
+    if(rangeSecs<=86400)
+      return d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
+    if(rangeSecs<=2592000)
+      return d.toLocaleDateString([],{month:'short',day:'numeric'})+' '+
+             d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
+    return d.toLocaleDateString([],{month:'short',day:'numeric',year:'2-digit'});
+  }
+
+  function _drawMetricsCanvas(canvas,data,rangeSecs){
+    if(!canvas||!data||!data.length)return;
+    const ctx=canvas.getContext('2d');
+    const dpr=window.devicePixelRatio||1;
+    const wrap=canvas.parentElement;
+    const W=wrap.clientWidth-16;
+    const H=wrap.clientHeight-16;
+    canvas.width=W*dpr; canvas.height=H*dpr;
+    canvas.style.width=W+'px'; canvas.style.height=H+'px';
+    ctx.scale(dpr,dpr);
+
+    // Layout constants
+    const PL=52,PR=50,PT=12,PB=52;
+    const cW=W-PL-PR, cH=H-PT-PB;
+
+    // Data ranges
+    const ts0=data[0].ts, ts1=data[data.length-1].ts;
+    const tsR=ts1-ts0||1;
+    const hasRooms=data.some(d=>d.active_rooms!=null);
+    const hasShares=data.some(d=>d.active_shares!=null);
+    const hasInbox=data.some(d=>d.inbox_msgs!=null);
+    const hasMesh=data.some(d=>d.mesh_peers!=null);
+    const hasServices=hasRooms||hasShares||hasInbox||hasMesh;
+    function _svcMax(key){
+      const vals=data.filter(d=>d[key]!=null).map(d=>d[key]);
+      return vals.length?Math.max(Math.ceil(Math.max(...vals)*1.2),1):0;
+    }
+    const svcMax=Math.max(
+      hasRooms  ?_svcMax('active_rooms') :0,
+      hasShares ?_svcMax('active_shares'):0,
+      hasInbox  ?_svcMax('inbox_msgs')   :0,
+      hasMesh   ?_svcMax('mesh_peers')   :0,
+      1
+    );
+
+    const toX=ts=>PL+((ts-ts0)/tsR)*cW;
+    const toY=pct=>PT+cH-(pct/100)*cH;
+    const toYS=v=>PT+cH-(v/svcMax)*cH;
+
+    ctx.clearRect(0,0,W,H);
+
+    // Gridlines
+    ctx.strokeStyle='#1d1d1d'; ctx.lineWidth=1;
+    for(let i=0;i<=4;i++){
+      const y=PT+(cH/4)*i;
+      ctx.beginPath(); ctx.moveTo(PL,y); ctx.lineTo(PL+cW,y); ctx.stroke();
+    }
+
+    // Left Y axis labels (0-100%)
+    ctx.fillStyle='#555'; ctx.font='10px monospace';
+    ctx.textAlign='right'; ctx.textBaseline='middle';
+    for(let i=0;i<=4;i++){
+      ctx.fillText((100-i*25)+'%',PL-5,PT+(cH/4)*i);
+    }
+    // Left Y axis title
+    ctx.save(); ctx.translate(10,PT+cH/2); ctx.rotate(-Math.PI/2);
+    ctx.textAlign='center'; ctx.fillStyle='#555'; ctx.font='10px system-ui,sans-serif';
+    ctx.fillText('Usage %',0,0); ctx.restore();
+
+    // Right Y axis labels (service counts) — only if there are service samples
+    if(hasServices){
+      ctx.fillStyle='#aaa'; ctx.textAlign='left'; ctx.textBaseline='middle';
+      ctx.font='10px monospace';
+      for(let i=0;i<=4;i++){
+        const v=svcMax-(svcMax/4)*i;
+        ctx.fillText(Math.round(v),PL+cW+4,PT+(cH/4)*i);
+      }
+      ctx.save(); ctx.translate(W-10,PT+cH/2); ctx.rotate(Math.PI/2);
+      ctx.textAlign='center'; ctx.fillStyle='#aaa'; ctx.font='10px system-ui,sans-serif';
+      ctx.fillText('Services →',0,0); ctx.restore();
+    }
+
+    // X axis tick labels
+    const nTicks=Math.min(6,data.length);
+    ctx.fillStyle='#555'; ctx.textAlign='center'; ctx.textBaseline='top';
+    ctx.font='10px monospace';
+    for(let i=0;i<=nTicks;i++){
+      const ts=ts0+(tsR/nTicks)*i;
+      ctx.fillText(_fmtChartTime(ts,rangeSecs),PL+(cW/nTicks)*i,PT+cH+6);
+    }
+
+    // Axis border
+    ctx.strokeStyle='#2e2e2e'; ctx.lineWidth=1;
+    ctx.beginPath(); ctx.moveTo(PL,PT); ctx.lineTo(PL,PT+cH); ctx.lineTo(PL+cW,PT+cH); ctx.stroke();
+
+    // Draw a filled+stroked line series
+    function drawSeries(getter,yFn,color,fillAlpha){
+      const pts=data.filter(d=>getter(d)!=null);
+      if(pts.length<2)return;
+      // Fill
+      ctx.beginPath();
+      pts.forEach((d,i)=>{const x=toX(d.ts),y=yFn(getter(d));i?ctx.lineTo(x,y):ctx.moveTo(x,y);});
+      ctx.lineTo(toX(pts[pts.length-1].ts),PT+cH);
+      ctx.lineTo(toX(pts[0].ts),PT+cH);
+      ctx.closePath();
+      ctx.fillStyle='rgba('+hexToRgb(color)+','+fillAlpha+')';
+      ctx.fill();
+      // Line
+      ctx.beginPath();
+      pts.forEach((d,i)=>{const x=toX(d.ts),y=yFn(getter(d));i?ctx.lineTo(x,y):ctx.moveTo(x,y);});
+      ctx.strokeStyle=color; ctx.lineWidth=2; ctx.lineJoin='round'; ctx.stroke();
+    }
+    function hexToRgb(hex){
+      const r=parseInt(hex.slice(1,3),16),g=parseInt(hex.slice(3,5),16),b=parseInt(hex.slice(5,7),16);
+      return r+','+g+','+b;
+    }
+
+    drawSeries(d=>d.cpu_pct,      toY,  '#ff5555',0.07);
+    drawSeries(d=>d.ram_pct,      toY,  '#60a5fa',0.07);
+    drawSeries(d=>d.disk_pct,     toY,  '#ffb347',0.07);
+    if(hasRooms)   drawSeries(d=>d.active_rooms,  toYS,'#00c896',0.05);
+    if(hasShares)  drawSeries(d=>d.active_shares, toYS,'#c084fc',0.05);
+    if(hasInbox)   drawSeries(d=>d.inbox_msgs,    toYS,'#fb923c',0.05);
+    if(hasMesh)    drawSeries(d=>d.mesh_peers,    toYS,'#22d3ee',0.05);
+
+    // Legend
+    const legend=[
+      {label:'CPU %',color:'#ff5555'},
+      {label:'RAM %',color:'#60a5fa'},
+      {label:'Disk %',color:'#ffb347'},
+    ];
+    if(hasRooms)  legend.push({label:'Rooms →',color:'#00c896'});
+    if(hasShares) legend.push({label:'Files →',color:'#c084fc'});
+    if(hasInbox)  legend.push({label:'Inbox →',color:'#fb923c'});
+    if(hasMesh)   legend.push({label:'Mesh →',color:'#22d3ee'});
+    ctx.font='11px system-ui,sans-serif'; ctx.textBaseline='middle';
+    let lx=PL;
+    legend.forEach(({label,color})=>{
+      ctx.fillStyle=color;
+      ctx.fillRect(lx,PT+cH+36,16,3);
+      ctx.fillStyle='#aaa'; ctx.textAlign='left';
+      ctx.fillText(label,lx+20,PT+cH+37);
+      lx+=ctx.measureText(label).width+46;
+    });
+  }
+
+  async function _refreshMetricsChart(){
+    const sel=document.getElementById('metrics-range');
+    if(!sel)return;
+    const range=sel.value;
+    try{
+      const r=await fetch(_AP+'/api/metrics-history?range='+range);
+      if(!r.ok)return;
+      const data=await r.json();
+      const canvas=document.getElementById('metrics-chart');
+      const noData=document.getElementById('metrics-no-data');
+      if(!canvas)return;
+      if(!data||!data.length){
+        if(noData){noData.style.display='flex';canvas.style.display='none';}
+        return;
+      }
+      if(noData){noData.style.display='none';canvas.style.display='';}
+      _drawMetricsCanvas(canvas,data,parseInt(range));
+    } catch(_){}
+  }
+
+  const _mRangeEl=document.getElementById('metrics-range');
+  if(_mRangeEl) _mRangeEl.addEventListener('change',_refreshMetricsChart);
+  window.addEventListener('resize',_refreshMetricsChart);
+  _refreshMetricsChart();
+  setInterval(_refreshMetricsChart,10000);
+  // ────────────────────────────────────────────────────────────────────────
+
+  startLogStream();
+
+  // Refresh stats every 5s (system metrics need faster refresh for live monitoring)
+  setInterval(async()=>{
+    const s=await fetchStats();
+    if(!s)return;
+    document.querySelector('.grid').outerHTML=`<div class="grid">
+      <div class="card"><h2>Total Rooms Created</h2><div class="val">${s.rooms_created_total}</div></div>
+      <div class="card"><h2>Open Chats</h2><div class="val">${s.open_rooms}</div></div>
+      <div class="card"><h2>Inactive Chats</h2><div class="val">${s.inactive_rooms}</div></div>
+      <div class="card"><h2>Rooms w/ Invite</h2><div class="val">${s.invite_rooms}</div></div>
+      <div class="card"><h2>Open File Transfers</h2><div class="val">${s.open_file_transfers}</div></div>
+      <div class="card"><h2>Files Uploaded</h2><div class="val">${s.files_uploaded_count}</div>
+        <div class="sub">${fmtBytes(s.files_uploaded_bytes)}</div></div>
+      <div class="card"><h2>Files Downloaded</h2><div class="val">${s.files_downloaded_count}</div>
+        <div class="sub">${fmtBytes(s.files_downloaded_bytes)}</div></div>
+      <div class="card"><h2>Chat Files Shared</h2><div class="val">${s.chat_files_shared}</div></div>
+    </div>`;
+    const sysArea=document.getElementById('sys-res-area');
+    if(sysArea)sysArea.innerHTML=renderSysResources(s);
+    document.getElementById('timer-breakdown').innerHTML=renderTimerBreakdown(s.rooms_by_destruct);
+  },5000);
+}
+
+function renderTimerBreakdown(obj){
+  if(!obj||!Object.keys(obj).length)return '<em style="color:#555">No active rooms</em>';
+  return Object.entries(obj).map(([k,v])=>
+    `<div style="display:inline-block;margin:.3rem .5rem .3rem 0;padding:.3rem .7rem;
+      background:#1a1a1a;border:1px solid #2e2e2e;border-radius:6px;font-size:.82rem">
+      <strong>${k}</strong>: ${v}</div>`).join('');
+}
+
+function startLogStream(){
+  const box=document.getElementById('log-box');
+  if(!box)return;
+  const es=new EventSource(_AP+'/api/logs');
+  es.addEventListener('log',e=>{
+    const line=document.createElement('div');
+    const t=e.data||'';
+    line.className='log-line '+_logClass(t);
+    line.textContent=t;
+    box.appendChild(line);
+    box.scrollTop=box.scrollHeight;
+    // Keep last 500 lines
+    while(box.children.length>500)box.removeChild(box.firstChild);
+  });
+  es.onerror=()=>{es.close();setTimeout(startLogStream,3000);};
+}
+
+/**
+ * Classify a log line into a CSS colour class.
+ * Mirrors the keyword logic in _ColourFormatter (server.py) so the admin
+ * panel uses the same semantic colour scheme as the terminal output.
+ */
+function _logClass(t){
+  const s=t.toLowerCase();
+  // Level overrides first
+  if(s.includes('error')||s.includes('warning'))return 'err';
+  if(s.includes('warn'))return 'warn';
+  // Semantic keywords (same sets as _ColourFormatter._DELETION, etc.)
+  if(s.includes('room deleted')||s.includes('room self-destructed')||
+     s.includes('cleaned up')||s.includes('expired'))return 'deleted';
+  if(s.includes('share download'))return 'dl';
+  if(s.includes('share upload'))return 'ul';
+  if(s.includes('room created')||s.includes('database ready')||
+     s.includes('securechat starting'))return 'created';
+  if(s.includes('peer joined'))return 'joined';
+  if(s.includes('room inactive'))return 'inactive';
+  if(s.includes('chat file share'))return 'chatfile';
+  if(s.includes('inbox created'))return 'inbox-created';
+  if(s.includes('inbox filled')||s.includes('inbox email received'))return 'inbox-msg';
+  if(s.includes('inbox read'))return 'inbox-read';
+  return 'info';
+}
+
+// Bootstrap — attach submit handler to the pre-rendered login form, then check session
+document.getElementById('lf').addEventListener('submit',async e=>{
+  e.preventDefault();
+  const pc=document.getElementById('pc').value;
+  const r=await fetch(_AP+'/login',{method:'POST',headers:{'Content-Type':'application/json'},
+                                    body:JSON.stringify({passcode:pc})});
+  if(r.ok){await renderDashboard().catch(()=>renderLogin('Load error. Please refresh.'));}
+  else{renderLogin(r.status===429?'Too many attempts — wait before retrying.':'Wrong passcode.');}
+});
+fetch(_AP+'/api/stats').then(async r=>{
+  if(r.ok)await renderDashboard().catch(()=>renderLogin());
+  // else: leave the pre-rendered login form as-is
+}).catch(()=>{/* leave login form as-is on network error */});
+</script>
+</body>
+</html>
