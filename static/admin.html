@@ -212,6 +212,12 @@ async function renderDashboard(){
         <div class="sub">${fmtBytes(stats.files_downloaded_bytes)}</div></div>
       <div class="card"><h2>Chat Files Shared</h2>
         <div class="val">${stats.chat_files_shared}</div></div>
+      <div class="card"><h2>Open Inboxes</h2>
+        <div class="val">${stats.open_inbox_slots}</div></div>
+      <div class="card"><h2>Inboxes Created</h2>
+        <div class="val">${stats.inbox_created_total}</div></div>
+      <div class="card"><h2>Mail Messages Received</h2>
+        <div class="val">${stats.inbox_msgs_received_total}</div></div>
     </div>
     <section>
       <h2>Server Process Resources</h2>
@@ -577,6 +583,9 @@ async function renderDashboard(){
       <div class="card"><h2>Files Downloaded</h2><div class="val">${s.files_downloaded_count}</div>
         <div class="sub">${fmtBytes(s.files_downloaded_bytes)}</div></div>
       <div class="card"><h2>Chat Files Shared</h2><div class="val">${s.chat_files_shared}</div></div>
+      <div class="card"><h2>Open Inboxes</h2><div class="val">${s.open_inbox_slots}</div></div>
+      <div class="card"><h2>Inboxes Created</h2><div class="val">${s.inbox_created_total}</div></div>
+      <div class="card"><h2>Mail Messages Received</h2><div class="val">${s.inbox_msgs_received_total}</div></div>
     </div>`;
     const sysArea=document.getElementById('sys-res-area');
     if(sysArea)sysArea.innerHTML=renderSysResources(s);

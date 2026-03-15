@@ -567,6 +567,7 @@ def _print_summary(
     smtp_enabled: bool,
     mail_domain: str,
     mesh_token: str,
+    mesh_path: str,
 ) -> None:
     lan = _lan_ip()
     sep = "=" * 66
@@ -614,7 +615,8 @@ def _print_summary(
     print("  🕸️   Mesh / multi-device federation:")
     print("        Run another instance anywhere in the world, then link them:")
     print()
-    print(f"        python run.py --mesh-join {base_url}/mesh/peer/connect --mesh-token {mesh_token}")
+    connect_url = f"{base_url}/{mesh_path}/mesh/connect"
+    print(f"        python run.py --mesh-join {connect_url} --mesh-token {mesh_token}")
     print()
     print("        Both instances will share room messages across the mesh.")
     print("        Uses Tor (.onion) when available — no IP exposed.")
@@ -639,10 +641,11 @@ def _join_mesh_peer(
     connect_url: str,
     remote_token: str,
     local_token: str,
+    local_mesh_path: str = "",
     onion: str | None,
     server_port: int,
-) -> None:
-    """POST to the remote server's /mesh/peer/connect to register as a peer.
+) -> list[dict]:
+    """POST to the remote server's /<mesh_path>/mesh/connect to register as a peer.
 
     When the target URL is a .onion address the request is routed through the
     local Tor SOCKS5 proxy at 127.0.0.1:9050 so hidden-service peers can be
@@ -655,20 +658,25 @@ def _join_mesh_peer(
 
     For plain (non-onion) URLs the legacy urllib path is used so that there is
     no hard dependency on aiohttp / aiohttp-socks in non-Tor deployments.
+
+    Returns a list of peer dicts (url, token, mesh_path) from the connect
+    response so the caller can pre-populate ``_mesh_peers`` before the server
+    starts.  Returns an empty list on failure.
     """
     import json as _json  # noqa: PLC0415
     import time as _time  # noqa: PLC0415
 
     if not remote_token:
         print("\n  ⚠️  --mesh-join requires --mesh-token <MESH_TOKEN of the remote server>")
-        return
+        return []
 
     lan = _lan_ip()
     local_url = f"http://{onion}" if onion else f"http://{lan}:{server_port}"
     payload = _json.dumps({
-        "token":      remote_token,
-        "peer_url":   local_url,
-        "peer_token": local_token,
+        "token":          remote_token,
+        "peer_url":       local_url,
+        "peer_token":     local_token,
+        "peer_mesh_path": local_mesh_path,
     }).encode()
 
     is_onion = ".onion" in connect_url.lower()
@@ -678,6 +686,14 @@ def _join_mesh_peer(
     print(f"\n  Joining mesh peer at {connect_url} …")
     if is_onion:
         print("  (routing through Tor SOCKS5 — may take a few seconds)")
+
+    # Derive the base URL of the target server for adding it to _mesh_peers.
+    try:
+        from urllib.parse import urlparse as _urlparse  # noqa: PLC0415
+        _parsed = _urlparse(connect_url)
+        _target_base = f"{_parsed.scheme}://{_parsed.netloc}"
+    except Exception:  # noqa: BLE001
+        _target_base = ""
 
     last_exc: Exception | None = None
     for attempt in range(1, max_attempts + 1):
@@ -699,11 +715,20 @@ def _join_mesh_peer(
                             data=payload,
                             headers={"Content-Type": "application/json"},
                         ) as resp:
-                            return await resp.json()
+                            if resp.status == 403:
+                                raise Exception(
+                                    "HTTP 403 Forbidden — wrong MESH_TOKEN. "
+                                    "Check the token printed on the remote server's console."
+                                )
+                            if resp.status != 200:
+                                body = await resp.text()
+                                raise Exception(f"HTTP {resp.status}: {body[:200]}")
+                            return await resp.json(content_type=None)
 
                 data = _asyncio.run(_post_via_tor())
             else:
                 import urllib.request as _urllib_request  # noqa: PLC0415
+                import urllib.error as _urllib_error  # noqa: PLC0415
 
                 req = _urllib_request.Request(
                     connect_url,
@@ -711,14 +736,40 @@ def _join_mesh_peer(
                     headers={"Content-Type": "application/json"},
                     method="POST",
                 )
-                with _urllib_request.urlopen(req, timeout=15) as resp:
-                    data = _json.loads(resp.read())
+                try:
+                    with _urllib_request.urlopen(req, timeout=15) as resp:
+                        data = _json.loads(resp.read())
+                except _urllib_error.HTTPError as http_err:
+                    if http_err.code == 403:
+                        raise Exception(
+                            "HTTP 403 Forbidden — wrong MESH_TOKEN. "
+                            "Check the token printed on the remote server's console."
+                        ) from http_err
+                    raise Exception(f"HTTP {http_err.code}: {http_err.reason}") from http_err
 
             if data.get("ok"):
                 print(f"  ✅  Mesh peer connected  (peer_id: …{data.get('peer_id', '')[-6:]})")
+                # Build the list of peers to pre-populate _mesh_peers:
+                # 1. The server we just connected to.
+                # 2. Any existing peers it told us about.
+                peers_out: list[dict] = []
+                if _target_base:
+                    peers_out.append({
+                        "url":       _target_base,
+                        "token":     remote_token,
+                        "mesh_path": data.get("mesh_path", ""),
+                    })
+                for _p in data.get("peers", []):
+                    if _p.get("url") and _p.get("token"):
+                        peers_out.append({
+                            "url":       _p["url"],
+                            "token":     _p["token"],
+                            "mesh_path": _p.get("mesh_path", ""),
+                        })
+                return peers_out
             else:
                 print(f"  ⚠️  Mesh join response: {data}")
-            return  # success — stop retrying
+            return []  # non-ok response — don't retry
 
         except Exception as exc:  # noqa: BLE001
             last_exc = exc
@@ -736,12 +787,13 @@ def _join_mesh_peer(
                         f"  ⚠️  Tor proxy not reachable at 127.0.0.1:9050 — "
                         "start Tor before joining .onion peers."
                     )
-                    return
+                    return []
             if attempt < max_attempts:
                 print(f"  ↻  Attempt {attempt}/{max_attempts} failed: {exc}  — retrying in {attempt_delay:.0f}s …")
                 _time.sleep(attempt_delay)
 
     print(f"  ⚠️  Mesh join failed after {max_attempts} attempts: {last_exc}")
+    return []
 
 
 # ---------------------------------------------------------------------------
@@ -818,6 +870,11 @@ def main() -> None:
             print("  Edit .env, uncomment the lines you want, then run:  python run.py")
         print("  Documentation:  info-files/env-vars.md")
         sys.exit(0)
+
+    # Save our own persisted MESH_TOKEN BEFORE _flag_env runs — the --mesh-token
+    # flag writes the REMOTE server's token into os.environ["MESH_TOKEN"], which
+    # would overwrite our own persisted value if we read it after the loop.
+    _own_persisted_mesh_token = os.environ.get("MESH_TOKEN", "").strip()
 
     # Apply CLI flags to env vars (only when explicitly provided, so .env and
     # parent-process env vars are not overridden by argparse defaults).
@@ -935,19 +992,24 @@ def main() -> None:
     # build_app() picks them up without a second initialisation.
     srv._ADMIN_PATH, srv._ADMIN_PASSCODE = srv._init_admin_credentials()
     srv._ADMIN_WEBHOOK_TOKEN = _secrets.token_urlsafe(32)
-    srv._MESH_TOKEN = _secrets.token_urlsafe(32)
+    # Re-use our own persisted MESH_TOKEN (saved before _flag_env could
+    # overwrite MESH_TOKEN with the remote server's token).  Generate a
+    # fresh one only on the very first run when nothing is persisted yet.
+    srv._MESH_TOKEN = _own_persisted_mesh_token or _secrets.token_urlsafe(32)
+    srv._MESH_PATH  = srv._init_mesh_path()
     srv._CLEARNET_PATH = srv._init_clearnet_path()
 
     # Persist auto-generated secrets so they survive restarts.
     # On Windows the .bat launcher is updated with SET commands so the values
     # are available before Python starts.  On other platforms (or when the bat
     # file is absent) the secrets fall back to the .env file.
+    # Admin path and passcode are intentionally NOT persisted — they are
+    # regenerated on every startup so credentials never stay the same.
     _secrets_to_persist = {
         "CLEARNET_PATH":       srv._CLEARNET_PATH,
-        "ADMIN_PATH":          srv._ADMIN_PATH,
-        "ADMIN_PASSCODE":      srv._ADMIN_PASSCODE,
         "ADMIN_WEBHOOK_TOKEN": srv._ADMIN_WEBHOOK_TOKEN,
         "MESH_TOKEN":          srv._MESH_TOKEN,
+        "MESH_PATH":           srv._MESH_PATH,
     }
     wrote_bat = srv._persist_vars_to_bat(_secrets_to_persist)
     if not wrote_bat:
@@ -968,6 +1030,7 @@ def main() -> None:
         smtp_enabled=smtp_enabled,
         mail_domain=mail_domain,
         mesh_token=srv._MESH_TOKEN,
+        mesh_path=srv._MESH_PATH,
     )
 
     # ── 7. Run the server ─────────────────────────────────────────────
@@ -976,13 +1039,27 @@ def main() -> None:
     # ── 8. Join a remote mesh peer (optional) ─────────────────────────
     mesh_join_url = os.environ.get("MESH_JOIN", "")
     if mesh_join_url:
-        _join_mesh_peer(
+        import time as _time_mod  # noqa: PLC0415
+        joined_peers = _join_mesh_peer(
             connect_url=mesh_join_url,
             remote_token=os.environ.get("MESH_TOKEN", ""),
             local_token=srv._MESH_TOKEN,
+            local_mesh_path=srv._MESH_PATH,
             onion=onion,
             server_port=server_port,
         )
+        # Populate _mesh_peers with every peer the remote server told us about
+        # (includes the remote server itself and any peers it already has).
+        # This ensures we can forward messages to all of them immediately.
+        import secrets as _sec2  # noqa: PLC0415
+        for _p in joined_peers:
+            if _p.get("url") and _p.get("token"):
+                srv._mesh_peers[_sec2.token_hex(16)] = {
+                    "url":          _p["url"],
+                    "token":        _p["token"],
+                    "mesh_path":    _p.get("mesh_path", ""),
+                    "connected_at": _time_mod.time(),
+                }
 
     try:
         web.run_app(srv.build_app(), host=host, port=server_port, access_log=None)

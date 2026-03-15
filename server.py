@@ -703,6 +703,8 @@ _stats: dict[str, int | float] = {
     "files_downloaded_count": 0,
     "files_downloaded_bytes": 0,
     "chat_files_shared": 0,
+    "inbox_created_total": 0,
+    "inbox_msgs_received_total": 0,
 }
 
 # ---------------------------------------------------------------------------
@@ -1783,6 +1785,7 @@ class InboxSmtpHandler:
                 "content_type": "text/html" if body_html else "text/plain",
                 "received_at":  time.time(),
             })
+            _stats["inbox_msgs_received_total"] += 1
             logger.info(
                 "inbox email received  token=…%s  from=%.40s  subject=%r",
                 local[-6:],
@@ -1831,6 +1834,7 @@ async def inbox_create_handler(request: web.Request) -> web.Response:
         "expires_at": expires_at,
     }
     _inbox_slots[token] = slot
+    _stats["inbox_created_total"] += 1
 
     # ── Determine the real email address ──────────────────────────────────
     mailtm_enabled = False
@@ -1897,6 +1901,7 @@ async def inbox_drop_handler(request: web.Request) -> web.Response:
         "content_type": "text/plain",
         "received_at":  time.time(),
     })
+    _stats["inbox_msgs_received_total"] += 1
     logger.info("inbox filled  token=…%s", token[-6:])
     return web.json_response({"ok": True})
 
@@ -2554,6 +2559,7 @@ async def _admin_stats_handler(request: web.Request) -> web.Response:
         "inactive_rooms": len(inactive_rooms),
         "invite_rooms": len(meta_rooms),
         "open_file_transfers": len(_share_slots),
+        "open_inbox_slots": len(_inbox_slots),
         "rooms_by_destruct": by_destruct,
         **_get_sys_metrics(),
     })
@@ -2857,23 +2863,23 @@ def _persist_vars_to_bat(
 
 
 def _init_admin_credentials() -> tuple[str, str]:
-    """Generate (or read from env) admin path and passcode; print both to console.
+    """Generate fresh admin path and passcode; print both to console.
+
+    Credentials are always regenerated on startup so they never stay the
+    same across restarts.  This ensures that any leaked or guessed credentials
+    become invalid after a server restart.
 
     Returns:
         (admin_path, admin_passcode) — both are ready to use as URL/auth values.
     """
     # ── Path (200 random URL-safe characters) ─────────────────────────────────
-    path = os.environ.get("ADMIN_PATH", "").strip()
-    if not path:
-        # secrets.token_urlsafe(150) returns exactly ceil(150*4/3) = 200 base64 chars.
-        # The [:200] slice is defensive in case the formula changes in a future Python.
-        path = secrets.token_urlsafe(150)[:200]
+    # secrets.token_urlsafe(150) returns exactly ceil(150*4/3) = 200 base64 chars.
+    # The [:200] slice is defensive in case the formula changes in a future Python.
+    path = secrets.token_urlsafe(150)[:200]
 
     # ── Passcode (100 characters) ──────────────────────────────────────────────
-    pc = os.environ.get("ADMIN_PASSCODE", "").strip()
-    if not pc:
-        # secrets.token_urlsafe(75) returns exactly 100 base64 chars.
-        pc = secrets.token_urlsafe(75)[:100]
+    # secrets.token_urlsafe(75) returns exactly 100 base64 chars.
+    pc = secrets.token_urlsafe(75)[:100]
 
     # ── Print both prominently to the console ──────────────────────────────────
     print("", flush=True)
@@ -2919,6 +2925,24 @@ def _init_clearnet_path() -> str:
     print("", flush=True)
     logger.info("clearnet access path ready  (printed to console at startup)")
 
+    return path
+
+
+def _init_mesh_path() -> str:
+    """Generate (or read from env) the 50-character mesh URL path segment.
+
+    All mesh endpoints (connect, forward, link) are mounted under this secret
+    path so they are not publicly discoverable.  Set MESH_PATH in the
+    environment to pin a specific path across restarts (recommended so that
+    saved connect URLs remain valid after a server restart).
+
+    Returns:
+        The 50-character URL-safe path string (no leading/trailing slashes).
+    """
+    path = os.environ.get("MESH_PATH", "").strip()
+    if not path:
+        # secrets.token_urlsafe(37) returns 50 URL-safe base64 characters.
+        path = secrets.token_urlsafe(37)[:50]
     return path
 
 
@@ -3327,28 +3351,112 @@ def build_admin_app(db_path: Path | None = None) -> web.Application:
 # ---------------------------------------------------------------------------
 # Mesh peer federation
 # ---------------------------------------------------------------------------
-# Each server has a MESH_TOKEN that acts as an invite secret.
-# Another server uses POST /mesh/peer/connect to register as a peer.
-# Once connected, room messages are forwarded between peers so users on
-# different instances can communicate in the same room.
+# Each server has a MESH_TOKEN that acts as an invite secret and a _MESH_PATH
+# that hides all mesh endpoints behind a 50-char random URL segment so they
+# are not publicly discoverable.
 #
-# Invite URL:  http://<onion-or-host>/mesh/peer/connect
-# Invite token printed at startup by run.py.
+# Another server uses POST /<_MESH_PATH>/mesh/connect to register as a peer.
+# Once connected, room messages are forwarded between peers so users on
+# different instances can communicate in the same room.  When a new peer
+# connects, the host server announces it to all existing peers via their
+# /<mesh_path>/mesh/link endpoint so every node can talk directly to every
+# other node without routing through the original host.
+#
+# Invite URL:  http://<onion-or-host>/<_MESH_PATH>/mesh/connect
+# Both the path and token are printed at startup by run.py.
 # ---------------------------------------------------------------------------
 
 _MESH_TOKEN: str = ""        # Set at startup; printed to console / shown by run.py
-_mesh_peers: dict[str, dict] = {}   # peer_id → {url, token, connected_at}
+_MESH_PATH: str = ""         # 50-char random URL segment hiding the mesh endpoints
+_mesh_peers: dict[str, dict] = {}   # peer_id → {url, token, mesh_path, connected_at}
 
 
 async def mesh_peer_connect_handler(request: web.Request) -> web.Response:
-    """POST /mesh/peer/connect — register a remote peer.
+    """POST /<_MESH_PATH>/mesh/connect — register a remote peer.
 
     Body::
 
         {
-            "token":    "<MESH_TOKEN of the target server>",
-            "peer_url": "http://<other-server>/",
-            "peer_token": "<MESH_TOKEN of the connecting server>"
+            "token":          "<MESH_TOKEN of the target server>",
+            "peer_url":       "http://<other-server>/",
+            "peer_token":     "<MESH_TOKEN of the connecting server>",
+            "peer_mesh_path": "<50-char mesh path of the connecting server>"
+        }
+
+    Returns on success::
+
+        {
+            "ok":         true,
+            "peer_id":    "…",
+            "mesh_path":  "<this server's 50-char mesh path>",
+            "peers":      [{"url": "…", "token": "…", "mesh_path": "…"}, …]
+        }
+
+    The ``mesh_path`` and ``peers`` fields let the connecting server add this
+    server (and every already-connected peer) to its own ``_mesh_peers`` so
+    all nodes can communicate directly without routing through this server.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        raise web.HTTPBadRequest(reason="JSON body required")
+
+    import hmac as _hmac  # noqa: PLC0415
+    provided = str(body.get("token", "")).encode()
+    expected = _MESH_TOKEN.encode()
+    if not expected or not _hmac.compare_digest(provided, expected):
+        raise web.HTTPForbidden(reason="Invalid mesh token")
+
+    peer_url = str(body.get("peer_url", "")).strip().rstrip("/")
+    peer_token = str(body.get("peer_token", "")).strip()
+    peer_mesh_path = str(body.get("peer_mesh_path", "")).strip()
+    if not peer_url:
+        raise web.HTTPBadRequest(reason="peer_url required")
+
+    # Snapshot existing peers BEFORE registering the new one so we can return
+    # them to the connecting server and announce the new peer to them.
+    existing_peers_snapshot = [
+        {"url": p["url"], "token": p["token"], "mesh_path": p.get("mesh_path", "")}
+        for p in _mesh_peers.values()
+    ]
+
+    peer_id = secrets.token_hex(16)
+    _mesh_peers[peer_id] = {
+        "url":          peer_url,
+        "token":        peer_token,
+        "mesh_path":    peer_mesh_path,
+        "connected_at": time.time(),
+    }
+    logger.info("mesh peer connected  peer_id=…%s  url=%s", peer_id[-6:], peer_url[:60])
+
+    # Tell every already-connected peer about the new arrival so they can
+    # build a direct link without routing through this server.
+    if existing_peers_snapshot:
+        asyncio.ensure_future(_announce_peer_to_all(peer_id))
+
+    return web.json_response({
+        "ok":        True,
+        "peer_id":   peer_id,
+        "mesh_path": _MESH_PATH,
+        "peers":     existing_peers_snapshot,
+    })
+
+
+async def mesh_peer_link_handler(request: web.Request) -> web.Response:
+    """POST /<_MESH_PATH>/mesh/link — accept a peer announcement from another peer.
+
+    When a new peer connects to any server in the mesh, that server fans out
+    the new peer's details to all existing peers using this endpoint.  The
+    request is authenticated with *this* server's MESH_TOKEN so only already-
+    trusted peers can announce new members.
+
+    Body::
+
+        {
+            "token":          "<this server's MESH_TOKEN>",
+            "peer_url":       "http://<new-peer>/",
+            "peer_token":     "<new peer's MESH_TOKEN>",
+            "peer_mesh_path": "<new peer's 50-char mesh path>"
         }
 
     Returns ``{"ok": true, "peer_id": "…"}`` on success.
@@ -3366,6 +3474,7 @@ async def mesh_peer_connect_handler(request: web.Request) -> web.Response:
 
     peer_url = str(body.get("peer_url", "")).strip().rstrip("/")
     peer_token = str(body.get("peer_token", "")).strip()
+    peer_mesh_path = str(body.get("peer_mesh_path", "")).strip()
     if not peer_url:
         raise web.HTTPBadRequest(reason="peer_url required")
 
@@ -3373,14 +3482,51 @@ async def mesh_peer_connect_handler(request: web.Request) -> web.Response:
     _mesh_peers[peer_id] = {
         "url":          peer_url,
         "token":        peer_token,
+        "mesh_path":    peer_mesh_path,
         "connected_at": time.time(),
     }
-    logger.info("mesh peer connected  peer_id=…%s  url=%s", peer_id[-6:], peer_url[:60])
+    logger.info("mesh peer linked  peer_id=…%s  url=%s", peer_id[-6:], peer_url[:60])
     return web.json_response({"ok": True, "peer_id": peer_id})
 
 
+async def _announce_peer_to_all(new_peer_id: str) -> None:
+    """Fire-and-forget: tell every existing peer about a newly connected peer.
+
+    Called after ``mesh_peer_connect_handler`` registers a new peer.  Each
+    already-connected peer receives a POST to its ``/<mesh_path>/mesh/link``
+    endpoint with the new peer's URL, token, and mesh path so every node can
+    build a direct link without routing through this server.
+
+    Peers that have no ``mesh_path`` stored (legacy connections) are skipped
+    because we don't know their link endpoint URL.
+    """
+    new_peer = _mesh_peers.get(new_peer_id)
+    if not new_peer:
+        return
+    for peer_id, peer in list(_mesh_peers.items()):
+        if peer_id == new_peer_id:
+            continue
+        peer_mesh_path = peer.get("mesh_path", "")
+        if not peer_mesh_path:
+            continue  # can't construct link URL without the secret path
+        link_url = peer["url"].rstrip("/") + f"/{peer_mesh_path}/mesh/link"
+        try:
+            async with await _make_proxied_session(timeout=5.0) as sess:
+                await sess.post(
+                    link_url,
+                    json={
+                        "token":          peer["token"],
+                        "peer_url":       new_peer["url"],
+                        "peer_token":     new_peer["token"],
+                        "peer_mesh_path": new_peer.get("mesh_path", ""),
+                    },
+                )
+        except Exception:  # noqa: BLE001
+            pass
+
+
 async def mesh_peer_forward_handler(request: web.Request) -> web.Response:
-    """POST /mesh/peer/forward — receive a forwarded room message from a peer.
+    """POST /<_MESH_PATH>/mesh/forward — receive a forwarded room message from a peer.
 
     Body::
 
@@ -3447,12 +3593,18 @@ async def mesh_invite_handler(request: web.Request) -> web.Response:
     scheme = "http"
     if request.secure:
         scheme = "https"
-    connect_url = f"{scheme}://{host}/mesh/peer/connect"
+    connect_url = f"{scheme}://{host}/{_MESH_PATH}/mesh/connect"
     return web.json_response({
         "connect_url":  connect_url,
         "mesh_token":   _MESH_TOKEN,
+        "mesh_path":    _MESH_PATH,
         "peers":        [
-            {"peer_id": pid[-6:], "url": p["url"], "connected_at": p["connected_at"]}
+            {
+                "peer_id":    pid[-6:],
+                "url":        p["url"],
+                "mesh_path":  p.get("mesh_path", ""),
+                "connected_at": p["connected_at"],
+            }
             for pid, p in _mesh_peers.items()
         ],
     })
@@ -3463,15 +3615,22 @@ async def _forward_to_peers(room_id: str, payload: str) -> None:
 
     Peer URLs may be .onion addresses — the proxied session routes them
     through Tor automatically.
+
+    Uses the per-peer ``mesh_path`` to construct the secret forward endpoint
+    URL.  Peers that have no ``mesh_path`` stored are skipped because the
+    forward endpoint is no longer at the public ``/mesh/peer/forward`` path.
     """
     if not _mesh_peers:
         return
     for peer in list(_mesh_peers.values()):
-        peer_url = peer["url"].rstrip("/") + "/mesh/peer/forward"
+        peer_mesh_path = peer.get("mesh_path", "")
+        if not peer_mesh_path:
+            continue  # skip legacy peers without a known secret path
+        fwd_url = peer["url"].rstrip("/") + f"/{peer_mesh_path}/mesh/forward"
         try:
             async with await _make_proxied_session(timeout=5.0) as sess:
                 await sess.post(
-                    peer_url,
+                    fwd_url,
                     json={"token": _MESH_TOKEN, "room_id": room_id, "payload": payload},
                 )
         except Exception:  # noqa: BLE001
@@ -3484,13 +3643,15 @@ async def _forward_to_peers(room_id: str, payload: str) -> None:
 
 
 def build_app(db_path: Path | None = None) -> web.Application:
-    global _ADMIN_PASSCODE, _ADMIN_PATH, _ADMIN_WEBHOOK_TOKEN, _MESH_TOKEN, _CLEARNET_PATH  # noqa: PLW0603
+    global _ADMIN_PASSCODE, _ADMIN_PATH, _ADMIN_WEBHOOK_TOKEN, _MESH_TOKEN, _MESH_PATH, _CLEARNET_PATH  # noqa: PLW0603
     if not _ADMIN_PASSCODE:
         _ADMIN_PATH, _ADMIN_PASSCODE = _init_admin_credentials()
     if not _ADMIN_WEBHOOK_TOKEN:
         _ADMIN_WEBHOOK_TOKEN = secrets.token_urlsafe(32)
     if not _MESH_TOKEN:
         _MESH_TOKEN = secrets.token_urlsafe(32)
+    if not _MESH_PATH:
+        _MESH_PATH = _init_mesh_path()
     if not _CLEARNET_PATH:
         _CLEARNET_PATH = _init_clearnet_path()
 
@@ -3588,10 +3749,15 @@ def build_app(db_path: Path | None = None) -> web.Application:
     app.router.add_get("/static/admin.html", _blocked_static_handler)
     app.router.add_static("/static", STATIC_DIR, show_index=False)
 
-    # Mesh peer federation routes
-    app.router.add_post("/mesh/peer/connect", mesh_peer_connect_handler)
-    app.router.add_post("/mesh/peer/forward", mesh_peer_forward_handler)
-    app.router.add_get("/mesh/invite", mesh_invite_handler)
+    # Mesh peer federation routes — all hidden behind the 50-char secret path.
+    # The forward and link endpoints are authenticated by peer token; the
+    # connect endpoint is authenticated by MESH_TOKEN.  The public /mesh/invite
+    # endpoint is kept for admin use and protected by the admin session.
+    mp = _MESH_PATH
+    app.router.add_post(f"/{mp}/mesh/connect", mesh_peer_connect_handler)
+    app.router.add_post(f"/{mp}/mesh/forward", mesh_peer_forward_handler)
+    app.router.add_post(f"/{mp}/mesh/link",    mesh_peer_link_handler)
+    app.router.add_get("/mesh/invite",          mesh_invite_handler)
 
     # Mount admin panel under the secret 200-char path on the same server
     _register_admin_routes(app)
@@ -3622,14 +3788,24 @@ if __name__ == "__main__":
     _ADMIN_PATH, _ADMIN_PASSCODE = _init_admin_credentials()
     _ADMIN_WEBHOOK_TOKEN = secrets.token_urlsafe(32)
     print(f"  Admin webhook  : /{_ADMIN_PATH}/webhook/{_ADMIN_WEBHOOK_TOKEN}", flush=True)
+
+    # Mesh: re-read token from env so it survives restarts; generate fresh only
+    # on first run.  The path is likewise persisted so connect URLs stay stable.
+    _MESH_TOKEN = os.environ.get("MESH_TOKEN", "").strip() or secrets.token_urlsafe(32)
+    _MESH_PATH = _init_mesh_path()
+    print(f"  Mesh connect   : /{_MESH_PATH}/mesh/connect", flush=True)
+    print(f"  Mesh token     : {_MESH_TOKEN}", flush=True)
+
     _CLEARNET_PATH = _init_clearnet_path()
 
     # Persist auto-generated secrets so they survive restarts.
+    # Admin path and passcode are intentionally NOT persisted — they are
+    # regenerated on every startup so credentials never stay the same.
     _secrets_to_persist = {
         "CLEARNET_PATH":       _CLEARNET_PATH,
-        "ADMIN_PATH":          _ADMIN_PATH,
-        "ADMIN_PASSCODE":      _ADMIN_PASSCODE,
         "ADMIN_WEBHOOK_TOKEN": _ADMIN_WEBHOOK_TOKEN,
+        "MESH_TOKEN":          _MESH_TOKEN,
+        "MESH_PATH":           _MESH_PATH,
     }
     if not _persist_vars_to_bat(_secrets_to_persist):
         _persist_new_env_vars(_secrets_to_persist)
