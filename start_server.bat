@@ -76,6 +76,11 @@ cd /d "%~dp0"
 :: Absolute path to the tor binary (default: auto-detected)
 :: SET TOR_PATH=C:\path\to\tor.exe
 
+:: Your known .onion address — set this if you already have a hostname so that
+:: invite links and /api/server-info return the correct onion URL.
+:: Leave unset and Tor will auto-generate one on first run.
+:: SET ONION_ADDRESS=yourhostname.onion
+
 :: ── Mesh / Federation ────────────────────────────────────────
 :: Automatically join a remote peer at startup.
 :: Set both MESH_JOIN and MESH_TOKEN together.
@@ -111,6 +116,47 @@ cd /d "%~dp0"
 
 :: Delay in seconds applied to each request while slow mode is active (default: 2.0).
 :: SET SLOW_MODE_DELAY=2.0
+
+:: ── DDoS protection ──────────────────────────────────────────
+:: Set to 0 to disable the built-in DDoS guard entirely (default: enabled).
+:: SET DDOS_ENABLED=1
+
+:: Max requests per IP inside the sliding window before the IP is banned (default: 200).
+:: SET DDOS_REQ_LIMIT=200
+
+:: Sliding window length in seconds (default: 10).
+:: SET DDOS_WINDOW_SEC=10
+
+:: How long a banned IP stays blocked in seconds (default: 300 = 5 min).
+:: SET DDOS_BAN_SEC=300
+
+:: Number of unique IPs banned within one window that triggers automatic lockdown (default: 50).
+:: SET DDOS_AUTO_LOCKDOWN_THRESHOLD=50
+
+:: ── Spam protection ──────────────────────────────────────────
+:: Set to 0 to disable the built-in chat/mail spam filter (default: enabled).
+:: SET SPAM_ENABLED=1
+
+:: Max chat messages per sender inside the sliding window (default: 20).
+:: SET SPAM_MSG_LIMIT=20
+
+:: Chat spam sliding window in seconds (default: 10).
+:: SET SPAM_MSG_WINDOW=10
+
+:: Max inbound emails per sender inside the sliding window (default: 5).
+:: SET SPAM_MAIL_LIMIT=5
+
+:: Mail spam sliding window in seconds (default: 60).
+:: SET SPAM_MAIL_WINDOW=60
+
+:: ── Chat history ─────────────────────────────────────────────
+:: Max messages stored and replayed per room.  Oldest are pruned automatically (default: 100).
+:: SET HISTORY_LIMIT=100
+
+:: ── Mail / mail.tm ───────────────────────────────────────────
+:: Set to 0 to disable the automatic mail.tm disposable-address integration (default: enabled).
+:: Only applies when MAIL_DOMAIN and RELAY_SECRET are both unset.
+:: SET MAILTM_ENABLED=1
 
 :: ── Check Python ─────────────────────────────────────────────
 where python >nul 2>&1
