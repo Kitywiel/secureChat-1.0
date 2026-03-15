@@ -610,7 +610,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="secureChat zero-config launcher",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="Full option descriptions: info-files/start-server-config.md",
+        epilog="Environment variable reference: info-files/env-vars.md\nFull option descriptions: info-files/start-server-config.md",
     )
     # Server
     parser.add_argument("--port", type=int, default=None)
@@ -652,7 +652,30 @@ def main() -> None:
     parser.add_argument("--history-limit", type=int, metavar="N", default=None)
     # mail.tm integration
     parser.add_argument("--mailtm-enabled", type=int, metavar="0|1", default=None)
+    # .env helper
+    parser.add_argument(
+        "--example",
+        action="store_true",
+        help="Copy .env.example to .env and exit. See info-files/env-vars.md for documentation.",
+    )
     args = parser.parse_args()
+
+    # Handle --example early, before any other startup logic.
+    if args.example:
+        src = _HERE / ".env.example"
+        dst = _DOTENV
+        if not src.is_file():
+            print("  ERROR: .env.example not found next to run.py.")
+            sys.exit(1)
+        if dst.is_file():
+            print(f"  .env already exists at: {dst}")
+            print("  To regenerate it, delete .env first and re-run:  python run.py --example")
+        else:
+            shutil.copy2(src, dst)
+            print(f"  Created .env at: {dst}")
+            print("  Edit .env, uncomment the lines you want, then run:  python run.py")
+        print("  Documentation:  info-files/env-vars.md")
+        sys.exit(0)
 
     # Apply CLI flags to env vars (only when explicitly provided, so .env and
     # parent-process env vars are not overridden by argparse defaults).
