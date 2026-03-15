@@ -978,13 +978,19 @@ async def ws_handler(request: web.Request) -> web.WebSocketResponse:
 
                 # Send stored history to the newly joined peer only.
                 # History is only kept for passcode-protected rooms.
+                # save_limit is always included so the client can inform the
+                # user how many messages this room retains, even on first join
+                # (when there are no stored messages yet).
                 if _room_meta.get(room_id, {}).get("passcode_hash"):
                     try:
                         history = await get_history(db_path, room_id)
-                        if history:
-                            await ws.send_str(
-                                json.dumps({"type": "history", "messages": history})
-                            )
+                        await ws.send_str(
+                            json.dumps({
+                                "type":       "history",
+                                "messages":   history,
+                                "save_limit": HISTORY_LIMIT,
+                            })
+                        )
                     except Exception as exc:  # noqa: BLE001
                         logger.warning("failed to load history  room=%s  error=%s", room_id, exc)
 

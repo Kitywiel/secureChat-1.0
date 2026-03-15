@@ -589,10 +589,12 @@ function connectWs(roomId) {
     } else if (data.type === 'history') {
       // Replay stored messages sent by the server on join
       const msgs = Array.isArray(data.messages) ? data.messages : [];
+      const limit = typeof data.save_limit === 'number' ? data.save_limit : null;
+      const limitLabel = limit !== null ? ` — saves up to ${limit}` : '';
       if (msgs.length > 0) {
         appendMessage(
           '',
-          `── ${msgs.length} stored message${msgs.length !== 1 ? 's' : ''} ──`,
+          `── ${msgs.length} stored message${msgs.length !== 1 ? 's' : ''}${limitLabel} ──`,
           'system',
         );
         for (const msg of msgs) {
@@ -606,6 +608,8 @@ function connectWs(roomId) {
           }
         }
         appendMessage('', '── live ──', 'system');
+      } else if (limit !== null) {
+        appendMessage('', `── no stored messages — saves up to ${limit} ──`, 'system');
       }
 
     } else if (data.type === 'message') {

@@ -328,7 +328,7 @@ async def test_ws_history_replayed_on_join(ws_client) -> None:
     # First client sends a message
     async with ws_client.ws_connect("/ws") as ws1:
         await ws1.send_str(json.dumps({"type": "join", "room": "roomE", "passcode": "pass"}))
-        await ws1.receive_json(timeout=2)  # system
+        await ws1.receive_json(timeout=2)  # history (empty, with save_limit)
 
         await ws1.send_str(json.dumps({
             "type": "message",
@@ -359,6 +359,36 @@ async def test_ws_history_replayed_on_join(ws_client) -> None:
         assert history_msg["messages"][0]["iv"] == "aGVsbG93b3JsZA=="
         assert history_msg["messages"][0]["ciphertext"] == "c2VjcmV0"
         assert history_msg["messages"][0]["sender"] == "Alice"
+        assert "save_limit" in history_msg, "history message must include save_limit"
+        assert isinstance(history_msg["save_limit"], int)
+
+
+@pytest.mark.asyncio
+async def test_ws_history_save_limit_sent_on_first_join(ws_client) -> None:
+    """A client joining an empty passcode-protected room receives save_limit even with no stored messages."""
+    _room_meta["save-limit-room"] = {
+        "passcode_hash": _hash_passcode("pw"),
+        "expires_at": None,
+    }
+    async with ws_client.ws_connect("/ws") as ws:
+        await ws.send_str(json.dumps({"type": "join", "room": "save-limit-room", "passcode": "pw"}))
+
+        import asyncio
+        messages = []
+        for _ in range(2):
+            try:
+                m = await asyncio.wait_for(ws.receive_json(), timeout=2)
+                messages.append(m)
+            except asyncio.TimeoutError:
+                break
+
+        types = {m["type"] for m in messages}
+        assert "history" in types, f"Expected history in {messages}"
+        history_msg = next(m for m in messages if m["type"] == "history")
+        assert history_msg["messages"] == [], "No stored messages on first join"
+        assert "save_limit" in history_msg, "history message must include save_limit on first join"
+        assert isinstance(history_msg["save_limit"], int)
+        assert history_msg["save_limit"] > 0
 
 
 @pytest.mark.asyncio
@@ -848,9 +878,20 @@ async def test_ws_join_passcode_correct(ws_client) -> None:
     }
     async with ws_client.ws_connect("/ws") as ws:
         await ws.send_str(json.dumps({"type": "join", "room": "passcode-room", "passcode": "1234"}))
-        msg = await ws.receive_json(timeout=2)
-        assert msg["type"] == "system"
-        assert msg["users"] == 1
+        # Passcode rooms now always send a history message (with save_limit) first,
+        # followed by the system user-count message.
+        import asyncio
+        messages = []
+        for _ in range(2):
+            try:
+                m = await asyncio.wait_for(ws.receive_json(), timeout=2)
+                messages.append(m)
+            except asyncio.TimeoutError:
+                break
+        types = {m["type"] for m in messages}
+        assert "system" in types, f"Expected system in {messages}"
+        system_msg = next(m for m in messages if m["type"] == "system")
+        assert system_msg["users"] == 1
 
 
 @pytest.mark.asyncio
