@@ -1282,9 +1282,11 @@ async def share_download_handler(request: web.Request) -> web.StreamResponse:
         # ?raw=1: serve the raw ciphertext bytes (one-time, consumes the slot)
         if request.query.get("raw") == "1":
             return await _stream_share_file(token, slot, request)
-        # Plain GET: serve the client-side decrypt page (slot not consumed)
+        # Plain GET: serve the client-side decrypt page (slot not consumed).
+        # .format() converts the {{ / }} Python escapes to literal { / } in the
+        # JavaScript so the crypto calls are syntactically valid.
         return web.Response(
-            body=_E2EE_DECRYPT_PAGE,
+            body=_E2EE_DECRYPT_PAGE.format(),
             content_type="text/html",
         )
 

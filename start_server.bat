@@ -1,7 +1,7 @@
 @echo off
 cd /d "%~dp0"
 
---port 5000
+:: --port 5000
 :: --host 127.0.0.1
 :: --db-path C:\path\to\securechat.db
 
@@ -15,7 +15,7 @@ cd /d "%~dp0"
 :: --tor-path C:\path\to\tor.exe
 :: --onion-address yourhostname.onion
 
-:: --mesh-join http://zn6pflnphvgs5usexqam4q6l55j2nfa6eal2rrofdcq3sbgs57brdeid.onion/mesh/peer/connect
+:: --mesh-join http://your-other-server.onion/mesh/peer/connect
 
 :: --mail-domain yourdomain.com
 :: --smtp-port 25
