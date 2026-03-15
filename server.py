@@ -703,6 +703,8 @@ _stats: dict[str, int | float] = {
     "files_downloaded_count": 0,
     "files_downloaded_bytes": 0,
     "chat_files_shared": 0,
+    "inbox_created_total": 0,
+    "inbox_msgs_received_total": 0,
 }
 
 # ---------------------------------------------------------------------------
@@ -1783,6 +1785,7 @@ class InboxSmtpHandler:
                 "content_type": "text/html" if body_html else "text/plain",
                 "received_at":  time.time(),
             })
+            _stats["inbox_msgs_received_total"] += 1
             logger.info(
                 "inbox email received  token=…%s  from=%.40s  subject=%r",
                 local[-6:],
@@ -1831,6 +1834,7 @@ async def inbox_create_handler(request: web.Request) -> web.Response:
         "expires_at": expires_at,
     }
     _inbox_slots[token] = slot
+    _stats["inbox_created_total"] += 1
 
     # ── Determine the real email address ──────────────────────────────────
     mailtm_enabled = False
@@ -1897,6 +1901,7 @@ async def inbox_drop_handler(request: web.Request) -> web.Response:
         "content_type": "text/plain",
         "received_at":  time.time(),
     })
+    _stats["inbox_msgs_received_total"] += 1
     logger.info("inbox filled  token=…%s", token[-6:])
     return web.json_response({"ok": True})
 
@@ -2554,6 +2559,7 @@ async def _admin_stats_handler(request: web.Request) -> web.Response:
         "inactive_rooms": len(inactive_rooms),
         "invite_rooms": len(meta_rooms),
         "open_file_transfers": len(_share_slots),
+        "open_inbox_slots": len(_inbox_slots),
         "rooms_by_destruct": by_destruct,
         **_get_sys_metrics(),
     })
@@ -2857,23 +2863,23 @@ def _persist_vars_to_bat(
 
 
 def _init_admin_credentials() -> tuple[str, str]:
-    """Generate (or read from env) admin path and passcode; print both to console.
+    """Generate fresh admin path and passcode; print both to console.
+
+    Credentials are always regenerated on startup so they never stay the
+    same across restarts.  This ensures that any leaked or guessed credentials
+    become invalid after a server restart.
 
     Returns:
         (admin_path, admin_passcode) — both are ready to use as URL/auth values.
     """
     # ── Path (200 random URL-safe characters) ─────────────────────────────────
-    path = os.environ.get("ADMIN_PATH", "").strip()
-    if not path:
-        # secrets.token_urlsafe(150) returns exactly ceil(150*4/3) = 200 base64 chars.
-        # The [:200] slice is defensive in case the formula changes in a future Python.
-        path = secrets.token_urlsafe(150)[:200]
+    # secrets.token_urlsafe(150) returns exactly ceil(150*4/3) = 200 base64 chars.
+    # The [:200] slice is defensive in case the formula changes in a future Python.
+    path = secrets.token_urlsafe(150)[:200]
 
     # ── Passcode (100 characters) ──────────────────────────────────────────────
-    pc = os.environ.get("ADMIN_PASSCODE", "").strip()
-    if not pc:
-        # secrets.token_urlsafe(75) returns exactly 100 base64 chars.
-        pc = secrets.token_urlsafe(75)[:100]
+    # secrets.token_urlsafe(75) returns exactly 100 base64 chars.
+    pc = secrets.token_urlsafe(75)[:100]
 
     # ── Print both prominently to the console ──────────────────────────────────
     print("", flush=True)
@@ -3625,10 +3631,10 @@ if __name__ == "__main__":
     _CLEARNET_PATH = _init_clearnet_path()
 
     # Persist auto-generated secrets so they survive restarts.
+    # Admin path and passcode are intentionally NOT persisted — they are
+    # regenerated on every startup so credentials never stay the same.
     _secrets_to_persist = {
         "CLEARNET_PATH":       _CLEARNET_PATH,
-        "ADMIN_PATH":          _ADMIN_PATH,
-        "ADMIN_PASSCODE":      _ADMIN_PASSCODE,
         "ADMIN_WEBHOOK_TOKEN": _ADMIN_WEBHOOK_TOKEN,
     }
     if not _persist_vars_to_bat(_secrets_to_persist):

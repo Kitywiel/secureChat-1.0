@@ -1308,6 +1308,21 @@ async def test_admin_stats_with_auth(admin_client) -> None:
 
 
 @pytest.mark.asyncio
+async def test_admin_stats_includes_inbox_fields(admin_client) -> None:
+    """GET /admin/api/stats returns inbox monitoring fields."""
+    await _login(admin_client)
+    resp = await admin_client.get("/admin/api/stats")
+    assert resp.status == 200
+    body = await resp.json()
+    assert "open_inbox_slots" in body, "open_inbox_slots missing from stats"
+    assert "inbox_created_total" in body, "inbox_created_total missing from stats"
+    assert "inbox_msgs_received_total" in body, "inbox_msgs_received_total missing from stats"
+    assert isinstance(body["open_inbox_slots"], int)
+    assert isinstance(body["inbox_created_total"], int)
+    assert isinstance(body["inbox_msgs_received_total"], int)
+
+
+@pytest.mark.asyncio
 async def test_admin_webhook_info_requires_auth(admin_client) -> None:
     """GET /admin/api/webhook-info without session returns 401."""
     resp = await admin_client.get("/admin/api/webhook-info")
@@ -1399,6 +1414,30 @@ async def test_admin_passcode_is_100_chars() -> None:
     """_ADMIN_PASSCODE is exactly 100 characters."""
     pc = _srv_mod._ADMIN_PASSCODE
     assert len(pc) == 100, f"Expected 100 chars, got {len(pc)}"
+
+
+def test_admin_credentials_always_fresh() -> None:
+    """_init_admin_credentials always generates fresh credentials, ignoring env vars."""
+    import os as _os
+    # Even if ADMIN_PATH and ADMIN_PASSCODE are set in the environment,
+    # _init_admin_credentials() must generate new values every call.
+    _os.environ["ADMIN_PATH"] = "should-be-ignored"
+    _os.environ["ADMIN_PASSCODE"] = "should-be-ignored"
+    try:
+        path1, pc1 = _srv_mod._init_admin_credentials()
+        path2, pc2 = _srv_mod._init_admin_credentials()
+        # Credentials must be freshly generated — not taken from env vars
+        assert path1 != "should-be-ignored", "ADMIN_PATH env var should not be used"
+        assert pc1 != "should-be-ignored", "ADMIN_PASSCODE env var should not be used"
+        # Two consecutive calls must produce different credentials
+        assert path1 != path2, "Admin path must differ between restarts"
+        assert pc1 != pc2, "Admin passcode must differ between restarts"
+        # Length constraints still apply
+        assert len(path1) == 200
+        assert len(pc1) == 100
+    finally:
+        _os.environ.pop("ADMIN_PATH", None)
+        _os.environ.pop("ADMIN_PASSCODE", None)
 
 
 @pytest.mark.asyncio
@@ -1606,6 +1645,29 @@ async def test_log_recent_ring_buffer_populated() -> None:
 
 
 # ─── One-time inbox tests ─────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_inbox_stats_increment(ws_client) -> None:
+    """inbox_created_total and inbox_msgs_received_total increment correctly."""
+    import server as _s
+
+    before_created = _s._stats["inbox_created_total"]
+    before_msgs    = _s._stats["inbox_msgs_received_total"]
+
+    # Create an inbox — should bump inbox_created_total
+    resp = await ws_client.post("/inbox/create", json={})
+    assert resp.status == 200
+    body = await resp.json()
+    drop_url = body["drop_url"]
+
+    assert _s._stats["inbox_created_total"] == before_created + 1
+
+    # Drop a message — should bump inbox_msgs_received_total
+    resp2 = await ws_client.post(drop_url, json={"message": "hello stats"})
+    assert resp2.status == 200
+
+    assert _s._stats["inbox_msgs_received_total"] == before_msgs + 1
+
 
 @pytest.mark.asyncio
 async def test_inbox_create_returns_urls(ws_client) -> None:

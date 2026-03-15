@@ -942,10 +942,10 @@ def main() -> None:
     # On Windows the .bat launcher is updated with SET commands so the values
     # are available before Python starts.  On other platforms (or when the bat
     # file is absent) the secrets fall back to the .env file.
+    # Admin path and passcode are intentionally NOT persisted — they are
+    # regenerated on every startup so credentials never stay the same.
     _secrets_to_persist = {
         "CLEARNET_PATH":       srv._CLEARNET_PATH,
-        "ADMIN_PATH":          srv._ADMIN_PATH,
-        "ADMIN_PASSCODE":      srv._ADMIN_PASSCODE,
         "ADMIN_WEBHOOK_TOKEN": srv._ADMIN_WEBHOOK_TOKEN,
         "MESH_TOKEN":          srv._MESH_TOKEN,
     }
