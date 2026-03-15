@@ -2328,6 +2328,30 @@ async def test_mesh_connect_registers_peer(ws_client) -> None:
 
 
 @pytest.mark.asyncio
+async def test_mesh_public_connect_alias(ws_client) -> None:
+    """POST /mesh/peer/connect is a public alias for the hidden connect endpoint."""
+    import server as _s
+    _s._MESH_TOKEN = "test-mesh-public-alias"
+    _s._mesh_peers.clear()
+    resp = await ws_client.post(
+        "/mesh/peer/connect",
+        json={
+            "token":          "test-mesh-public-alias",
+            "peer_url":       "http://peer2.onion",
+            "peer_token":     "pt2",
+            "peer_mesh_path": "b" * 50,
+        },
+    )
+    assert resp.status == 200
+    data = await resp.json()
+    assert data["ok"] is True
+    assert "peer_id" in data
+    assert data["mesh_path"] == _s._MESH_PATH
+    # Clean up
+    _s._mesh_peers.clear()
+
+
+@pytest.mark.asyncio
 async def test_mesh_forward_rejects_unknown_token(ws_client) -> None:
     """POST /<mesh_path>/mesh/forward returns 403 for unregistered peer token."""
     import server as _s

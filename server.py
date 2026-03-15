@@ -3758,6 +3758,10 @@ def build_app(db_path: Path | None = None) -> web.Application:
     app.router.add_post(f"/{mp}/mesh/forward", mesh_peer_forward_handler)
     app.router.add_post(f"/{mp}/mesh/link",    mesh_peer_link_handler)
     app.router.add_get("/mesh/invite",          mesh_invite_handler)
+    # Public compatibility alias — documented URL used by older configs and the
+    # start_server.bat template.  The MESH_TOKEN check inside the handler
+    # provides authentication so exposing this path is safe.
+    app.router.add_post("/mesh/peer/connect",   mesh_peer_connect_handler)
 
     # Mount admin panel under the secret 200-char path on the same server
     _register_admin_routes(app)
