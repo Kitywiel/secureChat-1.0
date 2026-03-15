@@ -538,6 +538,10 @@ def _join_mesh_peer(
     reached.  Up to 3 attempts are made with a short delay between each so
     that a freshly-started Tor circuit has time to become usable.
 
+    If the Tor proxy itself is unreachable (ProxyConnectionError / connection
+    refused on 127.0.0.1:9050), retrying is pointless — the function aborts
+    immediately and prints a clear message asking the user to start Tor.
+
     For plain (non-onion) URLs the legacy urllib path is used so that there is
     no hard dependency on aiohttp / aiohttp-socks in non-Tor deployments.
     """
@@ -607,6 +611,21 @@ def _join_mesh_peer(
 
         except Exception as exc:  # noqa: BLE001
             last_exc = exc
+            # If the Tor proxy itself is unreachable (not just a circuit error),
+            # retrying will not help — abort immediately with a clear hint.
+            if is_onion:
+                _proxy_unreachable = False
+                try:
+                    from aiohttp_socks import ProxyConnectionError as _PCE  # noqa: PLC0415
+                    _proxy_unreachable = isinstance(exc, _PCE)
+                except ImportError:
+                    _proxy_unreachable = "connect to proxy" in str(exc).lower()
+                if _proxy_unreachable:
+                    print(
+                        f"  ⚠️  Tor proxy not reachable at 127.0.0.1:9050 — "
+                        "start Tor before joining .onion peers."
+                    )
+                    return
             if attempt < max_attempts:
                 print(f"  ↻  Attempt {attempt}/{max_attempts} failed: {exc}  — retrying in {attempt_delay:.0f}s …")
                 _time.sleep(attempt_delay)

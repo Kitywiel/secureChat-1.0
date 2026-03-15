@@ -3014,9 +3014,46 @@ def test_join_mesh_peer_retries_on_failure(capsys) -> None:
     assert "failed after 3 attempts" in captured.out
 
 
-# ---------------------------------------------------------------------------
-# Mesh forward security tests
-# ---------------------------------------------------------------------------
+def test_join_mesh_peer_onion_aborts_on_proxy_unreachable(capsys) -> None:
+    """_join_mesh_peer aborts immediately (no retries) when Tor proxy is unreachable.
+
+    When connecting to a .onion URL and the Tor SOCKS5 proxy at 127.0.0.1:9050 is
+    not running, aiohttp_socks raises ProxyConnectionError.  Retrying is pointless
+    in this case, so the function should exit on the first attempt with a helpful
+    message rather than wasting time on two more failed attempts.
+    """
+    import sys, os
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    import run as _run
+    from unittest.mock import patch
+
+    call_count = 0
+
+    from aiohttp_socks import ProxyConnectionError
+
+    def _proxy_unreachable(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        raise ProxyConnectionError("Couldn't connect to proxy 127.0.0.1:9050")
+
+    with patch("asyncio.run", side_effect=_proxy_unreachable), \
+         patch.object(_run, "_lan_ip", return_value="10.0.0.1"), \
+         patch("time.sleep"):
+        _run._join_mesh_peer(
+            connect_url="http://sometest1234.onion/mesh/peer/connect",
+            remote_token="REMOTE_TOKEN",
+            local_token="LOCAL_TOKEN",
+            onion=None,
+            server_port=5000,
+        )
+
+    assert call_count == 1, "Should abort after first attempt when proxy is unreachable"
+    captured = capsys.readouterr()
+    assert "127.0.0.1:9050" in captured.out
+    assert "start Tor" in captured.out.lower() or "tor" in captured.out.lower()
+
+
+
 
 @pytest.mark.asyncio
 async def test_mesh_forward_rejects_non_json_content_type(ws_client) -> None:
