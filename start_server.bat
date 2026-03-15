@@ -1,7 +1,7 @@
 @echo off
 cd /d "%~dp0"
 
-:: --port 5000
+--port 5000
 :: --host 127.0.0.1
 :: --db-path C:\path\to\securechat.db
 
