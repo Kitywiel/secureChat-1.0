@@ -122,16 +122,28 @@ def _auto_update() -> None:
 
     print("  AUTO_UPDATE enabled — checking for updates via git …")
 
-    # Confirm we are inside a git repository
-    git_dir = _HERE / ".git"
-    if not git_dir.is_dir():
-        print("  WARNING: AUTO_UPDATE=1 but this directory is not a git repository — skipping.")
-        return
-
-    # Confirm git binary is available
+    # Confirm git binary is available (required for both the repo check and pull)
     git_bin = shutil.which("git")
     if not git_bin:
         print("  WARNING: AUTO_UPDATE=1 but 'git' was not found on PATH — skipping.")
+        return
+
+    # Confirm we are inside a git repository.
+    # Using `git rev-parse` handles normal clones (.git dir), worktrees (.git file),
+    # and subdirectory layouts — a plain `.git` directory check misses these.
+    try:
+        rev = subprocess.run(
+            [git_bin, "rev-parse", "--is-inside-work-tree"],
+            capture_output=True,
+            text=True,
+            cwd=str(_HERE),
+            timeout=5,
+        )
+        if rev.returncode != 0:
+            print("  WARNING: AUTO_UPDATE=1 but this directory is not a git repository — skipping.")
+            return
+    except Exception:  # noqa: BLE001
+        print("  WARNING: AUTO_UPDATE=1 but this directory is not a git repository — skipping.")
         return
 
     try:

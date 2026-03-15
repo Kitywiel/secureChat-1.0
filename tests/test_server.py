@@ -3525,16 +3525,33 @@ def test_auto_update_skips_when_disabled(monkeypatch) -> None:
 
 
 def test_auto_update_skips_when_no_git_dir(tmp_path, monkeypatch) -> None:
-    """_auto_update() warns and skips when the directory is not a git repo."""
+    """_auto_update() warns and skips when the directory is not a git repo.
+
+    The check is performed via ``git rev-parse --is-inside-work-tree`` so that
+    worktrees (.git file) and other non-standard layouts are handled correctly.
+    """
     import run as _run
     monkeypatch.setenv("AUTO_UPDATE", "1")
     original_here = _run._HERE
     try:
-        _run._HERE = tmp_path  # tmp_path has no .git folder
-        called = []
-        monkeypatch.setattr(_run.subprocess, "run", lambda *a, **kw: called.append(True))
+        _run._HERE = tmp_path  # tmp_path is not a git repository
+        monkeypatch.setattr(_run.shutil, "which", lambda name: "/usr/bin/git" if name == "git" else None)
+
+        class _NotARepo:
+            returncode = 1
+            stdout = ""
+            stderr = "fatal: not a git repository"
+
+        pull_called = []
+
+        def fake_run(cmd, **kwargs):
+            if "pull" in cmd:
+                pull_called.append(cmd)
+            return _NotARepo()
+
+        monkeypatch.setattr(_run.subprocess, "run", fake_run)
         _run._auto_update()
-        assert called == []
+        assert pull_called == []
     finally:
         _run._HERE = original_here
 
@@ -3559,12 +3576,16 @@ def test_auto_update_skips_when_git_not_on_path(tmp_path, monkeypatch) -> None:
 def test_auto_update_runs_git_pull(tmp_path, monkeypatch) -> None:
     """_auto_update() calls git pull when AUTO_UPDATE=1 and git is present."""
     import run as _run
-    (tmp_path / ".git").mkdir()
     monkeypatch.setenv("AUTO_UPDATE", "1")
     original_here = _run._HERE
     try:
         _run._HERE = tmp_path
         monkeypatch.setattr(_run.shutil, "which", lambda name: "/usr/bin/git" if name == "git" else None)
+
+        class FakeRevParse:
+            returncode = 0
+            stdout = "true"
+            stderr = ""
 
         class FakeResult:
             returncode = 0
@@ -3575,6 +3596,8 @@ def test_auto_update_runs_git_pull(tmp_path, monkeypatch) -> None:
 
         def fake_run(cmd, **kwargs):
             calls.append(cmd)
+            if "rev-parse" in cmd:
+                return FakeRevParse()
             return FakeResult()
 
         monkeypatch.setattr(_run.subprocess, "run", fake_run)
