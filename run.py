@@ -57,6 +57,10 @@ from pathlib import Path
 # Resolve paths
 # ---------------------------------------------------------------------------
 _HERE = Path(__file__).resolve().parent
+
+# Canonical upstream repository — used by AUTO_UPDATE to (re)point the git
+# remote when the repo was downloaded as a zip or cloned from a local path.
+_GITHUB_URL = "https://github.com/Kitywiel/secureChat-1.0"
 _REQUIREMENTS = _HERE / "requirements.txt"
 _DOTENV       = _HERE / ".env"
 
@@ -108,9 +112,14 @@ def _auto_update() -> None:
     or in the shell environment.  Disabled by default so that users who run
     from a custom checkout or without git are never surprised.
 
-    The update is a best-effort operation:
-    * If ``git`` is not installed or the working directory is not a git repo,
-      a warning is printed and the server starts normally.
+    **Zero-setup behaviour** — no manual git clone needed:
+
+    * If the directory is not yet a git repository, one is initialised
+      automatically and the latest code is fetched from ``_GITHUB_URL`` so
+      that updates work from the very first run.
+    * If the ``origin`` remote points to a local path (e.g. the repo was
+      cloned from a local copy instead of GitHub), the URL is corrected
+      automatically before pulling.
     * If ``git pull`` fails for any reason (merge conflicts, network error, …)
       a warning is printed and the server starts normally.
     * If new files were pulled, the user is notified and asked to restart
@@ -122,15 +131,15 @@ def _auto_update() -> None:
 
     print("  AUTO_UPDATE enabled — checking for updates via git …")
 
-    # Confirm git binary is available (required for both the repo check and pull)
+    # Confirm git binary is available.
     git_bin = shutil.which("git")
     if not git_bin:
         print("  WARNING: AUTO_UPDATE=1 but 'git' was not found on PATH — skipping.")
         return
 
-    # Confirm we are inside a git repository.
-    # Using `git rev-parse` handles normal clones (.git dir), worktrees (.git file),
-    # and subdirectory layouts — a plain `.git` directory check misses these.
+    # ── 1. Ensure we are inside a git repository ────────────────────────────
+    # Using `git rev-parse` handles normal clones (.git dir), worktrees, and
+    # subdirectory layouts — a plain `.git` directory check misses these.
     try:
         rev = subprocess.run(
             [git_bin, "rev-parse", "--is-inside-work-tree"],
@@ -139,16 +148,98 @@ def _auto_update() -> None:
             cwd=str(_HERE),
             timeout=5,
         )
-        if rev.returncode != 0:
-            print("  WARNING: AUTO_UPDATE=1 but this directory is not a git repository — skipping.")
-            return
+        is_repo = rev.returncode == 0
     except Exception:  # noqa: BLE001
-        print("  WARNING: AUTO_UPDATE=1 but this directory is not a git repository — skipping.")
-        return
+        is_repo = False
 
+    if not is_repo:
+        # Not a git repo — initialise one pointing to GitHub so that this and
+        # all future runs can auto-update without any manual setup.
+        print(f"  Not a git repository — installing from {_GITHUB_URL} …")
+        try:
+            subprocess.run(
+                [git_bin, "init"],
+                capture_output=True, cwd=str(_HERE), timeout=10,
+            )
+            subprocess.run(
+                [git_bin, "remote", "add", "origin", _GITHUB_URL],
+                capture_output=True, cwd=str(_HERE), timeout=10,
+            )
+            fetch = subprocess.run(
+                [git_bin, "fetch", "origin", "--depth=1"],
+                capture_output=True, text=True, cwd=str(_HERE), timeout=60,
+            )
+            if fetch.returncode == 0:
+                # Check out the default branch (try main then master).
+                checked_out = False
+                for branch in ("main", "master"):
+                    co = subprocess.run(
+                        [git_bin, "checkout", "-f", branch],
+                        capture_output=True, cwd=str(_HERE), timeout=10,
+                    )
+                    if co.returncode == 0:
+                        checked_out = True
+                        break
+                if not checked_out:
+                    subprocess.run(
+                        [git_bin, "reset", "--hard", "FETCH_HEAD"],
+                        capture_output=True, cwd=str(_HERE), timeout=10,
+                    )
+                print(
+                    "  ✅  Repository installed from GitHub.\n"
+                    "       Restart run.py to start with the freshly downloaded code."
+                )
+            else:
+                print(
+                    "  ⚠️  Git initialised but fetch failed — check your internet "
+                    "connection.\n"
+                    "       AUTO_UPDATE will retry on next restart."
+                )
+        except Exception as exc:  # noqa: BLE001
+            print(f"  WARNING: Could not set up git repository ({exc}).")
+        return  # Don't also run pull on the first-install run.
+
+    # ── 2. Ensure origin points to a network URL, not a local path ──────────
+    _network_schemes = ("http://", "https://", "git@", "git://", "ssh://")
+    try:
+        remote_res = subprocess.run(
+            [git_bin, "remote", "get-url", "origin"],
+            capture_output=True, text=True, cwd=str(_HERE), timeout=5,
+        )
+        remote_url = remote_res.stdout.strip() if remote_res.returncode == 0 else ""
+    except Exception:  # noqa: BLE001
+        remote_url = ""
+
+    if not remote_url:
+        # No origin remote — add the canonical GitHub URL.
+        print(f"  No 'origin' remote found — adding {_GITHUB_URL} …")
+        try:
+            subprocess.run(
+                [git_bin, "remote", "add", "origin", _GITHUB_URL],
+                capture_output=True, cwd=str(_HERE), timeout=10,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+    elif not any(remote_url.startswith(s) for s in _network_schemes):
+        # Origin is a local path — fix it to the canonical GitHub URL.
+        print(
+            f"  Remote 'origin' points to a local path ({remote_url!r}) — "
+            f"updating to {_GITHUB_URL} …"
+        )
+        try:
+            subprocess.run(
+                [git_bin, "remote", "set-url", "origin", _GITHUB_URL],
+                capture_output=True, cwd=str(_HERE), timeout=10,
+            )
+            print(f"  ✅  Remote updated to {_GITHUB_URL}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"  WARNING: Could not update remote URL ({exc}) — skipping auto-update.")
+            return
+
+    # ── 3. Pull latest code from main ───────────────────────────────────────
     try:
         result = subprocess.run(
-            [git_bin, "pull", "--ff-only"],
+            [git_bin, "pull", "--ff-only", "origin", "main"],
             capture_output=True,
             text=True,
             cwd=str(_HERE),
@@ -173,7 +264,7 @@ def _auto_update() -> None:
         print(f"  ✅  Repository updated:\n    {output}")
         print(
             "\n  ⚠️  New files were pulled.  Restart run.py to apply the updates.\n"
-            "       The server will now start with the pre-update code.\n"
+            "       The server will now start with the pre-update code for safety.\n"
         )
     else:
         print("  Already up to date.")

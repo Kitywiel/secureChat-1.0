@@ -3591,34 +3591,46 @@ def test_auto_update_skips_when_disabled(monkeypatch) -> None:
     assert called == []
 
 
-def test_auto_update_skips_when_no_git_dir(tmp_path, monkeypatch) -> None:
-    """_auto_update() warns and skips when the directory is not a git repo.
-
-    The check is performed via ``git rev-parse --is-inside-work-tree`` so that
-    worktrees (.git file) and other non-standard layouts are handled correctly.
+def test_auto_update_initialises_repo_when_no_git_dir(tmp_path, monkeypatch) -> None:
+    """When the directory is not a git repo, _auto_update() runs git init,
+    adds the GitHub remote, fetches, and checks out — but does NOT run pull.
     """
     import run as _run
     monkeypatch.setenv("AUTO_UPDATE", "1")
     original_here = _run._HERE
     try:
-        _run._HERE = tmp_path  # tmp_path is not a git repository
+        _run._HERE = tmp_path
         monkeypatch.setattr(_run.shutil, "which", lambda name: "/usr/bin/git" if name == "git" else None)
 
-        class _NotARepo:
+        class _Fail:
             returncode = 1
             stdout = ""
             stderr = "fatal: not a git repository"
 
-        pull_called = []
+        class _Ok:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        cmds: list[list[str]] = []
 
         def fake_run(cmd, **kwargs):
-            if "pull" in cmd:
-                pull_called.append(cmd)
-            return _NotARepo()
+            cmds.append(list(cmd))
+            if "rev-parse" in cmd:
+                return _Fail()
+            return _Ok()
 
         monkeypatch.setattr(_run.subprocess, "run", fake_run)
         _run._auto_update()
-        assert pull_called == []
+
+        joined = [" ".join(c) for c in cmds]
+        # pull must NOT be called on first-install run
+        assert not any("pull" in c for c in joined)
+        # init and remote add must be called to set up the repo
+        assert any("init" in c for c in joined)
+        assert any("remote" in c and "add" in c for c in joined)
+        # fetch must be called to download the code
+        assert any("fetch" in c for c in joined)
     finally:
         _run._HERE = original_here
 
@@ -3640,8 +3652,10 @@ def test_auto_update_skips_when_git_not_on_path(tmp_path, monkeypatch) -> None:
         _run._HERE = original_here
 
 
-def test_auto_update_runs_git_pull(tmp_path, monkeypatch) -> None:
-    """_auto_update() calls git pull when AUTO_UPDATE=1 and git is present."""
+def test_auto_update_runs_git_pull_on_main(tmp_path, monkeypatch) -> None:
+    """_auto_update() calls 'git pull --ff-only origin main' when the repo
+    is already set up and the remote points to GitHub.
+    """
     import run as _run
     monkeypatch.setenv("AUTO_UPDATE", "1")
     original_here = _run._HERE
@@ -3654,22 +3668,82 @@ def test_auto_update_runs_git_pull(tmp_path, monkeypatch) -> None:
             stdout = "true"
             stderr = ""
 
+        class FakeRemote:
+            returncode = 0
+            stdout = "https://github.com/Kitywiel/secureChat-1.0"
+            stderr = ""
+
         class FakeResult:
             returncode = 0
             stdout = "Already up to date."
             stderr = ""
 
-        calls = []
+        calls: list[list[str]] = []
 
         def fake_run(cmd, **kwargs):
-            calls.append(cmd)
+            calls.append(list(cmd))
             if "rev-parse" in cmd:
                 return FakeRevParse()
+            if "remote" in cmd and "get-url" in cmd:
+                return FakeRemote()
             return FakeResult()
 
         monkeypatch.setattr(_run.subprocess, "run", fake_run)
         _run._auto_update()
-        assert any("pull" in " ".join(c) for c in calls)
+
+        pull_cmds = [c for c in calls if "pull" in c]
+        assert pull_cmds, "git pull should have been called"
+        # Must explicitly pull from origin main
+        assert "origin" in pull_cmds[0]
+        assert "main" in pull_cmds[0]
+    finally:
+        _run._HERE = original_here
+
+
+def test_auto_update_fixes_local_remote_then_pulls(tmp_path, monkeypatch) -> None:
+    """When origin is a local path, _auto_update() fixes it to the GitHub URL
+    and then proceeds with git pull origin main.
+    """
+    import run as _run
+    monkeypatch.setenv("AUTO_UPDATE", "1")
+    original_here = _run._HERE
+    try:
+        _run._HERE = tmp_path
+        monkeypatch.setattr(_run.shutil, "which", lambda name: "/usr/bin/git" if name == "git" else None)
+
+        class FakeRevParse:
+            returncode = 0
+            stdout = "true"
+            stderr = ""
+
+        class FakeLocalRemote:
+            returncode = 0
+            stdout = "/home/user/local-copy"   # local path, not a URL
+            stderr = ""
+
+        class FakeResult:
+            returncode = 0
+            stdout = "Already up to date."
+            stderr = ""
+
+        calls: list[list[str]] = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(list(cmd))
+            if "rev-parse" in cmd:
+                return FakeRevParse()
+            if "remote" in cmd and "get-url" in cmd:
+                return FakeLocalRemote()
+            return FakeResult()
+
+        monkeypatch.setattr(_run.subprocess, "run", fake_run)
+        _run._auto_update()
+
+        joined = [" ".join(c) for c in calls]
+        # remote set-url must have been called to fix the local path
+        assert any("remote" in c and "set-url" in c for c in joined)
+        # pull must still be called after the fix
+        assert any("pull" in c and "origin" in c and "main" in c for c in joined)
     finally:
         _run._HERE = original_here
 
