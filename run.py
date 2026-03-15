@@ -607,29 +607,95 @@ def _join_mesh_peer(
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="secureChat zero-config launcher")
-    parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", "5000")))
-    parser.add_argument(
-        "--no-tor",
-        action="store_true",
-        default=(os.environ.get("NO_TOR", "").strip() in ("1", "true", "yes")),
-        help="Skip Tor even if installed",
+    parser = argparse.ArgumentParser(
+        description="secureChat zero-config launcher",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Full option descriptions: info-files/start-server-config.md",
     )
-    parser.add_argument(
-        "--mesh-join",
-        metavar="URL",
-        default=os.environ.get("MESH_JOIN", ""),
-        help="Connect to a remote peer's /mesh/peer/connect URL",
-    )
-    parser.add_argument(
-        "--mesh-token",
-        metavar="TOKEN",
-        default=os.environ.get("MESH_TOKEN", ""),
-        help="MESH_TOKEN of the remote server (required with --mesh-join)",
-    )
+    # Server
+    parser.add_argument("--port", type=int, default=None)
+    parser.add_argument("--host", default=None)
+    parser.add_argument("--db-path", metavar="PATH", default=None)
+    # Custom URL paths / secrets
+    parser.add_argument("--clearnet-path", metavar="PATH", default=None)
+    parser.add_argument("--admin-path", metavar="PATH", default=None)
+    parser.add_argument("--admin-passcode", metavar="SECRET", default=None)
+    parser.add_argument("--admin-webhook-token", metavar="TOKEN", default=None)
+    # Tor
+    parser.add_argument("--no-tor", action="store_true", default=None)
+    parser.add_argument("--tor-path", metavar="PATH", default=None)
+    parser.add_argument("--onion-address", metavar="HOSTNAME", default=None)
+    # Mesh
+    parser.add_argument("--mesh-join", metavar="URL", default=None)
+    parser.add_argument("--mesh-token", metavar="TOKEN", default=None)
+    # Mail / SMTP
+    parser.add_argument("--mail-domain", metavar="DOMAIN", default=None)
+    parser.add_argument("--smtp-port", type=int, default=None)
+    parser.add_argument("--relay-secret", metavar="SECRET", default=None)
+    # Misc
+    parser.add_argument("--auto-update", action="store_true", default=None)
+    parser.add_argument("--slow-mode", action="store_true", default=None)
+    parser.add_argument("--slow-mode-delay", type=float, metavar="SECONDS", default=None)
+    # DDoS protection
+    parser.add_argument("--ddos-enabled", type=int, metavar="0|1", default=None)
+    parser.add_argument("--ddos-req-limit", type=int, metavar="N", default=None)
+    parser.add_argument("--ddos-window-sec", type=int, metavar="N", default=None)
+    parser.add_argument("--ddos-ban-sec", type=int, metavar="N", default=None)
+    parser.add_argument("--ddos-auto-lockdown-threshold", type=int, metavar="N", default=None)
+    # Spam protection
+    parser.add_argument("--spam-enabled", type=int, metavar="0|1", default=None)
+    parser.add_argument("--spam-msg-limit", type=int, metavar="N", default=None)
+    parser.add_argument("--spam-msg-window", type=int, metavar="N", default=None)
+    parser.add_argument("--spam-mail-limit", type=int, metavar="N", default=None)
+    parser.add_argument("--spam-mail-window", type=int, metavar="N", default=None)
+    # Chat history
+    parser.add_argument("--history-limit", type=int, metavar="N", default=None)
+    # mail.tm integration
+    parser.add_argument("--mailtm-enabled", type=int, metavar="0|1", default=None)
     args = parser.parse_args()
 
-    server_port: int = args.port
+    # Apply CLI flags to env vars (only when explicitly provided, so .env and
+    # parent-process env vars are not overridden by argparse defaults).
+    _flag_env: list[tuple[object, str]] = [
+        (args.port,                          "PORT"),
+        (args.host,                          "HOST"),
+        (args.db_path,                       "DB_PATH"),
+        (args.clearnet_path,                 "CLEARNET_PATH"),
+        (args.admin_path,                    "ADMIN_PATH"),
+        (args.admin_passcode,                "ADMIN_PASSCODE"),
+        (args.admin_webhook_token,           "ADMIN_WEBHOOK_TOKEN"),
+        (args.tor_path,                      "TOR_PATH"),
+        (args.onion_address,                 "ONION_ADDRESS"),
+        (args.mesh_join,                     "MESH_JOIN"),
+        (args.mesh_token,                    "MESH_TOKEN"),
+        (args.mail_domain,                   "MAIL_DOMAIN"),
+        (args.smtp_port,                     "SMTP_PORT"),
+        (args.relay_secret,                  "RELAY_SECRET"),
+        (args.slow_mode_delay,               "SLOW_MODE_DELAY"),
+        (args.ddos_enabled,                  "DDOS_ENABLED"),
+        (args.ddos_req_limit,                "DDOS_REQ_LIMIT"),
+        (args.ddos_window_sec,               "DDOS_WINDOW_SEC"),
+        (args.ddos_ban_sec,                  "DDOS_BAN_SEC"),
+        (args.ddos_auto_lockdown_threshold,  "DDOS_AUTO_LOCKDOWN_THRESHOLD"),
+        (args.spam_enabled,                  "SPAM_ENABLED"),
+        (args.spam_msg_limit,                "SPAM_MSG_LIMIT"),
+        (args.spam_msg_window,               "SPAM_MSG_WINDOW"),
+        (args.spam_mail_limit,               "SPAM_MAIL_LIMIT"),
+        (args.spam_mail_window,              "SPAM_MAIL_WINDOW"),
+        (args.history_limit,                 "HISTORY_LIMIT"),
+        (args.mailtm_enabled,                "MAILTM_ENABLED"),
+    ]
+    for val, key in _flag_env:
+        if val is not None:
+            os.environ[key] = str(val)
+    if args.no_tor:
+        os.environ["NO_TOR"] = "1"
+    if args.auto_update:
+        os.environ["AUTO_UPDATE"] = "1"
+    if args.slow_mode:
+        os.environ["SLOW_MODE"] = "1"
+
+    server_port: int = args.port if args.port is not None else int(os.environ.get("PORT", "5000"))
 
     print()
     print("=" * 66)
@@ -743,10 +809,11 @@ def main() -> None:
     host = os.environ.get("HOST", "127.0.0.1")
 
     # ── 8. Join a remote mesh peer (optional) ─────────────────────────
-    if args.mesh_join:
+    mesh_join_url = os.environ.get("MESH_JOIN", "")
+    if mesh_join_url:
         _join_mesh_peer(
-            connect_url=args.mesh_join,
-            remote_token=args.mesh_token,
+            connect_url=mesh_join_url,
+            remote_token=os.environ.get("MESH_TOKEN", ""),
             local_token=srv._MESH_TOKEN,
             onion=onion,
             server_port=server_port,
