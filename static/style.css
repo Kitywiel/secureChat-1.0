@@ -587,6 +587,14 @@ select:focus {
   overflow-y: auto;
 }
 
+/* ── Inbox screen ──────────────────────────────────────────────────────────── */
+#inbox {
+  align-items: center;
+  justify-content: center;
+  padding: 1.5rem 1rem;
+  overflow-y: auto;
+}
+
 /* ── gen-row (generated value + refresh button) ────────────────────────────── */
 .gen-row {
   display: flex;

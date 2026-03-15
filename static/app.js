@@ -370,8 +370,10 @@ async function _sendLargeFileViaShare(file) {
     }
 
     const data = await result.json();
-    // Embed key + IV + original filename in the URL fragment (never sent to server)
-    const fragment  = `key=${keyB64}&iv=${ivB64}&name=${encodeURIComponent(file.name)}`;
+    // Embed key + IV + original filename in the URL fragment (never sent to server).
+    // encodeURIComponent is required because base64 can contain '+' which
+    // URLSearchParams (used in the decrypt page) decodes as a space.
+    const fragment  = `key=${encodeURIComponent(keyB64)}&iv=${encodeURIComponent(ivB64)}&name=${encodeURIComponent(file.name)}`;
     const downloadUrl = `${location.origin}${data.download_url}#${fragment}`;
     const sizeLabel   = _fmtFileSize(file.size);
 
@@ -1242,8 +1244,10 @@ document.getElementById('share-form').addEventListener('submit', async (e) => {
       }
 
       const data = await resp.json();
-      // Append key+IV+filename to the download URL fragment (never sent to server)
-      const fragment = `key=${keyB64}&iv=${ivB64}&name=${encodeURIComponent(file.name)}`;
+      // Append key+IV+filename to the download URL fragment (never sent to server).
+      // encodeURIComponent is required because base64 can contain '+' which
+      // URLSearchParams (used in the decrypt page) decodes as a space.
+      const fragment = `key=${encodeURIComponent(keyB64)}&iv=${encodeURIComponent(ivB64)}&name=${encodeURIComponent(file.name)}`;
       data.download_url = `${data.download_url}#${fragment}`;
       _appendShareResult(data, '');
       successCount++;
