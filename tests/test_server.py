@@ -1712,7 +1712,7 @@ async def test_inbox_stats_increment(ws_client) -> None:
 
 @pytest.mark.asyncio
 async def test_inbox_create_returns_urls(ws_client) -> None:
-    """POST /inbox/create returns address, drop_url, read_url, and expires_at."""
+    """POST /inbox/create returns address, drop_url, read_url, and expires_at with separate tokens."""
     resp = await ws_client.post("/inbox/create", json={})
     assert resp.status == 200
     body = await resp.json()
@@ -1725,6 +1725,10 @@ async def test_inbox_create_returns_urls(ws_client) -> None:
     assert body["read_url"].endswith("/read")
     # address should be in the form local@host
     assert "@" in body["address"]
+    # The drop and read URLs must use different tokens so senders cannot access the inbox
+    drop_token = body["drop_url"].split("/")[2]
+    read_token = body["read_url"].split("/")[2]
+    assert drop_token != read_token
 
 
 @pytest.mark.asyncio
@@ -1733,26 +1737,26 @@ async def test_inbox_create_ttl_minutes(ws_client) -> None:
     import server as _s
     import time
 
-    # Custom TTL = 15 minutes
+    # Custom TTL = 15 minutes — look up by read_token (keyed in _inbox_slots)
     resp = await ws_client.post("/inbox/create", json={"ttl_minutes": 15})
     body = await resp.json()
-    token = body["drop_url"].split("/")[2]
+    read_token = body["read_url"].split("/")[2]
     expected = time.time() + 15 * 60
-    assert abs(_s._inbox_slots[token]["expires_at"] - expected) < 5
+    assert abs(_s._inbox_slots[read_token]["expires_at"] - expected) < 5
 
     # TTL above maximum should be clamped to 1440 min (24 h)
     resp2 = await ws_client.post("/inbox/create", json={"ttl_minutes": 99999})
     body2 = await resp2.json()
-    token2 = body2["drop_url"].split("/")[2]
+    read_token2 = body2["read_url"].split("/")[2]
     max_expected = time.time() + 1440 * 60
-    assert _s._inbox_slots[token2]["expires_at"] <= max_expected + 5
+    assert _s._inbox_slots[read_token2]["expires_at"] <= max_expected + 5
 
     # TTL below minimum should be clamped to 1 min
     resp3 = await ws_client.post("/inbox/create", json={"ttl_minutes": 0})
     body3 = await resp3.json()
-    token3 = body3["drop_url"].split("/")[2]
+    read_token3 = body3["read_url"].split("/")[2]
     min_expected = time.time() + 1 * 60
-    assert abs(_s._inbox_slots[token3]["expires_at"] - min_expected) < 5
+    assert abs(_s._inbox_slots[read_token3]["expires_at"] - min_expected) < 5
 
 
 @pytest.mark.asyncio
@@ -1802,18 +1806,18 @@ async def test_inbox_drop_page_served(ws_client) -> None:
 async def test_inbox_accepts_multiple_messages(ws_client) -> None:
     """Multiple POSTs to /drop on the same inbox are all accepted (no 409)."""
     resp = await ws_client.post("/inbox/create", json={})
-    drop_url = (await resp.json())["drop_url"]
+    body = await resp.json()
+    drop_url = body["drop_url"]
 
     first  = await ws_client.post(drop_url, json={"message": "first"})
     second = await ws_client.post(drop_url, json={"message": "second"})
     assert first.status == 200
     assert second.status == 200
 
-    # Both messages should be stored
-    read_url = (await (await ws_client.post("/inbox/create", json={})).json())["drop_url"]
-    token = drop_url.split("/")[2]
+    # Both messages should be stored — look up by read_token
     import server as _s
-    slot = _s._inbox_slots.get(token)
+    read_token = body["read_url"].split("/")[2]
+    slot = _s._inbox_slots.get(read_token)
     assert slot is not None
     assert len(slot["messages"]) == 2
 
@@ -1852,10 +1856,12 @@ async def test_inbox_expired_drop_returns_410(ws_client) -> None:
     """POSTing to a manually expired inbox returns 410."""
     import server as _s
     resp = await ws_client.post("/inbox/create", json={"ttl_minutes": 10})
-    token = (await resp.json())["drop_url"].split("/")[2]
-    # Force expiry
-    _s._inbox_slots[token]["expires_at"] = 0.0
-    gone = await ws_client.post(f"/inbox/{token}/drop", json={"message": "hi"})
+    data = await resp.json()
+    drop_token = data["drop_url"].split("/")[2]
+    read_token = _s._inbox_drop_tokens[drop_token]
+    # Force expiry via the read_token key in _inbox_slots
+    _s._inbox_slots[read_token]["expires_at"] = 0.0
+    gone = await ws_client.post(f"/inbox/{drop_token}/drop", json={"message": "hi"})
     assert gone.status == 410
 
 
@@ -1876,7 +1882,8 @@ async def test_smtp_handler_fills_slot_plaintext(ws_client) -> None:
 
     resp = await ws_client.post("/inbox/create", json={"ttl_minutes": 10})
     data = await resp.json()
-    token = data["drop_url"].split("/")[2]
+    # SMTP addresses use the read_token so emails are routed to _inbox_slots directly
+    read_token = data["read_url"].split("/")[2]
 
     raw_email = (
         "From: alice@example.com\r\n"
@@ -1885,14 +1892,14 @@ async def test_smtp_handler_fills_slot_plaintext(ws_client) -> None:
         "Content-Type: text/plain; charset=utf-8\r\n"
         "\r\n"
         "Your code is 123456\r\n"
-    ).format(token=token).encode()
+    ).format(token=read_token).encode()
 
     handler = _s.InboxSmtpHandler()
-    envelope = FakeEnvelope(rcpt_tos=[f"{token}@example.com"], content=raw_email)
+    envelope = FakeEnvelope(rcpt_tos=[f"{read_token}@example.com"], content=raw_email)
     result = await handler.handle_DATA(None, None, envelope)
 
     assert result.startswith("250")
-    slot = _s._inbox_slots.get(token)
+    slot = _s._inbox_slots.get(read_token)
     assert slot is not None
     assert len(slot["messages"]) == 1
     msg = slot["messages"][0]
@@ -1908,7 +1915,7 @@ async def test_smtp_handler_fills_slot_html_email(ws_client) -> None:
     import server as _s
 
     resp = await ws_client.post("/inbox/create", json={"ttl_minutes": 5})
-    token = (await resp.json())["drop_url"].split("/")[2]
+    read_token = (await resp.json())["read_url"].split("/")[2]
 
     raw_email = (
         "From: noreply@discord.com\r\n"
@@ -1918,14 +1925,14 @@ async def test_smtp_handler_fills_slot_html_email(ws_client) -> None:
         "Content-Type: text/html; charset=utf-8\r\n"
         "\r\n"
         "<html><body><p>Your code is <b>654321</b></p></body></html>\r\n"
-    ).format(token=token).encode()
+    ).format(token=read_token).encode()
 
     handler = _s.InboxSmtpHandler()
-    envelope = FakeEnvelope(rcpt_tos=[f"{token}@mail.example.com"], content=raw_email)
+    envelope = FakeEnvelope(rcpt_tos=[f"{read_token}@mail.example.com"], content=raw_email)
     result = await handler.handle_DATA(None, None, envelope)
 
     assert result.startswith("250")
-    slot = _s._inbox_slots.get(token)
+    slot = _s._inbox_slots.get(read_token)
     assert slot is not None
     assert len(slot["messages"]) == 1
     msg = slot["messages"][0]
@@ -1959,7 +1966,7 @@ async def test_inbox_read_returns_email_metadata(ws_client) -> None:
 
     resp = await ws_client.post("/inbox/create", json={"ttl_minutes": 10})
     data = await resp.json()
-    token = data["drop_url"].split("/")[2]
+    read_token = data["read_url"].split("/")[2]
 
     # Simulate SMTP delivery by calling the handler directly
     raw_email = (
@@ -1969,13 +1976,13 @@ async def test_inbox_read_returns_email_metadata(ws_client) -> None:
         "Content-Type: text/plain; charset=utf-8\r\n"
         "\r\n"
         "Click here to verify: https://github.com/verify/abc\r\n"
-    ).format(token=token).encode()
+    ).format(token=read_token).encode()
 
     handler = _s.InboxSmtpHandler()
-    envelope = FakeEnvelope(rcpt_tos=[f"{token}@example.com"], content=raw_email)
+    envelope = FakeEnvelope(rcpt_tos=[f"{read_token}@example.com"], content=raw_email)
     await handler.handle_DATA(None, None, envelope)
 
-    read_resp = await ws_client.get(f"/inbox/{token}/read")
+    read_resp = await ws_client.get(f"/inbox/{read_token}/read")
     assert read_resp.status == 200
     body = await read_resp.json()
     assert "messages" in body
@@ -2065,13 +2072,13 @@ async def test_relay_json_deposits_message(ws_client) -> None:
         _s.RELAY_SECRET = "test-relay-secret"
         create = await ws_client.post("/inbox/create", json={"ttl_minutes": 10})
         data   = await create.json()
-        token  = data["drop_url"].split("/")[2]
+        read_token = data["read_url"].split("/")[2]
 
         relay_resp = await ws_client.post(
             "/inbox/relay",
             json={
                 "secret":  "test-relay-secret",
-                "token":   token,
+                "token":   read_token,
                 "from":    "relay@example.com",
                 "subject": "Relay test",
                 "body":    "Hello from relay",
@@ -2080,7 +2087,7 @@ async def test_relay_json_deposits_message(ws_client) -> None:
         assert relay_resp.status == 200
         assert (await relay_resp.json())["ok"] is True
 
-        read_resp = await ws_client.get(f"/inbox/{token}/read")
+        read_resp = await ws_client.get(f"/inbox/{read_token}/read")
         body = await read_resp.json()
         assert body["count"] == 1
         msg = body["messages"][0]
@@ -2099,18 +2106,18 @@ async def test_relay_json_html_content_type(ws_client) -> None:
     try:
         _s.RELAY_SECRET = "test-relay-secret"
         create = await ws_client.post("/inbox/create", json={"ttl_minutes": 5})
-        token  = (await create.json())["drop_url"].split("/")[2]
+        read_token = (await create.json())["read_url"].split("/")[2]
 
         await ws_client.post(
             "/inbox/relay",
             json={
                 "secret": "test-relay-secret",
-                "token":  token,
+                "token":  read_token,
                 "html":   "<b>HTML email</b>",
                 "body":   "fallback plain",
             },
         )
-        read_resp = await ws_client.get(f"/inbox/{token}/read")
+        read_resp = await ws_client.get(f"/inbox/{read_token}/read")
         msg = (await read_resp.json())["messages"][0]
         assert msg["content_type"] == "text/html"
         assert msg["body"] == "<b>HTML email</b>"
@@ -2126,12 +2133,12 @@ async def test_relay_secret_via_header(ws_client) -> None:
     try:
         _s.RELAY_SECRET = "header-secret"
         create = await ws_client.post("/inbox/create", json={})
-        token  = (await create.json())["drop_url"].split("/")[2]
+        read_token = (await create.json())["read_url"].split("/")[2]
 
         resp = await ws_client.post(
             "/inbox/relay",
             headers={"X-Relay-Secret": "header-secret"},
-            json={"token": token, "body": "from header auth"},
+            json={"token": read_token, "body": "from header auth"},
         )
         assert resp.status == 200
     finally:
@@ -2146,20 +2153,20 @@ async def test_relay_mailgun_form_format(ws_client) -> None:
     try:
         _s.RELAY_SECRET = "mg-secret"
         create = await ws_client.post("/inbox/create", json={})
-        token  = (await create.json())["drop_url"].split("/")[2]
+        read_token = (await create.json())["read_url"].split("/")[2]
 
         resp = await ws_client.post(
             "/inbox/relay",
             headers={"X-Relay-Secret": "mg-secret"},
             data={
-                "recipient":   f"{token}@mail.example.com",
+                "recipient":   f"{read_token}@mail.example.com",
                 "sender":      "user@gmail.com",
                 "subject":     "Mailgun test",
                 "body-plain":  "Mailgun body",
             },
         )
         assert resp.status == 200
-        read = await ws_client.get(f"/inbox/{token}/read")
+        read = await ws_client.get(f"/inbox/{read_token}/read")
         msgs = (await read.json())["messages"]
         assert len(msgs) == 1
         assert msgs[0]["email_from"] == "user@gmail.com"
@@ -2242,11 +2249,13 @@ async def test_lockdown_toggle_and_wipe(ws_client) -> None:
 
     # Create an inbox and deposit a message
     cr = await ws_client.post("/inbox/create", json={})
-    token = (await cr.json())["drop_url"].split("/")[2]
-    await ws_client.post(f"/inbox/{token}/drop", json={"message": "secret"})
+    inbox_data = await cr.json()
+    drop_token = inbox_data["drop_url"].split("/")[2]
+    read_token = inbox_data["read_url"].split("/")[2]
+    await ws_client.post(f"/inbox/{drop_token}/drop", json={"message": "secret"})
 
     # Verify inbox has a message
-    read = await ws_client.get(f"/inbox/{token}/read")
+    read = await ws_client.get(f"/inbox/{read_token}/read")
     assert (await read.json())["count"] == 1
 
     try:
@@ -2256,8 +2265,8 @@ async def test_lockdown_toggle_and_wipe(ws_client) -> None:
         assert (await act.json())["lockdown"] is True
         assert _s._lockdown_active is True
 
-        # Inbox should now be wiped
-        assert token not in _s._inbox_slots
+        # Inbox should now be wiped (keyed by read_token in _inbox_slots)
+        assert read_token not in _s._inbox_slots
 
         # Status endpoint should report lockdown active
         status = await ws_client.get(f"/{ap}/api/lockdown")
