@@ -302,19 +302,19 @@ def _start_tor_hidden_service(tor_exe: Path) -> Optional[tuple]:
     control_port = _free_port()
 
     config: dict = {
-        "SocksPort":                _socks_port_for_tor(),
-        "ControlPort":              str(control_port),
-        "DataDirectory":            str(_TOR_DATA_DIR),
-        "HiddenServiceDir":         str(_HS_DIR),
-        "HiddenServicePort":        f"80 127.0.0.1:{SERVER_PORT}",
+        "SocksPort":       _socks_port_for_tor(),
+        "ControlPort":     str(control_port),
+        "DataDirectory":   str(_TOR_DATA_DIR),
+        "HiddenServiceDir":  str(_HS_DIR),
+        "HiddenServicePort": f"80 127.0.0.1:{SERVER_PORT}",
         # Prevent the common "stuck at 95%" bootstrap stall.
         # Tor builds 3-hop circuits to complete bootstrap; if the first guard
         # it tries is slow the default adaptive timeout can freeze for many
-        # minutes.  Setting an explicit 10-second ceiling per circuit-build
-        # attempt forces rapid retry with a different relay path.
-        "CircuitBuildTimeout":      "10",
-        "LearnCircuitBuildTimeout": "0",
-        "NumEntryGuards":           "8",
+        # minutes.  This value is used as the initial estimate; Tor's adaptive
+        # algorithm then refines it upward.  Even with learning enabled, the
+        # 10-second starting point causes rapid guard rotation early in the
+        # session when circuits are most likely to stall.
+        "CircuitBuildTimeout": "10",
     }
     # Provide GeoIP files from the bundle so Tor doesn't warn about a missing
     # GeoIPFile path.  These files sit next to tor.exe in the Expert Bundle.

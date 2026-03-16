@@ -2475,9 +2475,10 @@ async def test_forward_to_peers_skips_peers_without_mesh_path(ws_client) -> None
 
     async def _fake_proxied_session(timeout=5.0):
         sess = MagicMock()
-        async def _post(url, **kwargs):
+        def _post(url, **kwargs):  # plain function — returns the ctx-manager directly
             posted_urls.append(url)
-            resp = AsyncMock()
+            resp = MagicMock()
+            resp.status = 200
             resp.__aenter__ = AsyncMock(return_value=resp)
             resp.__aexit__ = AsyncMock(return_value=False)
             return resp

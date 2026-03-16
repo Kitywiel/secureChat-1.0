@@ -2758,36 +2758,68 @@ async def _admin_incoming_webhook_handler(request: web.Request) -> web.Response:
 def _persist_new_env_vars(
     pairs: dict[str, str],
     dotenv_path: Path | None = None,
+    *,
+    overwrite_keys: frozenset[str] = frozenset(),
 ) -> None:
     """Append *new* key=value entries to the .env file next to server.py.
 
-    Only writes keys that are **not already present** in the file.  Existing
-    entries — including user-set values and comments — are never modified.
-    Creates the file (with a header comment) if it does not yet exist.
+    Keys not yet present in the file are appended.  Keys listed in
+    ``overwrite_keys`` are updated in-place even if they already exist —
+    this is used to refresh values such as ``MESH_LOCK`` when a copied
+    installation is detected at startup.
 
-    This lets auto-generated secrets (admin path, clearnet path, …) survive
-    server restarts without any manual configuration.  Users who prefer a
-    custom value can simply set it in ``.env`` before the first run, or
-    overwrite the auto-generated line afterwards.
+    All other existing entries — including user-set values and comments —
+    are never modified.  Creates the file (with a header comment) if it
+    does not yet exist.
 
     Args:
-        pairs:        Mapping of ``ENV_VAR_NAME`` → ``value`` to persist.
-        dotenv_path:  Path to the ``.env`` file.  Defaults to ``.env`` next
-                      to *this* file (``server.py``).
+        pairs:          Mapping of ``ENV_VAR_NAME`` → ``value`` to persist.
+        dotenv_path:    Path to the ``.env`` file.  Defaults to ``.env`` next
+                        to *this* file (``server.py``).
+        overwrite_keys: Keys whose existing values should be updated in-place.
     """
     target = dotenv_path if dotenv_path is not None else (_HERE / ".env")
 
-    # Collect keys already present so we never duplicate them.
     existing_keys: set[str] = set()
     if target.is_file():
         try:
-            for raw in target.read_text(encoding="utf-8").splitlines():
+            raw_text = target.read_text(encoding="utf-8")
+        except OSError:
+            return  # can't read — bail out silently
+
+        # Pass 1 — update in-place for overwrite_keys.
+        if overwrite_keys:
+            lines = raw_text.splitlines(keepends=True)
+            changed = False
+            for i, line in enumerate(lines):
+                stripped = line.strip()
+                if stripped and not stripped.startswith("#") and "=" in stripped:
+                    k, _, _ = stripped.partition("=")
+                    key_name = k.strip()
+                    if key_name in overwrite_keys and key_name in pairs:
+                        lines[i] = f"{key_name}={pairs[key_name]}\n"
+                        changed = True
+                    existing_keys.add(key_name)
+            if changed:
+                try:
+                    target.write_text("".join(lines), encoding="utf-8")
+                    raw_text = "".join(lines)
+                except OSError:
+                    pass
+            # Collect remaining existing keys (in case write failed).
+            if not changed:
+                for raw in raw_text.splitlines():
+                    line = raw.strip()
+                    if line and not line.startswith("#") and "=" in line:
+                        key, _, _ = line.partition("=")
+                        existing_keys.add(key.strip())
+        else:
+            # No overwrite needed — just collect existing keys.
+            for raw in raw_text.splitlines():
                 line = raw.strip()
                 if line and not line.startswith("#") and "=" in line:
                     key, _, _ = line.partition("=")
                     existing_keys.add(key.strip())
-        except OSError:
-            return  # can't read — bail out silently
 
     new_lines = [
         f"{k}={v}\n"
@@ -2811,22 +2843,31 @@ def _persist_new_env_vars(
 def _persist_vars_to_bat(
     pairs: dict[str, str],
     bat_path: Path | None = None,
+    *,
+    overwrite_keys: frozenset[str] = frozenset(),
 ) -> bool:
-    """Write new ``SET KEY=VALUE`` entries into the Windows ``.bat`` launcher.
+    """Write ``SET KEY=VALUE`` entries into the Windows ``.bat`` launcher.
 
-    Only writes keys that are **not already present** as ``SET`` commands in
-    the file.  Existing ``SET`` lines — including user-edited ones — are never
-    modified.  New lines are inserted right before the ``python run.py`` call
-    so they are active as environment variables when the server starts next
-    time via double-click.
+    Keys not yet present in the file are inserted right before the
+    ``python run.py`` invocation line.  Keys listed in ``overwrite_keys``
+    are updated in-place even when they already exist — this is used to
+    refresh values such as ``MESH_LOCK`` when a copied installation is
+    detected at startup.
+
+    All other existing ``SET`` lines — including user-edited ones — are
+    never modified.  New lines are inserted right before the ``python
+    run.py`` call so they are active next time the server starts via
+    double-click.
 
     Args:
-        pairs:    Mapping of ``ENV_VAR_NAME`` → value to persist.
-        bat_path: Path to the ``.bat`` file.  Defaults to ``start_server.bat``
-                  next to *this* file (``server.py``).
+        pairs:          Mapping of ``ENV_VAR_NAME`` → value to persist.
+        bat_path:       Path to the ``.bat`` file.  Defaults to
+                        ``start_server.bat`` next to *this* file.
+        overwrite_keys: Keys whose existing SET lines should be updated
+                        in-place rather than left unchanged.
 
     Returns:
-        ``True`` if the file was written (or no new keys were needed),
+        ``True`` if the file was written (or no changes were needed),
         ``False`` if the bat file does not exist or could not be read/written.
     """
     target = bat_path if bat_path is not None else (_HERE / "start_server.bat")
@@ -2838,50 +2879,132 @@ def _persist_vars_to_bat(
     except OSError:
         return False
 
-    # Collect keys already present as SET commands (case-insensitive).
-    existing_keys: set[str] = set()
-    for line in content.splitlines():
-        stripped = line.strip()
-        upper = stripped.upper()
-        if upper.startswith("SET ") and "=" in stripped:
-            key = stripped[4:].partition("=")[0].strip().upper()
-            existing_keys.add(key)
+    lines = content.splitlines(keepends=True)
 
+    # Pass 1 — update existing SET lines for overwrite_keys.
+    existing_keys: set[str] = set()
+    overwrite_upper = {k.upper() for k in overwrite_keys}
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.upper().startswith("SET ") and "=" in stripped:
+            key = stripped[4:].partition("=")[0].strip()
+            key_upper = key.upper()
+            existing_keys.add(key_upper)
+            if key_upper in overwrite_upper:
+                # Find the matching key from pairs (case-insensitive).
+                match = next((k for k in pairs if k.upper() == key_upper), None)
+                if match is not None:
+                    lines[i] = f"SET {key}={pairs[match]}\n"
+
+    # Pass 2 — collect any remaining new keys not yet in the file.
     new_lines = [
         f"SET {k}={v}\n"
         for k, v in pairs.items()
         if k.upper() not in existing_keys
     ]
-    if not new_lines:
-        return True  # nothing to add, already up-to-date
 
-    header = (
-        "\n"
-        ":: Auto-generated secrets — kept so URLs/tokens survive restarts.\n"
-        ":: To use a custom value, update the SET line below and restart.\n"
-    )
-    block = header + "".join(new_lines)
+    if not new_lines and overwrite_upper.isdisjoint(existing_keys):
+        # Nothing to add and no in-place updates were needed.
+        return True
 
-    # Insert right before the 'python run.py' invocation line.
-    lines = content.splitlines(keepends=True)
-    insert_idx: int | None = None
-    for i, line in enumerate(lines):
-        if "run.py" in line and line.strip().lower().startswith("python"):
-            insert_idx = i
-            break
+    if new_lines:
+        header = (
+            "\n"
+            ":: Auto-generated secrets — kept so URLs/tokens survive restarts.\n"
+            ":: To use a custom value, update the SET line below and restart.\n"
+        )
+        block = header + "".join(new_lines)
 
-    if insert_idx is not None:
-        lines.insert(insert_idx, block)
-        new_content = "".join(lines)
-    else:
-        # Fallback: append at the end of the file.
-        new_content = content.rstrip("\n") + "\n" + block
+        # Insert right before the 'python run.py' invocation line.
+        insert_idx: int | None = None
+        for i, line in enumerate(lines):
+            if "run.py" in line and line.strip().lower().startswith("python"):
+                insert_idx = i
+                break
+
+        if insert_idx is not None:
+            lines.insert(insert_idx, block)
+        else:
+            lines.append("\n" + block)
 
     try:
-        target.write_text(new_content, encoding="utf-8")
+        target.write_text("".join(lines), encoding="utf-8")
         return True
     except OSError:
         return False
+
+
+def _remove_keys_from_env(
+    keys: frozenset[str],
+    dotenv_path: Path | None = None,
+) -> None:
+    """Remove ``KEY=...`` lines for *keys* from the ``.env`` file.
+
+    Used when the operator wants to force regeneration of a secret (e.g.
+    ``MESH_PATH``) by clearing the persisted value so a fresh one is
+    created on the next startup.  Lines whose key is not in *keys* and all
+    comment lines are preserved unchanged.
+
+    Args:
+        keys:         Set of environment variable names to remove.
+        dotenv_path:  Path to the ``.env`` file.  Defaults to ``.env``
+                      next to *this* file (``server.py``).
+    """
+    target = dotenv_path if dotenv_path is not None else (_HERE / ".env")
+    if not target.is_file():
+        return
+    try:
+        lines = target.read_text(encoding="utf-8").splitlines(keepends=True)
+    except OSError:
+        return
+    new_lines = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#") and "=" in stripped:
+            k, _, _ = stripped.partition("=")
+            if k.strip() in keys:
+                continue  # drop this key
+        new_lines.append(line)
+    try:
+        target.write_text("".join(new_lines), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _remove_keys_from_bat(
+    keys: frozenset[str],
+    bat_path: Path | None = None,
+) -> None:
+    """Remove ``SET KEY=...`` lines for *keys* from the ``.bat`` launcher.
+
+    Companion to :func:`_remove_keys_from_env` for Windows installations
+    that use ``start_server.bat`` as the primary launcher.
+
+    Args:
+        keys:     Set of environment variable names to remove (case-insensitive).
+        bat_path: Path to the ``.bat`` file.  Defaults to ``start_server.bat``
+                  next to *this* file (``server.py``).
+    """
+    target = bat_path if bat_path is not None else (_HERE / "start_server.bat")
+    if not target.is_file():
+        return
+    try:
+        lines = target.read_text(encoding="utf-8").splitlines(keepends=True)
+    except OSError:
+        return
+    keys_upper = {k.upper() for k in keys}
+    new_lines = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped.upper().startswith("SET ") and "=" in stripped:
+            key = stripped[4:].partition("=")[0].strip().upper()
+            if key in keys_upper:
+                continue  # drop this key
+        new_lines.append(line)
+    try:
+        target.write_text("".join(new_lines), encoding="utf-8")
+    except OSError:
+        pass
 
 
 def _init_admin_credentials() -> tuple[str, str]:
@@ -2950,21 +3073,58 @@ def _init_clearnet_path() -> str:
     return path
 
 
-def _init_mesh_path() -> str:
-    """Generate (or read from env) the 50-character mesh URL path segment.
+def _folder_lock() -> str:
+    """Return a 16-char hex digest of this installation's absolute directory.
 
-    All mesh endpoints (connect, forward, link) are mounted under this secret
-    path so they are not publicly discoverable.  Set MESH_PATH in the
-    environment to pin a specific path across restarts (recommended so that
-    saved connect URLs remain valid after a server restart).
+    Written to ``.env`` / ``.bat`` alongside ``MESH_PATH`` so that a copied
+    installation can be detected on the next startup: if ``MESH_LOCK`` is
+    present but does not match the current directory's digest, the stored
+    mesh path is discarded and a fresh one is generated for *this* folder.
+    """
+    return hashlib.sha256(str(_HERE).encode()).hexdigest()[:16]
+
+
+def _init_mesh_path() -> str:
+    """Return a stable, folder-unique 50-char mesh URL path segment.
+
+    Each installation folder gets its own distinct mesh path so that two
+    copies of secureChat on the same machine (or two copies of the same
+    ``.env`` / ``.bat``) do not share a URL.
+
+    Startup logic
+    -------------
+    1. ``MESH_LOCK`` present and **matches** this folder's digest
+       → the stored ``MESH_PATH`` is legitimate for this folder; return it.
+    2. ``MESH_LOCK`` present but **mis-matches** (folder was copied/moved)
+       → discard ``MESH_PATH`` and ``MESH_LOCK`` from the environment so the
+         caller can persist fresh values with :func:`_persist_new_env_vars`
+         / :func:`_persist_vars_to_bat` (using ``overwrite_keys``).
+    3. ``MESH_LOCK`` absent (first run, or legacy install without a lock)
+       → use ``MESH_PATH`` if already set (backward-compat), otherwise
+         generate a new random path.
+
+    In all cases the chosen path and the current lock are written back into
+    ``os.environ`` so the caller can persist both with a single dict.
 
     Returns:
-        The 50-character URL-safe path string (no leading/trailing slashes).
+        A 50-character URL-safe path string (no leading/trailing slashes).
     """
+    current_lock = _folder_lock()
+    stored_lock  = os.environ.get("MESH_LOCK", "").strip()
+
+    if stored_lock and stored_lock != current_lock:
+        # The .env / .bat was copied from a different folder — discard the
+        # stale path so a fresh one is generated below.
+        os.environ.pop("MESH_PATH", None)
+        os.environ.pop("MESH_LOCK", None)
+
     path = os.environ.get("MESH_PATH", "").strip()
     if not path:
-        # secrets.token_urlsafe(37) returns 50 URL-safe base64 characters.
         path = secrets.token_urlsafe(37)[:50]
+
+    # Record both values so the caller can persist them in one pass.
+    os.environ["MESH_PATH"] = path
+    os.environ["MESH_LOCK"] = current_lock
     return path
 
 
@@ -3636,8 +3796,13 @@ async def mesh_invite_handler(request: web.Request) -> web.Response:
 async def _forward_to_peers(room_id: str, payload: str) -> None:
     """Fire-and-forget: POST a message to every connected mesh peer.
 
-    Peer URLs may be .onion addresses — the proxied session routes them
-    through Tor automatically.
+    Routing strategy
+    ----------------
+    * ``.onion`` peer URLs are routed through Tor via :func:`_make_proxied_session`
+      (the standard proxy-selection logic).
+    * All other peer URLs (LAN / clearnet) use a **direct** aiohttp session —
+      Tor cannot route to private IP ranges, so using it for clearnet peers
+      would silently drop every message.
 
     Uses the per-peer ``mesh_path`` to construct the secret forward endpoint
     URL.  Peers that have no ``mesh_path`` stored are skipped because the
@@ -3651,13 +3816,28 @@ async def _forward_to_peers(room_id: str, payload: str) -> None:
             continue  # skip legacy peers without a known secret path
         fwd_url = peer["url"].rstrip("/") + f"/{peer_mesh_path}/mesh/forward"
         try:
-            async with await _make_proxied_session(timeout=5.0) as sess:
-                await sess.post(
+            # Use Tor for .onion addresses; connect directly for clearnet/LAN.
+            if ".onion" in peer["url"]:
+                sess_ctx = await _make_proxied_session(timeout=15.0)
+            else:
+                sess_ctx = _build_session("", 15.0)
+            async with sess_ctx as sess:
+                async with sess.post(
                     fwd_url,
                     json={"token": _MESH_TOKEN, "room_id": room_id, "payload": payload},
-                )
-        except Exception:  # noqa: BLE001
-            pass
+                ) as resp:
+                    if resp.status >= 400:
+                        logger.warning(
+                            "mesh forward rejected  peer_url=%s  status=%d",
+                            peer["url"][:60],
+                            resp.status,
+                        )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "mesh forward failed  peer_url=%s  error=%s",
+                peer["url"][:60],
+                exc,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -3828,14 +4008,19 @@ if __name__ == "__main__":
     # Persist auto-generated secrets so they survive restarts.
     # Admin path and passcode are intentionally NOT persisted — they are
     # regenerated on every startup so credentials never stay the same.
+    # MESH_LOCK ties the stored MESH_PATH to this folder; it is always
+    # overwritten so a copied .env / .bat picks up the new lock on its
+    # first run and triggers path regeneration.
     _secrets_to_persist = {
         "CLEARNET_PATH":       _CLEARNET_PATH,
         "ADMIN_WEBHOOK_TOKEN": _ADMIN_WEBHOOK_TOKEN,
         "MESH_TOKEN":          _MESH_TOKEN,
         "MESH_PATH":           _MESH_PATH,
+        "MESH_LOCK":           _folder_lock(),
     }
-    if not _persist_vars_to_bat(_secrets_to_persist):
-        _persist_new_env_vars(_secrets_to_persist)
+    _mesh_overwrite = frozenset({"MESH_PATH", "MESH_LOCK"})
+    if not _persist_vars_to_bat(_secrets_to_persist, overwrite_keys=_mesh_overwrite):
+        _persist_new_env_vars(_secrets_to_persist, overwrite_keys=_mesh_overwrite)
 
     logger.info("secureChat starting  host=%s  port=%d", host, port)
     logger.info(

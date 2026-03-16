@@ -102,7 +102,52 @@ _load_dotenv()
 
 
 # ---------------------------------------------------------------------------
-# Step 0 — Auto-update: git pull (opt-in via AUTO_UPDATE=1 in .env)
+# Config-file key removal helper
+# ---------------------------------------------------------------------------
+
+def _remove_keys_from_config(keys: set[str]) -> None:
+    """Remove ``KEY=...`` lines from ``.env`` and ``SET KEY=...`` from ``.bat``.
+
+    Used by ``--new-mesh-url`` and ``--new-onion-url`` to clear persisted
+    secrets so fresh values are generated on the next (current) startup.
+    """
+    keys_upper = {k.upper() for k in keys}
+
+    # ── .env ──────────────────────────────────────────────────────────────
+    if _DOTENV.is_file():
+        try:
+            lines = _DOTENV.read_text(encoding="utf-8").splitlines(keepends=True)
+            new_lines = []
+            for line in lines:
+                stripped = line.strip()
+                if stripped and not stripped.startswith("#") and "=" in stripped:
+                    k, _, _ = stripped.partition("=")
+                    k_upper = k.strip().upper()
+                    if k_upper in keys_upper:
+                        continue  # drop this key
+                new_lines.append(line)
+            _DOTENV.write_text("".join(new_lines), encoding="utf-8")
+        except OSError:
+            pass
+
+    # ── start_server.bat ──────────────────────────────────────────────────
+    bat = _HERE / "start_server.bat"
+    if bat.is_file():
+        try:
+            lines = bat.read_text(encoding="utf-8").splitlines(keepends=True)
+            new_lines = []
+            for line in lines:
+                stripped = line.strip()
+                if stripped.upper().startswith("SET ") and "=" in stripped:
+                    key = stripped[4:].partition("=")[0].strip().upper()
+                    if key in keys_upper:
+                        continue  # drop this key
+                new_lines.append(line)
+            bat.write_text("".join(new_lines), encoding="utf-8")
+        except OSError:
+            pass
+
+
 # ---------------------------------------------------------------------------
 
 def _auto_update() -> None:
@@ -496,16 +541,17 @@ def _start_tor(tor_exe: Path, server_port: int) -> tuple[str, object] | None:
         # Prevent the common "stuck at 95%" bootstrap stall.
         # Tor builds 3-hop circuits to complete bootstrap; if the first guard
         # it tries is slow the default adaptive timeout can freeze for many
-        # minutes.  Setting an explicit 10-second ceiling per circuit-build
-        # attempt forces rapid retry with a different relay path.
-        "CircuitBuildTimeout":     "10",
-        "LearnCircuitBuildTimeout": "0",
-        "NumEntryGuards":          "8",
+        # minutes.  This value is used as the initial estimate; Tor's adaptive
+        # algorithm then refines it upward.  Even with learning enabled, the
+        # 10-second starting point causes rapid guard rotation early in the
+        # session when circuits are most likely to stall.
+        "CircuitBuildTimeout": "10",
     }
     config.update(_find_geoip_files(tor_exe))
 
     tor_process = None
     _tmp_data_dir: str | None = None
+    _last_exc: Exception | None = None
     for attempt in range(3):
         if attempt > 0:
             config["ControlPort"] = str(_free_port())
@@ -524,14 +570,18 @@ def _start_tor(tor_exe: Path, server_port: int) -> tuple[str, object] | None:
                 init_msg_handler=_tor_log,
             )
             break
-        except OSError:
+        except OSError as exc:
+            _last_exc = exc
             continue
         except Exception as exc:  # noqa: BLE001
             print(f"  Tor error: {exc}")
             return None
 
     if tor_process is None:
-        print("  Tor failed to start.")
+        if _last_exc:
+            print(f"  Tor failed to start: {_last_exc}")
+        else:
+            print("  Tor failed to start.")
         return None
 
     hostname_file = _HS_DIR / "hostname"
@@ -868,6 +918,29 @@ def main() -> None:
         action="store_true",
         help="Copy .env.example to .env and exit. See info-files/env-vars.md for documentation.",
     )
+    # URL reset helpers — clear persisted values so fresh ones are generated
+    parser.add_argument(
+        "--new-mesh-url",
+        action="store_true",
+        default=False,
+        help=(
+            "Generate a new random mesh URL for this installation. "
+            "Clears MESH_PATH and MESH_LOCK from .env / start_server.bat so a "
+            "fresh path is created on this startup. "
+            "Existing mesh peers will need to reconnect using the new URL."
+        ),
+    )
+    parser.add_argument(
+        "--new-onion-url",
+        action="store_true",
+        default=False,
+        help=(
+            "Generate a new .onion address and clearnet URL. "
+            "Deletes the Tor hidden-service key directory (tor_hs/) so Tor "
+            "creates a brand-new .onion address, and clears CLEARNET_PATH "
+            "from .env / start_server.bat so a fresh path is also generated."
+        ),
+    )
     args = parser.parse_args()
 
     # Handle --example early, before any other startup logic.
@@ -886,6 +959,29 @@ def main() -> None:
             print("  Edit .env, uncomment the lines you want, then run:  python run.py")
         print("  Documentation:  info-files/env-vars.md")
         sys.exit(0)
+
+    # Handle --new-mesh-url: remove stored mesh path so a new one is generated.
+    if args.new_mesh_url:
+        _remove_keys_from_config({"MESH_PATH", "MESH_LOCK"})
+        os.environ.pop("MESH_PATH", None)
+        os.environ.pop("MESH_LOCK", None)
+        print("  ✅  Mesh URL cleared — a new URL will be generated on this startup.")
+
+    # Handle --new-onion-url: delete Tor hidden-service key + clear clearnet path.
+    if args.new_onion_url:
+        _remove_keys_from_config({"CLEARNET_PATH"})
+        os.environ.pop("CLEARNET_PATH", None)
+        if _HS_DIR.is_dir():
+            try:
+                shutil.rmtree(_HS_DIR)
+                print(
+                    "  ✅  Tor hidden-service directory deleted — "
+                    "a new .onion address will be created when Tor starts."
+                )
+            except OSError as _e:
+                print(f"  ⚠️  Could not delete {_HS_DIR}: {_e}")
+        else:
+            print("  ✅  Clearnet URL cleared — a new URL will be generated on this startup.")
 
     # Save our own persisted MESH_TOKEN BEFORE _flag_env runs — the --mesh-token
     # flag writes the REMOTE server's token into os.environ["MESH_TOKEN"], which
@@ -1021,16 +1117,21 @@ def main() -> None:
     # file is absent) the secrets fall back to the .env file.
     # Admin path and passcode are intentionally NOT persisted — they are
     # regenerated on every startup so credentials never stay the same.
+    # MESH_LOCK ties the stored MESH_PATH to this installation folder; it is
+    # always overwritten so a copied .env / .bat gets its lock corrected on
+    # the very next run and triggers path regeneration for the new folder.
     _secrets_to_persist = {
         "CLEARNET_PATH":       srv._CLEARNET_PATH,
         "ADMIN_WEBHOOK_TOKEN": srv._ADMIN_WEBHOOK_TOKEN,
         "MESH_TOKEN":          srv._MESH_TOKEN,
         "MESH_PATH":           srv._MESH_PATH,
+        "MESH_LOCK":           srv._folder_lock(),
     }
-    wrote_bat = srv._persist_vars_to_bat(_secrets_to_persist)
+    _mesh_overwrite = frozenset({"MESH_PATH", "MESH_LOCK"})
+    wrote_bat = srv._persist_vars_to_bat(_secrets_to_persist, overwrite_keys=_mesh_overwrite)
     if not wrote_bat:
         # Fallback: write to .env for non-Windows or missing bat file.
-        srv._persist_new_env_vars(_secrets_to_persist)
+        srv._persist_new_env_vars(_secrets_to_persist, overwrite_keys=_mesh_overwrite)
 
     mail_domain: str = srv.MAIL_DOMAIN
     smtp_enabled: bool = bool(mail_domain)
