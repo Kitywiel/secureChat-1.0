@@ -27,6 +27,10 @@ Environment overrides (all optional — every default works out-of-the-box)
     SMTP_PORT      SMTP listen port               (default: 25)
     MESH_JOIN      URL of a remote peer to auto-join at startup (optional)
     MESH_TOKEN     MESH_TOKEN of the remote peer  (required when MESH_JOIN is set)
+    LOCAL_MESH_PORT  Port for the local mesh hub (default: disabled).  When set, the hub
+                   (local_mesh.py) is started automatically if not already running, and
+                   this instance registers with it.  Run multiple instances on the same
+                   machine with the same LOCAL_MESH_PORT to form a local cluster.
     NO_TOR         Set to '1' to skip Tor even if installed (optional)
     TOR_PATH       Override path to the tor binary (optional)
 
@@ -619,6 +623,81 @@ def _lan_ip() -> str:
 
 
 # ---------------------------------------------------------------------------
+# Step 3b — Local mesh hub auto-start
+# ---------------------------------------------------------------------------
+
+def _is_port_open(port: int) -> bool:
+    """Return True if something is already listening on 127.0.0.1:*port*.
+
+    Uses a 0.5-second connect timeout which is long enough to detect a local
+    listener reliably while short enough not to slow down startup noticeably.
+    """
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(0.5)
+            return s.connect_ex(("127.0.0.1", port)) == 0
+    except OSError:
+        return False
+
+
+_HUB_START_TIMEOUT_SEC: float = 3.0     # max seconds to wait for hub to start
+_HUB_START_POLL_INTERVAL: float = 0.1   # polling interval while waiting
+
+
+def _ensure_local_mesh_hub(port: int) -> None:
+    """Start the local mesh hub (local_mesh.py) in the background if not already running.
+
+    Called automatically when ``LOCAL_MESH_PORT`` is set so operators only
+    need to run ``python run.py --local-mesh-port <port>`` on each instance —
+    no separate ``python local_mesh.py`` invocation is required.
+
+    If the hub port is already occupied (another instance started it, or the
+    user started it manually) this function returns immediately without
+    spawning a second hub.
+    """
+    if _is_port_open(port):
+        return  # hub already running — nothing to do
+
+    hub_script = _HERE / "local_mesh.py"
+    if not hub_script.is_file():
+        print(f"  ⚠️  local_mesh.py not found next to run.py — skipping hub start.")
+        return
+
+    env = os.environ.copy()
+    env["LOCAL_MESH_PORT"] = str(port)
+
+    # Spawn the hub as a detached background process.  We use DETACHED_PROCESS
+    # on Windows and start_new_session on POSIX so the hub survives the parent.
+    kwargs: dict = {
+        "env": env,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+    }
+    if sys.platform == "win32":
+        kwargs["creationflags"] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        kwargs["start_new_session"] = True
+
+    try:
+        subprocess.Popen([sys.executable, str(hub_script)], **kwargs)
+    except OSError as exc:
+        print(f"  ⚠️  Could not start local mesh hub: {exc}")
+        return
+
+    # Wait up to _HUB_START_TIMEOUT_SEC for the hub to begin accepting connections.
+    _max_polls = int(_HUB_START_TIMEOUT_SEC / _HUB_START_POLL_INTERVAL)
+    for _ in range(_max_polls):
+        if _is_port_open(port):
+            break
+        time.sleep(_HUB_START_POLL_INTERVAL)
+    else:
+        print(f"  ⚠️  Local mesh hub on port {port} did not start in time.")
+        return
+
+    print(f"  🕸️   Local mesh hub started on port {port}.")
+
+
+# ---------------------------------------------------------------------------
 # Step 4 — Print startup summary
 # ---------------------------------------------------------------------------
 
@@ -634,6 +713,7 @@ def _print_summary(
     mail_domain: str,
     mesh_token: str,
     mesh_path: str,
+    local_mesh_port: int = 0,
 ) -> None:
     lan = _lan_ip()
     sep = "=" * 66
@@ -679,7 +759,24 @@ def _print_summary(
 
     print()
     print("  🕸️   Mesh / multi-device federation:")
-    print("        Run another instance anywhere in the world, then link them:")
+    if local_mesh_port:
+        print("        Local cluster (same machine) — hub is running on port "
+              f"{local_mesh_port}.")
+        print("        To add another instance on this machine:")
+        print()
+        print(f"        python run.py --port <other_port> --local-mesh-port {local_mesh_port}")
+        print()
+        print("        Remote mesh — link instances anywhere in the world:")
+    else:
+        print("        Run another instance anywhere in the world, then link them:")
+        print()
+        print("        Same-machine cluster (instant, no Tor needed):")
+        print()
+        print(f"        python run.py --port <other_port> --local-mesh-port 9000")
+        print()
+        print("          (first instance auto-starts the hub; others just join it)")
+        print()
+        print("        Remote mesh:")
     print()
     connect_url = f"{base_url}/{mesh_path}/mesh/connect"
     print(f"        python run.py --mesh-join {connect_url} --mesh-token {mesh_token}")
@@ -1100,6 +1197,11 @@ def main() -> None:
         # No Tor — bind to all interfaces so LAN devices can connect
         os.environ.setdefault("HOST", "0.0.0.0")
 
+    # ── 3b. Local mesh hub ────────────────────────────────────────────
+    local_mesh_port: int = int(os.environ.get("LOCAL_MESH_PORT", "0"))
+    if local_mesh_port:
+        _ensure_local_mesh_hub(local_mesh_port)
+
     # ── 4. Import server (now dependencies are guaranteed to be present) ──
     # We must import AFTER pip-installing, and AFTER setting env vars.
     try:
@@ -1161,6 +1263,7 @@ def main() -> None:
         mail_domain=mail_domain,
         mesh_token=srv._MESH_TOKEN,
         mesh_path=srv._MESH_PATH,
+        local_mesh_port=local_mesh_port,
     )
 
     # ── 7. Run the server ─────────────────────────────────────────────

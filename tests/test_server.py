@@ -4891,3 +4891,158 @@ def test_start_with_tor_omits_timeout_on_windows() -> None:
     assert "timeout" not in captured_kwargs[0], (
         "timeout= must NOT be passed to stem on Windows (start_with_tor)"
     )
+
+
+# ---------------------------------------------------------------------------
+# Local mesh hub auto-start (run.py _ensure_local_mesh_hub / _is_port_open)
+# ---------------------------------------------------------------------------
+
+def test_is_port_open_returns_false_for_closed_port() -> None:
+    """_is_port_open returns False when nothing listens on the given port."""
+    import sys, os
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    import run as _run
+
+    # Find a free port — nothing is listening there.
+    import socket
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        free = s.getsockname()[1]
+
+    assert _run._is_port_open(free) is False
+
+
+def test_is_port_open_returns_true_for_listening_port() -> None:
+    """_is_port_open returns True when a socket is listening."""
+    import sys, os
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    import run as _run
+    import socket, threading
+
+    srv_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv_sock.bind(("127.0.0.1", 0))
+    port = srv_sock.getsockname()[1]
+    srv_sock.listen(1)
+    try:
+        assert _run._is_port_open(port) is True
+    finally:
+        srv_sock.close()
+
+
+def test_ensure_local_mesh_hub_skips_if_already_running(capsys) -> None:
+    """_ensure_local_mesh_hub does nothing when the port is already open."""
+    import sys, os
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    import run as _run
+    from unittest.mock import patch
+    import socket
+
+    spawn_calls: list = []
+
+    with patch.object(_run, "_is_port_open", return_value=True), \
+         patch("subprocess.Popen", side_effect=lambda *a, **kw: spawn_calls.append(a)):
+        _run._ensure_local_mesh_hub(9000)
+
+    assert spawn_calls == [], "Popen must not be called when hub is already running"
+
+
+def test_ensure_local_mesh_hub_spawns_when_not_running(tmp_path, capsys) -> None:
+    """_ensure_local_mesh_hub spawns local_mesh.py when the port is closed."""
+    import sys, os
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    import run as _run
+    from unittest.mock import patch, MagicMock
+
+    fake_hub = tmp_path / "local_mesh.py"
+    fake_hub.write_text("# stub\n")
+
+    port_open_calls: list[int] = []
+
+    def fake_is_port_open(port: int) -> bool:
+        port_open_calls.append(port)
+        # First call (pre-check): port closed; subsequent calls (wait loop): open
+        return len(port_open_calls) > 1
+
+    mock_proc = MagicMock()
+    popen_calls: list = []
+
+    def fake_popen(cmd, **kwargs):
+        popen_calls.append(cmd)
+        return mock_proc
+
+    with patch.object(_run, "_is_port_open", side_effect=fake_is_port_open), \
+         patch.object(_run, "_HERE", tmp_path), \
+         patch("subprocess.Popen", side_effect=fake_popen), \
+         patch("time.sleep"):
+        _run._ensure_local_mesh_hub(9000)
+
+    assert len(popen_calls) == 1, "Popen must be called exactly once"
+    assert str(fake_hub) in popen_calls[0]
+
+    out = capsys.readouterr().out
+    assert "9000" in out
+
+
+def test_ensure_local_mesh_hub_missing_script(tmp_path, capsys) -> None:
+    """_ensure_local_mesh_hub warns and returns when local_mesh.py is absent."""
+    import sys, os
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    import run as _run
+    from unittest.mock import patch
+
+    with patch.object(_run, "_is_port_open", return_value=False), \
+         patch.object(_run, "_HERE", tmp_path), \
+         patch("subprocess.Popen") as mock_popen:
+        _run._ensure_local_mesh_hub(9000)
+
+    mock_popen.assert_not_called()
+    assert "local_mesh.py" in capsys.readouterr().out
+
+
+def test_print_summary_shows_local_mesh_port(capsys) -> None:
+    """_print_summary includes the --local-mesh-port join command when hub is active."""
+    import sys, os
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    import run as _run
+
+    _run._print_summary(
+        server_port=5000,
+        onion=None,
+        admin_path="x" * 200,
+        admin_passcode="p" * 100,
+        relay_secret="secret",
+        relay_enabled=True,
+        smtp_enabled=False,
+        mail_domain="",
+        mesh_token="tok",
+        mesh_path="mpath",
+        local_mesh_port=9000,
+    )
+    out = capsys.readouterr().out
+    assert "--local-mesh-port 9000" in out
+    assert "9000" in out
+
+
+def test_print_summary_shows_local_mesh_hint_without_hub(capsys) -> None:
+    """_print_summary shows cluster instructions even when no hub is active."""
+    import sys, os
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    import run as _run
+
+    _run._print_summary(
+        server_port=5000,
+        onion=None,
+        admin_path="x" * 200,
+        admin_passcode="p" * 100,
+        relay_secret="secret",
+        relay_enabled=False,
+        smtp_enabled=False,
+        mail_domain="",
+        mesh_token="tok",
+        mesh_path="mpath",
+        local_mesh_port=0,
+    )
+    out = capsys.readouterr().out
+    # Even without an active hub, the instructions mention --local-mesh-port
+    assert "--local-mesh-port" in out
