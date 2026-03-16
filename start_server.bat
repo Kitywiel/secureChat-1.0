@@ -72,6 +72,13 @@ if %errorlevel% neq 0 (
     exit /b 1
 )
 
+
+:: Auto-generated secrets — kept so URLs/tokens survive restarts.
+:: To use a custom value, update the SET line below and restart.
+SET CLEARNET_PATH=ehKt5ZKxarOPsVuhDh_jZBJtsxCRlRaptijhVbtz3YH8H2JC_eYcDggTdSzlEpNLkct7qOELp0xuueef4b-y2aal2jK4zS7TCjpF
+SET ADMIN_WEBHOOK_TOKEN=nC6-7DTZvWqTHiqOsWVfwHvtaHTjsuF0UeJH0JlroVI
+SET MESH_TOKEN=SfXFEdand1gIvdqnbPHN4KrakQfuli3iBEXuta2Ewmk
+SET MESH_PATH=wJNnrnhtE-pG_6-CbHq2hsVcuNaRLoOITzVJv7ev-BhGbFSC8A
 python run.py
 
 echo.

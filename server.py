@@ -978,13 +978,19 @@ async def ws_handler(request: web.Request) -> web.WebSocketResponse:
 
                 # Send stored history to the newly joined peer only.
                 # History is only kept for passcode-protected rooms.
+                # save_limit is always included so the client can inform the
+                # user how many messages this room retains, even on first join
+                # (when there are no stored messages yet).
                 if _room_meta.get(room_id, {}).get("passcode_hash"):
                     try:
                         history = await get_history(db_path, room_id)
-                        if history:
-                            await ws.send_str(
-                                json.dumps({"type": "history", "messages": history})
-                            )
+                        await ws.send_str(
+                            json.dumps({
+                                "type":       "history",
+                                "messages":   history,
+                                "save_limit": HISTORY_LIMIT,
+                            })
+                        )
                     except Exception as exc:  # noqa: BLE001
                         logger.warning("failed to load history  room=%s  error=%s", room_id, exc)
 
@@ -3758,6 +3764,10 @@ def build_app(db_path: Path | None = None) -> web.Application:
     app.router.add_post(f"/{mp}/mesh/forward", mesh_peer_forward_handler)
     app.router.add_post(f"/{mp}/mesh/link",    mesh_peer_link_handler)
     app.router.add_get("/mesh/invite",          mesh_invite_handler)
+    # Public compatibility alias — documented URL used by older configs and the
+    # start_server.bat template.  The MESH_TOKEN check inside the handler
+    # provides authentication so exposing this path is safe.
+    app.router.add_post("/mesh/peer/connect",   mesh_peer_connect_handler)
 
     # Mount admin panel under the secret 200-char path on the same server
     _register_admin_routes(app)
