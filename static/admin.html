@@ -90,6 +90,15 @@ section h2{font-size:1rem;font-weight:700;margin-bottom:.75rem;padding-bottom:.4
 #metrics-range:focus{border-color:var(--accent)}
 #metrics-chart-wrap{position:relative;height:280px;background:#000;
                     border:1px solid var(--border);border-radius:8px;padding:.5rem}
+/* ── Local Cluster section ── */
+.cluster-table{width:100%;border-collapse:collapse;font-size:.82rem}
+.cluster-table th{text-align:left;color:var(--dim);font-weight:600;text-transform:uppercase;
+                  letter-spacing:.05em;padding:.4rem .75rem;border-bottom:1px solid var(--border)}
+.cluster-table td{padding:.45rem .75rem;border-bottom:1px solid #1e1e1e}
+.cluster-table tr:last-child td{border-bottom:none}
+.cluster-ok{color:var(--accent)}
+.cluster-err{color:var(--red)}
+.cluster-na{color:#444;font-size:.82rem;padding:.5rem 0}
 </style>
 </head>
 <body>
@@ -252,6 +261,10 @@ async function renderDashboard(){
           No data yet — samples recorded every 10 s
         </div>
       </div>
+    </section>
+    <section>
+      <h2>🕸️ Local Cluster</h2>
+      <div id="cluster-area"><p class="cluster-na">Loading cluster data…</p></div>
     </section>
     <section>
       <h2>Chats by Self-Destruct Timer</h2>
@@ -568,6 +581,10 @@ async function renderDashboard(){
 
   startLogStream();
 
+  // Refresh cluster stats on load and every 10 seconds.
+  refreshCluster();
+  setInterval(refreshCluster,10000);
+
   // Refresh stats every 5s (system metrics need faster refresh for live monitoring)
   setInterval(async()=>{
     const s=await fetchStats();
@@ -599,6 +616,60 @@ function renderTimerBreakdown(obj){
     `<div style="display:inline-block;margin:.3rem .5rem .3rem 0;padding:.3rem .7rem;
       background:#1a1a1a;border:1px solid #2e2e2e;border-radius:6px;font-size:.82rem">
       <strong>${k}</strong>: ${v}</div>`).join('');
+}
+
+/** Render the Local Cluster section from the cluster-stats API response. */
+function renderCluster(data){
+  if(!data){
+    return '<p class="cluster-na">Could not reach local mesh hub.</p>';
+  }
+  if(data.error&&(!data.instances||!data.instances.length)){
+    return `<p class="cluster-na">ℹ️ ${data.error}</p>`;
+  }
+  if(!data.instances||!data.instances.length){
+    return '<p class="cluster-na">No instances registered with the hub yet.</p>';
+  }
+  let rows='';
+  data.instances.forEach(inst=>{
+    const status=inst.ok
+      ?`<span class="cluster-ok">● online</span>`
+      :`<span class="cluster-err">● offline${inst.error?' ('+inst.error+')':''}</span>`;
+    const cpu=inst.sys_cpu_percent!=null?inst.sys_cpu_percent+'%':'—';
+    const ram=inst.sys_ram_percent!=null?inst.sys_ram_percent+'%':'—';
+    const rooms=inst.open_rooms!=null?inst.open_rooms:'—';
+    const files=inst.open_file_transfers!=null?inst.open_file_transfers:'—';
+    rows+=`<tr>
+      <td><code style="font-size:.78rem">${inst.url||inst.instance_id}</code></td>
+      <td>${status}</td>
+      <td>${cpu}</td>
+      <td>${ram}</td>
+      <td>${rooms}</td>
+      <td>${files}</td>
+    </tr>`;
+  });
+  const hubInfo=data.hub_port?`Hub: 127.0.0.1:${data.hub_port}`:'';
+  return `
+    <p style="font-size:.78rem;color:var(--dim);margin-bottom:.6rem">${hubInfo}</p>
+    <table class="cluster-table">
+      <thead><tr>
+        <th>Instance URL</th><th>Status</th>
+        <th>CPU</th><th>RAM</th><th>Rooms</th><th>Files</th>
+      </tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+}
+
+async function refreshCluster(){
+  const area=document.getElementById('cluster-area');
+  if(!area)return;
+  try{
+    const r=await fetch(_AP+'/api/cluster-stats');
+    if(!r.ok){area.innerHTML='<p class="cluster-na">Cluster stats unavailable.</p>';return;}
+    const data=await r.json();
+    area.innerHTML=renderCluster(data);
+  }catch(_){
+    area.innerHTML='<p class="cluster-na">Could not reach local mesh hub.</p>';
+  }
 }
 
 function startLogStream(){

@@ -912,6 +912,9 @@ def main() -> None:
     parser.add_argument("--history-limit", type=int, metavar="N", default=None)
     # mail.tm integration
     parser.add_argument("--mailtm-enabled", type=int, metavar="0|1", default=None)
+    # Local mesh (multi-instance on same machine)
+    parser.add_argument("--local-mesh-port", type=int, metavar="PORT", default=None)
+    parser.add_argument("--file-storage", metavar="PATH", default=None)
     # .env helper
     parser.add_argument(
         "--example",
@@ -1018,6 +1021,8 @@ def main() -> None:
         (args.spam_mail_window,              "SPAM_MAIL_WINDOW"),
         (args.history_limit,                 "HISTORY_LIMIT"),
         (args.mailtm_enabled,                "MAILTM_ENABLED"),
+        (args.local_mesh_port,               "LOCAL_MESH_PORT"),
+        (args.file_storage,                  "FILE_STORAGE"),
     ]
     for val, key in _flag_env:
         if val is not None:

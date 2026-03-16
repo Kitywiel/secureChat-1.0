@@ -146,3 +146,22 @@ restart.
 | Variable | Default | Description |
 |---|---|---|
 | `MAILTM_ENABLED` | `1` (enabled) | Set to `0` to disable the automatic mail.tm disposable-address integration. Only applies when `MAIL_DOMAIN` and `RELAY_SECRET` are both unset. |
+
+---
+
+## Local Mesh (multi-instance on the same machine)
+
+Run multiple secureChat instances on one machine and keep them in sync via the
+loopback interface.  Start the hub first, then start each server with both
+variables set.
+
+```
+python local_mesh.py          # start the hub (port 9000 by default)
+LOCAL_MESH_PORT=9000 FILE_STORAGE=storage PORT=5000 python run.py
+LOCAL_MESH_PORT=9000 FILE_STORAGE=storage PORT=5001 python run.py
+```
+
+| Variable | Default | Description |
+|---|---|---|
+| `LOCAL_MESH_PORT` | not set (disabled) | Port of the `local_mesh.py` hub on `127.0.0.1`. When set, this instance registers with the hub and chat messages are fanned out to all other registered instances in real time over loopback. |
+| `FILE_STORAGE` | not set (temp dirs) | Directory for shared file storage. When set, uploaded files are written here instead of a per-process temp directory, so any instance can serve the download regardless of which URL the uploader used. Set the same path on every instance. |

@@ -4530,3 +4530,214 @@ async def test_metrics_history_endpoint_returns_list(admin_client) -> None:
     assert resp.status == 200
     data = await resp.json()
     assert isinstance(data, list)
+
+
+# ---------------------------------------------------------------------------
+# Local mesh helpers (server.py)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_local_mesh_receive_handler_rejects_non_loopback(ws_client) -> None:
+    """POST /local-mesh/receive from a non-loopback address returns 403."""
+    # The test client uses 127.0.0.1 by default so we need to verify the
+    # handler itself checks the remote address.  We test this via the module
+    # directly rather than through the HTTP layer so we can inject a fake IP.
+    import server as _s
+    from unittest.mock import AsyncMock, MagicMock
+
+    req = MagicMock()
+    req.remote = "10.0.0.1"  # not loopback
+
+    with pytest.raises(Exception) as exc_info:
+        await _s.local_mesh_receive_handler(req)
+    # Should raise HTTPForbidden (status 403)
+    assert "403" in str(exc_info.value) or "Forbidden" in str(exc_info.value) or \
+           hasattr(exc_info.value, "status_code") and exc_info.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_local_mesh_receive_handler_broadcasts(ws_client) -> None:
+    """POST /local-mesh/receive from loopback broadcasts to WebSocket clients."""
+    import server as _s
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    broadcast_calls: list[tuple] = []
+
+    async def _fake_broadcast(room_id, payload, *, exclude=None, _from_peer=False):
+        broadcast_calls.append((room_id, payload, _from_peer))
+
+    req = MagicMock()
+    req.remote = "127.0.0.1"
+    req.json = AsyncMock(return_value={"room_id": "testroom1", "payload": '{"type":"message"}'})
+
+    with patch.object(_s, "_broadcast_to_room", side_effect=_fake_broadcast):
+        resp = await _s.local_mesh_receive_handler(req)
+
+    assert resp.status == 200
+    assert len(broadcast_calls) == 1
+    room_id, payload, from_peer = broadcast_calls[0]
+    assert room_id == "testroom1"
+    assert from_peer is True   # must not re-forward
+
+
+@pytest.mark.asyncio
+async def test_local_mesh_stats_handler_rejects_non_loopback(ws_client) -> None:
+    """GET /local-mesh/stats from a non-loopback address returns 403."""
+    import server as _s
+    from unittest.mock import MagicMock
+
+    req = MagicMock()
+    req.remote = "192.168.1.5"  # not loopback
+
+    with pytest.raises(Exception) as exc_info:
+        await _s.local_mesh_stats_handler(req)
+    assert "403" in str(exc_info.value) or "Forbidden" in str(exc_info.value) or \
+           hasattr(exc_info.value, "status_code") and exc_info.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_local_mesh_stats_handler_returns_metrics(ws_client) -> None:
+    """GET /local-mesh/stats from loopback returns a JSON metrics dict."""
+    import json as _json
+    import server as _s
+    from unittest.mock import MagicMock
+
+    req = MagicMock()
+    req.remote = "127.0.0.1"
+
+    resp = await _s.local_mesh_stats_handler(req)
+    assert resp.status == 200
+    data = _json.loads(resp.body)
+    assert "instance_id" in data
+    assert "open_rooms" in data
+    assert "ts" in data
+
+
+def test_save_and_load_slot_from_storage(tmp_path) -> None:
+    """_save_slot_to_storage / _load_slot_from_storage round-trip works correctly."""
+    import server as _s
+
+    original = _s._FILE_STORAGE_DIR
+    try:
+        _s._FILE_STORAGE_DIR = tmp_path
+        token = "testtoken1234"
+        slot_dir = tmp_path / token
+        slot_dir.mkdir()
+        # Write a dummy file so the slot has something to serve
+        (slot_dir / "hello.txt").write_bytes(b"hello world")
+
+        slot = {
+            "tmp_dir":      slot_dir,
+            "filename":     "hello.txt",
+            "size":         11,
+            "expires_at":   9999999999.0,
+            "passcode_hash": None,
+            "encrypted":    False,
+        }
+        _s._save_slot_to_storage(token, slot)
+
+        loaded = _s._load_slot_from_storage(token)
+        assert loaded is not None
+        assert loaded["filename"] == "hello.txt"
+        assert loaded["size"] == 11
+        assert loaded["encrypted"] is False
+    finally:
+        _s._FILE_STORAGE_DIR = original
+
+
+def test_load_slot_from_storage_expired(tmp_path) -> None:
+    """_load_slot_from_storage returns None for expired slots."""
+    import server as _s, time as _time
+
+    original = _s._FILE_STORAGE_DIR
+    try:
+        _s._FILE_STORAGE_DIR = tmp_path
+        token = "expiredtoken"
+        slot_dir = tmp_path / token
+        slot_dir.mkdir()
+
+        slot = {
+            "tmp_dir":      slot_dir,
+            "filename":     "file.txt",
+            "size":         5,
+            "expires_at":   _time.time() - 1,  # already expired
+            "passcode_hash": None,
+            "encrypted":    False,
+        }
+        _s._save_slot_to_storage(token, slot)
+        loaded = _s._load_slot_from_storage(token)
+        assert loaded is None
+    finally:
+        _s._FILE_STORAGE_DIR = original
+
+
+def test_load_slot_from_storage_returns_none_without_file_storage() -> None:
+    """_load_slot_from_storage returns None when FILE_STORAGE is not configured."""
+    import server as _s
+
+    original = _s._FILE_STORAGE_DIR
+    try:
+        _s._FILE_STORAGE_DIR = None
+        result = _s._load_slot_from_storage("any-token")
+        assert result is None
+    finally:
+        _s._FILE_STORAGE_DIR = original
+
+
+@pytest.mark.asyncio
+async def test_cluster_stats_endpoint_requires_auth(admin_client) -> None:
+    """GET /admin/api/cluster-stats without auth returns 401."""
+    resp = await admin_client.get("/admin/api/cluster-stats")
+    assert resp.status == 401
+
+
+@pytest.mark.asyncio
+async def test_cluster_stats_endpoint_returns_json_when_disabled(admin_client) -> None:
+    """Authenticated GET /admin/api/cluster-stats with no hub configured returns JSON."""
+    import server as _s
+    original_port = _s.LOCAL_MESH_PORT
+    try:
+        _s.LOCAL_MESH_PORT = 0  # disabled
+        await admin_client.post(
+            "/admin/login",
+            json={"passcode": _s._ADMIN_PASSCODE},
+        )
+        resp = await admin_client.get("/admin/api/cluster-stats")
+        assert resp.status == 200
+        data = await resp.json()
+        assert "instances" in data
+        assert isinstance(data["instances"], list)
+        assert "error" in data  # should explain hub not configured
+    finally:
+        _s.LOCAL_MESH_PORT = original_port
+
+
+@pytest.mark.asyncio
+async def test_share_upload_uses_file_storage_dir(tmp_path, ws_client) -> None:
+    """When FILE_STORAGE is configured, uploaded files land in FILE_STORAGE/<token>/."""
+    import io, server as _s
+
+    original_dir = _s._FILE_STORAGE_DIR
+    try:
+        _s._FILE_STORAGE_DIR = tmp_path
+        _s._share_slots.clear()
+
+        data = aiohttp.FormData()
+        data.add_field("file", io.BytesIO(b"test content"), filename="test.txt",
+                       content_type="text/plain")
+        resp = await ws_client.post("/share/upload", data=data)
+        assert resp.status == 200
+        body = await resp.json()
+        token = body["download_url"].split("/")[-1]
+
+        # File must be in FILE_STORAGE/<token>/test.txt
+        stored = tmp_path / token / "test.txt"
+        assert stored.is_file(), f"Expected file at {stored}"
+        assert stored.read_bytes() == b"test content"
+
+        # .meta.json must also exist for cross-instance downloads
+        meta_path = tmp_path / token / ".meta.json"
+        assert meta_path.is_file(), ".meta.json not written to FILE_STORAGE"
+    finally:
+        _s._FILE_STORAGE_DIR = original_dir
+        _s._share_slots.clear()

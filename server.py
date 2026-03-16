@@ -195,6 +195,22 @@ MAX_UPLOAD_BYTES = 10 * 1024 * 1024 * 1024  # 10 GB per file
 MAX_FILENAME_LEN = 200                       # characters in the sanitised filename
 _SHARE_TOKEN_BYTES = 32                      # 256-bit token → 43-char URL-safe base64
 
+# Shared file storage — when FILE_STORAGE is set, uploaded files are written to
+# a persistent directory instead of a per-process tempdir.  Multiple server
+# instances sharing the same directory can serve each other's uploads so
+# downloads work across URLs.
+_FILE_STORAGE_DIR: Path | None = (
+    Path(os.environ.get("FILE_STORAGE", "")).resolve()
+    if os.environ.get("FILE_STORAGE", "").strip()
+    else None
+)
+
+# Local mesh hub — when LOCAL_MESH_PORT is set, this instance registers with
+# the local_mesh.py hub running on 127.0.0.1:LOCAL_MESH_PORT.  Chat messages
+# are fanned out to all other registered instances over the loopback interface
+# so that conversations are in sync regardless of which URL the client used.
+LOCAL_MESH_PORT: int = int(os.environ.get("LOCAL_MESH_PORT", "0"))  # 0 = disabled
+
 # Inbox constants
 _INBOX_TOKEN_BYTES = 16                      # 128-bit token → ~22-char URL-safe base64 local part
 MAX_INBOX_MESSAGE_LEN = 65536                # max bytes per message body
@@ -1141,6 +1157,11 @@ async def _broadcast_to_room(
     # to avoid infinite forwarding loops)
     if not _from_peer and _mesh_peers:
         asyncio.ensure_future(_forward_to_peers(room_id, payload))
+    # Forward to local mesh hub so sibling instances on the same machine also
+    # receive the message (loopback, near-zero latency).  _from_peer=True
+    # prevents the receiving instances from re-forwarding.
+    if not _from_peer and LOCAL_MESH_PORT:
+        asyncio.ensure_future(_forward_to_local_mesh(room_id, payload))
 
 
 # ---------------------------------------------------------------------------
@@ -1202,7 +1223,16 @@ async def share_upload_handler(request: web.Request) -> web.Response:
         raise web.HTTPBadRequest(reason="Expected multipart/form-data")
 
     reader = await request.multipart()
-    tmp_dir = Path(tempfile.mkdtemp(prefix="sc_share_"))
+    # Generate the token first so we can use it as the storage directory name
+    # when FILE_STORAGE is configured.  This makes the slot directory name
+    # predictable and enables cross-instance downloads via the shared directory.
+    token = secrets.token_urlsafe(_SHARE_TOKEN_BYTES)
+    if _FILE_STORAGE_DIR is not None:
+        _FILE_STORAGE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp_dir = _FILE_STORAGE_DIR / token
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        tmp_dir = Path(tempfile.mkdtemp(prefix="sc_share_"))
     try:
         # Find the "file" part
         file_part = await reader.next()
@@ -1234,11 +1264,10 @@ async def share_upload_handler(request: web.Request) -> web.Response:
         except Exception:  # noqa: BLE001
             pass
 
-        token = secrets.token_urlsafe(_SHARE_TOKEN_BYTES)
         expires_at = time.time() + ttl_hours * 3600
         # Mark the slot as E2EE-encrypted if the uploader set the "e=1" query param.
         encrypted = request.query.get("e", "0") == "1"
-        _share_slots[token] = {
+        slot: dict = {
             "tmp_dir": tmp_dir,
             "filename": filename,
             "size": total,
@@ -1246,6 +1275,9 @@ async def share_upload_handler(request: web.Request) -> web.Response:
             "passcode_hash": _hash_passcode(passcode) if passcode else None,
             "encrypted": encrypted,
         }
+        _share_slots[token] = slot
+        # Persist metadata to FILE_STORAGE so sibling instances can serve downloads.
+        _save_slot_to_storage(token, slot)
         _stats["files_uploaded_count"] += 1
         _stats["files_uploaded_bytes"] += total
         logger.info("share upload  file=%s  size=%d  ttl=%dh  passcode=%s",
@@ -1276,9 +1308,17 @@ async def share_download_handler(request: web.Request) -> web.StreamResponse:
     For unencrypted slots:
       * If the slot requires a passcode, an HTML gate page is returned.
       * Otherwise, the file is streamed immediately (one-time).
+
+    Cross-instance fallback
+    -----------------------
+    When FILE_STORAGE is configured, a token uploaded by a sibling instance on
+    the same machine may not be present in this instance's ``_share_slots``.
+    In that case the handler falls back to ``_load_slot_from_storage`` which
+    reads the persisted metadata from the shared directory so downloads always
+    succeed regardless of which server URL the client uses.
     """
     token = request.match_info["token"]
-    slot = _share_slots.get(token)
+    slot = _share_slots.get(token) or _load_slot_from_storage(token)
 
     if slot is None:
         raise web.HTTPNotFound(reason="Link not found or already used")
@@ -1317,7 +1357,7 @@ async def share_download_handler(request: web.Request) -> web.StreamResponse:
 async def share_download_post_handler(request: web.Request) -> web.StreamResponse:
     """POST /share/download/{token} — verify passcode and deliver the file once."""
     token = request.match_info["token"]
-    slot = _share_slots.get(token)
+    slot = _share_slots.get(token) or _load_slot_from_storage(token)
 
     if slot is None:
         raise web.HTTPNotFound(reason="Link not found or already used")
@@ -3364,6 +3404,44 @@ async def _admin_metrics_history_handler(request: web.Request) -> web.Response:
     return resp
 
 
+async def _admin_cluster_stats_handler(request: web.Request) -> web.Response:
+    """GET /{admin}/api/cluster-stats — return live stats from all local mesh instances.
+
+    Queries the local mesh hub at ``127.0.0.1:LOCAL_MESH_PORT/local/stats``,
+    which in turn polls every registered server instance.  The result is a list
+    of per-instance metrics dicts that the admin panel's "Local Cluster" section
+    uses to render per-instance load cards.
+
+    Returns ``{"instances": [], "error": "…"}`` when the local mesh hub is not
+    configured or unreachable, so the admin panel can display a helpful message
+    instead of failing silently.
+    """
+    if not _valid_admin_session(request):
+        raise web.HTTPUnauthorized()
+    if not LOCAL_MESH_PORT:
+        data: dict = {
+            "instances": [],
+            "hub_port": 0,
+            "error": "LOCAL_MESH_PORT not configured — start local_mesh.py first",
+        }
+    else:
+        try:
+            async with _build_session("", 5.0) as sess:
+                async with sess.get(
+                    f"http://127.0.0.1:{LOCAL_MESH_PORT}/local/stats"
+                ) as hub_resp:
+                    data = await hub_resp.json(content_type=None)
+        except Exception as exc:  # noqa: BLE001
+            data = {
+                "instances": [],
+                "hub_port": LOCAL_MESH_PORT,
+                "error": str(exc),
+            }
+    resp = web.json_response(data)
+    _add_admin_security_headers(resp)
+    return resp
+
+
 def _register_admin_routes(app: web.Application) -> None:
     """Add admin-panel routes to *app* under the secret path prefix."""
     p = _ADMIN_PATH
@@ -3381,6 +3459,7 @@ def _register_admin_routes(app: web.Application) -> None:
     app.router.add_post(f"/{p}/api/ddos-unban", _admin_ddos_unban_handler)
     app.router.add_post(f"/{p}/api/slow-mode", _admin_slow_mode_handler)
     app.router.add_get(f"/{p}/api/metrics-history", _admin_metrics_history_handler)
+    app.router.add_get(f"/{p}/api/cluster-stats", _admin_cluster_stats_handler)
 
 
 # ---------------------------------------------------------------------------
@@ -3538,6 +3617,7 @@ def build_admin_app(db_path: Path | None = None) -> web.Application:
     app.router.add_post("/admin/api/ddos-unban", _admin_ddos_unban_handler)
     app.router.add_post("/admin/api/slow-mode", _admin_slow_mode_handler)
     app.router.add_get("/admin/api/metrics-history", _admin_metrics_history_handler)
+    app.router.add_get("/admin/api/cluster-stats", _admin_cluster_stats_handler)
     return app
 
 
@@ -3562,6 +3642,207 @@ def build_admin_app(db_path: Path | None = None) -> web.Application:
 _MESH_TOKEN: str = ""        # Set at startup; printed to console / shown by run.py
 _MESH_PATH: str = ""         # 50-char random URL segment hiding the mesh endpoints
 _mesh_peers: dict[str, dict] = {}   # peer_id → {url, token, mesh_path, connected_at}
+
+# Local mesh state — unique ID for this process instance so the hub can
+# distinguish it from sibling instances running on the same machine.
+_LOCAL_MESH_INSTANCE_ID: str = secrets.token_hex(8)
+
+
+# ---------------------------------------------------------------------------
+# Local mesh helpers — loopback-only inter-instance communication
+# ---------------------------------------------------------------------------
+
+def _local_mesh_base() -> str:
+    """Return the base URL of the local mesh hub, or empty string when disabled."""
+    return f"http://127.0.0.1:{LOCAL_MESH_PORT}" if LOCAL_MESH_PORT else ""
+
+
+async def _local_mesh_register(local_url: str) -> None:
+    """Register this instance with the local mesh hub (called on startup)."""
+    base = _local_mesh_base()
+    if not base:
+        return
+    try:
+        async with _build_session("", 5.0) as sess:
+            async with sess.post(
+                f"{base}/local/register",
+                json={"instance_id": _LOCAL_MESH_INSTANCE_ID, "url": local_url},
+            ) as resp:
+                if resp.status == 200:
+                    logger.info(
+                        "local mesh registered  instance=%s  hub=%s",
+                        _LOCAL_MESH_INSTANCE_ID,
+                        base,
+                    )
+                else:
+                    logger.warning(
+                        "local mesh registration failed  status=%d", resp.status
+                    )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("local mesh registration error: %s", exc)
+
+
+async def _local_mesh_unregister() -> None:
+    """Unregister this instance from the local mesh hub on clean shutdown."""
+    base = _local_mesh_base()
+    if not base:
+        return
+    try:
+        async with _build_session("", 3.0) as sess:
+            async with sess.delete(
+                f"{base}/local/register/{_LOCAL_MESH_INSTANCE_ID}",
+            ) as _resp:
+                pass
+    except Exception:  # noqa: BLE001
+        pass  # best-effort; hub may already be stopping
+
+
+async def _forward_to_local_mesh(room_id: str, payload: str) -> None:
+    """Forward a room message to the local mesh hub for fanout to all other instances.
+
+    Fire-and-forget — never raises.
+    """
+    base = _local_mesh_base()
+    if not base:
+        return
+    try:
+        async with _build_session("", 5.0) as sess:
+            async with sess.post(
+                f"{base}/local/forward",
+                json={
+                    "from_instance": _LOCAL_MESH_INSTANCE_ID,
+                    "room_id": room_id,
+                    "payload": payload,
+                },
+            ) as resp:
+                if resp.status >= 400:
+                    logger.warning(
+                        "local mesh forward failed  status=%d", resp.status
+                    )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("local mesh forward error: %s", exc)
+
+
+def _is_loopback(request: web.Request) -> bool:
+    """Return ``True`` if the request originates from the loopback address."""
+    return request.remote in ("127.0.0.1", "::1")
+
+
+async def local_mesh_receive_handler(request: web.Request) -> web.Response:
+    """POST /local-mesh/receive — receive a forwarded chat message from the hub.
+
+    This endpoint is **loopback-only**.  The local mesh hub calls it for every
+    other registered instance when any instance POSTs to ``/local/forward``.
+
+    The message is injected into the local WebSocket broadcast with
+    ``_from_peer=True`` to prevent re-forwarding it back to the external mesh
+    or to the hub again.
+    """
+    if not _is_loopback(request):
+        raise web.HTTPForbidden(reason="Local-only endpoint")
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise web.HTTPBadRequest(reason="JSON body required")
+
+    room_id = str(body.get("room_id", "")).strip()
+    payload = str(body.get("payload", "")).strip()
+
+    import re as _re  # noqa: PLC0415
+    if not _re.fullmatch(r"[A-Za-z0-9_\-]{1,64}", room_id):
+        raise web.HTTPBadRequest(reason="Invalid room_id")
+    if not payload:
+        raise web.HTTPBadRequest(reason="payload required")
+    if len(payload) > MAX_MESH_PAYLOAD_LEN:
+        raise web.HTTPBadRequest(reason="payload too large")
+
+    await _broadcast_to_room(room_id, payload, _from_peer=True)
+    return web.json_response({"ok": True})
+
+
+async def local_mesh_stats_handler(request: web.Request) -> web.Response:
+    """GET /local-mesh/stats — return this instance's live metrics (loopback-only).
+
+    Called by the local mesh hub when ``GET /local/stats`` is requested.
+    Returns a flat dict of metrics compatible with the cluster-stats admin panel.
+    """
+    if not _is_loopback(request):
+        raise web.HTTPForbidden(reason="Local-only endpoint")
+
+    return web.json_response({
+        "instance_id":         _LOCAL_MESH_INSTANCE_ID,
+        "open_rooms":          len(rooms),
+        "open_file_transfers": len(_share_slots),
+        "open_inbox_slots":    len(_inbox_slots),
+        "mesh_peers":          len(_mesh_peers),
+        **_stats,
+        **_get_sys_metrics(),
+        "ts": time.time(),
+    })
+
+
+# ---------------------------------------------------------------------------
+# File-storage helpers — cross-instance download support
+# ---------------------------------------------------------------------------
+
+def _file_storage_meta_path(token: str) -> Path | None:
+    """Return the path to the slot metadata JSON for *token*, or ``None`` if
+    FILE_STORAGE is not configured."""
+    if _FILE_STORAGE_DIR is None:
+        return None
+    return _FILE_STORAGE_DIR / token / ".meta.json"
+
+
+def _save_slot_to_storage(token: str, slot: dict) -> None:
+    """Persist share-slot metadata to FILE_STORAGE/<token>/.meta.json.
+
+    Allows other server instances sharing the same FILE_STORAGE directory to
+    reconstruct the slot and serve downloads without contacting the uploading
+    instance.
+    """
+    meta_path = _file_storage_meta_path(token)
+    if meta_path is None:
+        return
+    try:
+        meta_path.write_text(
+            json.dumps({
+                "filename":     slot["filename"],
+                "size":         slot["size"],
+                "expires_at":   slot["expires_at"],
+                "passcode_hash": slot.get("passcode_hash"),
+                "encrypted":    slot.get("encrypted", False),
+            }),
+            encoding="utf-8",
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _load_slot_from_storage(token: str) -> dict | None:
+    """Attempt to load a share slot from FILE_STORAGE/<token>/.meta.json.
+
+    Returns a slot dict compatible with the in-memory ``_share_slots`` format,
+    or ``None`` when FILE_STORAGE is not configured, the token is unknown, or
+    the slot has expired.
+    """
+    meta_path = _file_storage_meta_path(token)
+    if meta_path is None or not meta_path.is_file():
+        return None
+    try:
+        raw = json.loads(meta_path.read_text(encoding="utf-8"))
+        if time.time() > raw.get("expires_at", 0):
+            return None
+        return {
+            "tmp_dir":      meta_path.parent,
+            "filename":     raw["filename"],
+            "size":         raw["size"],
+            "expires_at":   raw["expires_at"],
+            "passcode_hash": raw.get("passcode_hash"),
+            "encrypted":    raw.get("encrypted", False),
+        }
+    except Exception:  # noqa: BLE001
+        return None
 
 
 async def mesh_peer_connect_handler(request: web.Request) -> web.Response:
@@ -4054,6 +4335,14 @@ def build_app(db_path: Path | None = None) -> web.Application:
                 "SMTP inbox disabled (set MAIL_DOMAIN env var to enable real email)"
             )
 
+        # Register with the local mesh hub so sibling instances on the same
+        # machine can sync chat messages and the cluster admin panel works.
+        if LOCAL_MESH_PORT:
+            host_for_mesh = os.environ.get("HOST", "127.0.0.1")
+            port_for_mesh = int(os.environ.get("PORT", "5000"))
+            local_url = f"http://{host_for_mesh}:{port_for_mesh}"
+            asyncio.create_task(_local_mesh_register(local_url))
+
     async def on_cleanup(app: web.Application) -> None:
         global _smtp_controller  # noqa: PLW0603
         for key in ("_cleanup_share_task", "_cleanup_inbox_task", "_cleanup_rooms_task", "_lockdown_broadcast_task", "_mailtm_poll_task", "_proxy_watchdog_task", "_metrics_collector_task"):
@@ -4068,6 +4357,9 @@ def build_app(db_path: Path | None = None) -> web.Application:
             _smtp_controller.stop()
             _smtp_controller = None
             logger.info("SMTP inbox server stopped")
+        # Deregister from local mesh hub on clean shutdown.
+        if LOCAL_MESH_PORT:
+            await _local_mesh_unregister()
 
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_cleanup)
@@ -4092,6 +4384,11 @@ def build_app(db_path: Path | None = None) -> web.Application:
     # served via _admin_index_handler which injects the secret path.
     app.router.add_get("/static/admin.html", _blocked_static_handler)
     app.router.add_static("/static", STATIC_DIR, show_index=False)
+
+    # Local mesh — loopback-only internal endpoints used by the local_mesh.py
+    # hub to deliver forwarded chat messages and collect per-instance stats.
+    app.router.add_post("/local-mesh/receive", local_mesh_receive_handler)
+    app.router.add_get("/local-mesh/stats",    local_mesh_stats_handler)
 
     # Mesh peer federation routes — all hidden behind the 50-char secret path.
     # The forward and link endpoints are authenticated by peer token; the
