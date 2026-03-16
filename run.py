@@ -485,14 +485,22 @@ def _start_tor(tor_exe: Path, server_port: int) -> tuple[str, object] | None:
     _HS_DIR.mkdir(parents=True, exist_ok=True)
     _TOR_DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-    print("\n  Starting Tor …  (may take up to 90 s on first run)")
+    print("\n  Starting Tor …  (may take up to 2 min on first run)")
 
     config: dict = {
-        "SocksPort":        _socks_port_for_tor(),
-        "ControlPort":      str(_free_port()),
-        "DataDirectory":    str(_TOR_DATA_DIR),
-        "HiddenServiceDir": str(_HS_DIR),
-        "HiddenServicePort": f"80 127.0.0.1:{server_port}",
+        "SocksPort":               _socks_port_for_tor(),
+        "ControlPort":             str(_free_port()),
+        "DataDirectory":           str(_TOR_DATA_DIR),
+        "HiddenServiceDir":        str(_HS_DIR),
+        "HiddenServicePort":       f"80 127.0.0.1:{server_port}",
+        # Prevent the common "stuck at 95%" bootstrap stall.
+        # Tor builds 3-hop circuits to complete bootstrap; if the first guard
+        # it tries is slow the default adaptive timeout can freeze for many
+        # minutes.  Setting an explicit 10-second ceiling per circuit-build
+        # attempt forces rapid retry with a different relay path.
+        "CircuitBuildTimeout":     "10",
+        "LearnCircuitBuildTimeout": "0",
+        "NumEntryGuards":          "8",
     }
     config.update(_find_geoip_files(tor_exe))
 
@@ -512,7 +520,7 @@ def _start_tor(tor_exe: Path, server_port: int) -> tuple[str, object] | None:
             tor_process = stem.process.launch_tor_with_config(
                 tor_cmd=str(tor_exe),
                 config=config,
-                timeout=90,
+                timeout=120,
                 init_msg_handler=_tor_log,
             )
             break
