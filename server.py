@@ -397,18 +397,11 @@ _room_meta: dict[str, dict] = {}
 # token → {"tmp_dir": Path, "filename": str, "size": int, "expires_at": float}
 _share_slots: dict[str, dict] = {}
 
-# Inbox registry
-# read_token → {
-#   "messages":   list[{body, email_from, subject, content_type, received_at}],
-#   "expires_at": float,   # Unix timestamp — inbox is destroyed at this time
-# }
-# Inboxes accept unlimited messages and allow unlimited reads until the TTL expires.
-_inbox_slots: dict[str, dict] = {}
-# Separate sender tokens — drop_token → read_token.
-# Senders are only given the drop_token so they cannot derive the read URL.
-_inbox_drop_tokens: dict[str, str] = {}
-# Tracks which inbox read_tokens have already emitted their first-read log line.
-_inbox_logged_tokens: set[str] = set()
+# Inbox slots are persisted to the SQLite database (inbox_slots +
+# inbox_messages tables).  The module-level path is set by build_app()'s
+# on_startup hook so that the InboxSmtpHandler thread can call the sync
+# helpers without access to the aiohttp event-loop.
+_inbox_db_path: Path | None = None
 
 # Lockdown state — set True by admin panel; cleared by admin panel deactivate.
 # While active, all non-admin HTTP/WS requests are redirected to the lockdown page.
@@ -808,9 +801,292 @@ def _init_db_sync(path: Path) -> None:
         ]:
             if col not in existing_cols:
                 con.execute(f"ALTER TABLE metrics_history ADD COLUMN {col} {ddl}")
+
+        # ── Inbox tables ──────────────────────────────────────────────────────
+        # inbox_slots: one row per allocated inbox.
+        #   mailtm_seen is a JSON array of already-fetched mail.tm message IDs
+        #   so re-delivery is avoided across server restarts.
+        #   first_read tracks whether the "inbox read" log line has been emitted.
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS inbox_slots (
+                read_token     TEXT    PRIMARY KEY,
+                drop_token     TEXT    NOT NULL UNIQUE,
+                expires_at     REAL    NOT NULL,
+                mailtm_address TEXT,
+                mailtm_bearer  TEXT,
+                mailtm_seen    TEXT    NOT NULL DEFAULT '[]',
+                first_read     INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+        con.execute(
+            "CREATE INDEX IF NOT EXISTS idx_inbox_slots_drop    ON inbox_slots(drop_token)"
+        )
+        con.execute(
+            "CREATE INDEX IF NOT EXISTS idx_inbox_slots_expires ON inbox_slots(expires_at)"
+        )
+        # inbox_messages: individual messages deposited into an inbox.
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS inbox_messages (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                read_token   TEXT    NOT NULL,
+                body         TEXT    NOT NULL DEFAULT '',
+                email_from   TEXT,
+                subject      TEXT,
+                content_type TEXT    NOT NULL DEFAULT 'text/plain',
+                received_at  REAL    NOT NULL
+            )
+            """
+        )
+        con.execute(
+            "CREATE INDEX IF NOT EXISTS idx_inbox_msg_token ON inbox_messages(read_token)"
+        )
+
         con.commit()
     finally:
         con.close()
+
+
+# ---------------------------------------------------------------------------
+# Inbox DB helpers — synchronous; called via asyncio.to_thread or directly
+# from the InboxSmtpHandler thread.
+# ---------------------------------------------------------------------------
+
+
+def _inbox_create_sync(
+    path: Path,
+    read_token: str,
+    drop_token: str,
+    expires_at: float,
+) -> None:
+    """Insert a new inbox slot row."""
+    con = sqlite3.connect(path)
+    try:
+        con.execute(
+            "INSERT INTO inbox_slots (read_token, drop_token, expires_at) VALUES (?, ?, ?)",
+            (read_token, drop_token, expires_at),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def _inbox_update_mailtm_sync(
+    path: Path,
+    read_token: str,
+    mailtm_address: str,
+    mailtm_bearer: str,
+) -> None:
+    """Persist mail.tm credentials onto an existing slot."""
+    con = sqlite3.connect(path)
+    try:
+        con.execute(
+            "UPDATE inbox_slots SET mailtm_address=?, mailtm_bearer=? WHERE read_token=?",
+            (mailtm_address, mailtm_bearer, read_token),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def _inbox_get_sync(path: Path, read_token: str) -> dict | None:
+    """Return the slot metadata dict for *read_token*, or ``None`` if absent."""
+    con = sqlite3.connect(path)
+    con.row_factory = sqlite3.Row
+    try:
+        row = con.execute(
+            "SELECT * FROM inbox_slots WHERE read_token=?", (read_token,)
+        ).fetchone()
+    finally:
+        con.close()
+    if row is None:
+        return None
+    return dict(row)
+
+
+def _inbox_get_by_drop_sync(path: Path, drop_token: str) -> tuple[str, dict] | None:
+    """Look up a slot by its drop token.  Returns ``(read_token, slot)`` or ``None``."""
+    con = sqlite3.connect(path)
+    con.row_factory = sqlite3.Row
+    try:
+        row = con.execute(
+            "SELECT * FROM inbox_slots WHERE drop_token=?", (drop_token,)
+        ).fetchone()
+    finally:
+        con.close()
+    if row is None:
+        return None
+    d = dict(row)
+    return d["read_token"], d
+
+
+def _inbox_add_message_sync(
+    path: Path,
+    read_token: str,
+    body: str,
+    email_from: str | None,
+    subject: str | None,
+    content_type: str,
+    received_at: float,
+) -> None:
+    """Append one message to an inbox."""
+    con = sqlite3.connect(path)
+    try:
+        con.execute(
+            """
+            INSERT INTO inbox_messages (read_token, body, email_from, subject,
+                                        content_type, received_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (read_token, body, email_from, subject, content_type, received_at),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def _inbox_get_messages_sync(path: Path, read_token: str) -> list[dict]:
+    """Return all messages for an inbox in receipt order."""
+    con = sqlite3.connect(path)
+    con.row_factory = sqlite3.Row
+    try:
+        rows = con.execute(
+            """
+            SELECT body, email_from, subject, content_type, received_at
+              FROM inbox_messages
+             WHERE read_token=?
+             ORDER BY id ASC
+            """,
+            (read_token,),
+        ).fetchall()
+    finally:
+        con.close()
+    return [dict(r) for r in rows]
+
+
+def _inbox_mark_first_read_sync(path: Path, read_token: str) -> bool:
+    """Atomically set first_read=1; returns True if this was the first call."""
+    con = sqlite3.connect(path)
+    try:
+        cur = con.execute(
+            "SELECT first_read FROM inbox_slots WHERE read_token=?", (read_token,)
+        )
+        row = cur.fetchone()
+        if row is None or row[0]:
+            con.close()
+            return False
+        con.execute(
+            "UPDATE inbox_slots SET first_read=1 WHERE read_token=?", (read_token,)
+        )
+        con.commit()
+    finally:
+        con.close()
+    return True
+
+
+def _inbox_count_sync(path: Path) -> int:
+    """Count inbox slots that have not yet expired."""
+    now = time.time()
+    con = sqlite3.connect(path)
+    try:
+        row = con.execute(
+            "SELECT COUNT(*) FROM inbox_slots WHERE expires_at > ?", (now,)
+        ).fetchone()
+        return row[0] if row else 0
+    finally:
+        con.close()
+
+
+def _inbox_cleanup_expired_sync(path: Path) -> list[str]:
+    """Delete all expired inbox slots and their messages.
+
+    Returns the list of deleted ``read_token`` values.
+    """
+    now = time.time()
+    con = sqlite3.connect(path)
+    try:
+        rows = con.execute(
+            "SELECT read_token FROM inbox_slots WHERE expires_at <= ?", (now,)
+        ).fetchall()
+        expired = [r[0] for r in rows]
+        if expired:
+            placeholders = ",".join("?" * len(expired))
+            con.execute(
+                f"DELETE FROM inbox_messages WHERE read_token IN ({placeholders})",
+                expired,
+            )
+            con.execute(
+                f"DELETE FROM inbox_slots WHERE read_token IN ({placeholders})",
+                expired,
+            )
+            con.commit()
+    finally:
+        con.close()
+    return expired
+
+
+def _inbox_wipe_all_sync(path: Path) -> None:
+    """Delete every inbox slot and message (called during lockdown)."""
+    con = sqlite3.connect(path)
+    try:
+        con.execute("DELETE FROM inbox_messages")
+        con.execute("DELETE FROM inbox_slots")
+        con.commit()
+    finally:
+        con.close()
+
+
+def _inbox_set_expires_sync(path: Path, read_token: str, expires_at: float) -> None:
+    """Update the TTL of an existing slot (used by tests to force expiry)."""
+    con = sqlite3.connect(path)
+    try:
+        con.execute(
+            "UPDATE inbox_slots SET expires_at=? WHERE read_token=?",
+            (expires_at, read_token),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def _inbox_get_mailtm_slots_sync(path: Path) -> list[dict]:
+    """Return all active (non-expired) slots that have a mailtm_bearer set."""
+    now = time.time()
+    con = sqlite3.connect(path)
+    con.row_factory = sqlite3.Row
+    try:
+        rows = con.execute(
+            """
+            SELECT read_token, expires_at, mailtm_bearer, mailtm_seen
+              FROM inbox_slots
+             WHERE expires_at > ? AND mailtm_bearer IS NOT NULL
+            """,
+            (now,),
+        ).fetchall()
+    finally:
+        con.close()
+    return [dict(r) for r in rows]
+
+
+def _inbox_update_mailtm_seen_sync(path: Path, read_token: str, seen_json: str) -> None:
+    """Persist the updated set of seen mail.tm message IDs."""
+    con = sqlite3.connect(path)
+    try:
+        con.execute(
+            "UPDATE inbox_slots SET mailtm_seen=? WHERE read_token=?",
+            (seen_json, read_token),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def _inbox_drop_token_get_sync(path: Path, drop_token: str) -> str | None:
+    """Return the read_token for *drop_token*, or ``None``."""
+    result = _inbox_get_by_drop_sync(path, drop_token)
+    return result[0] if result else None
 
 
 def _save_message_sync(
@@ -887,10 +1163,12 @@ def _delete_room_history_sync(path: Path, room_id: str) -> None:
 
 
 def _wipe_all_data_sync(path: Path) -> None:
-    """Delete every message in the DB.  Called during lockdown activation."""
+    """Delete every message and inbox row in the DB.  Called during lockdown activation."""
     con = sqlite3.connect(path)
     try:
         con.execute("DELETE FROM messages")
+        con.execute("DELETE FROM inbox_messages")
+        con.execute("DELETE FROM inbox_slots")
         con.commit()
     finally:
         con.close()
@@ -1734,44 +2012,69 @@ async def _mailtm_poll_all_inboxes() -> None:
     """Background task: poll mail.tm for new messages every 30 seconds."""
     while True:
         await asyncio.sleep(30)
-        for slot in list(_inbox_slots.values()):
-            bearer = slot.get("mailtm_bearer")
-            if not bearer:
-                continue
-            if time.time() > slot.get("expires_at", 0):
-                continue
-            seen: set = slot.setdefault("mailtm_seen", set())
+        if _inbox_db_path is None:
+            continue
+        db = _inbox_db_path
+        slots = await asyncio.to_thread(_inbox_get_mailtm_slots_sync, db)
+        for slot_row in slots:
+            bearer = slot_row["mailtm_bearer"]
+            read_token = slot_row["read_token"]
+            try:
+                seen: set = set(json.loads(slot_row.get("mailtm_seen") or "[]"))
+            except Exception:  # noqa: BLE001
+                seen = set()
             new_msgs = await _mailtm_fetch_messages(bearer, seen)
             for msg in new_msgs:
-                slot["messages"].append(msg)
+                await asyncio.to_thread(
+                    _inbox_add_message_sync,
+                    db,
+                    read_token,
+                    msg.get("body", ""),
+                    msg.get("email_from"),
+                    msg.get("subject"),
+                    msg.get("content_type", "text/plain"),
+                    msg.get("received_at", time.time()),
+                )
+                _stats["inbox_msgs_received_total"] += 1
                 logger.info(
                     "mail.tm message received  from=%.40s  subject=%r",
                     msg.get("email_from") or "",
                     (msg.get("subject") or "")[:60],
                 )
+            if new_msgs:
+                await asyncio.to_thread(
+                    _inbox_update_mailtm_seen_sync,
+                    db,
+                    read_token,
+                    json.dumps(list(seen)),
+                )
 
 
 class InboxSmtpHandler:
-    """aiosmtpd message handler — receives inbound SMTP and stores messages in inbox slots.
+    """aiosmtpd message handler — receives inbound SMTP and persists messages to SQLite.
 
     This handler runs in the aiosmtpd Controller's own thread/event-loop.
-    Appending to ``slot["messages"]`` is GIL-protected in CPython and safe for
-    concurrent access from the SMTP thread and the aiohttp event-loop thread.
+    All inbox state is now on disk; access goes through the synchronous DB
+    helpers using the module-level ``_inbox_db_path``.
     """
 
     async def handle_RCPT(
         self, server, session, envelope, address: str, rcpt_options
     ) -> str:
         """Accept mail only for tokens that map to an active inbox slot."""
+        if _inbox_db_path is None:
+            return "550 5.1.1 Inbox service unavailable"
         local = address.split("@")[0]
-        slot = _inbox_slots.get(local)
+        slot = _inbox_get_sync(_inbox_db_path, local)
         if slot is None or time.time() > slot["expires_at"]:
             return "550 5.1.1 User unknown or inbox unavailable"
         envelope.rcpt_tos.append(address)
         return "250 OK"
 
     async def handle_DATA(self, server, session, envelope) -> str:
-        """Parse the raw email and append its body to the matching inbox slot(s)."""
+        """Parse the raw email and persist its body to the matching inbox slot(s)."""
+        if _inbox_db_path is None:
+            return "550 5.1.1 Inbox service unavailable"
         raw = envelope.content
         if isinstance(raw, bytes):
             msg = _email_lib.message_from_bytes(raw, policy=_email_policy.default)
@@ -1825,19 +2128,23 @@ class InboxSmtpHandler:
                     )
 
         body = body_html or body_text or "(empty message)"
+        content_type = "text/html" if body_html else "text/plain"
+        now = time.time()
 
         for rcpt in envelope.rcpt_tos:
             local = rcpt.split("@")[0]
-            slot = _inbox_slots.get(local)
-            if slot is None or time.time() > slot["expires_at"]:
+            slot = _inbox_get_sync(_inbox_db_path, local)
+            if slot is None or now > slot["expires_at"]:
                 continue
-            slot["messages"].append({
-                "body":         body,
-                "email_from":   from_addr,
-                "subject":      subject,
-                "content_type": "text/html" if body_html else "text/plain",
-                "received_at":  time.time(),
-            })
+            _inbox_add_message_sync(
+                _inbox_db_path,
+                local,
+                body,
+                from_addr,
+                subject,
+                content_type,
+                now,
+            )
             _stats["inbox_msgs_received_total"] += 1
             logger.info(
                 "inbox email received  token=…%s  from=%.40s  subject=%r",
@@ -1873,6 +2180,7 @@ async def inbox_create_handler(request: web.Request) -> web.Response:
           "mailtm_enabled": true|false,
         }
     """
+    db: Path = request.app["db_path"]
     try:
         body = await request.json()
     except Exception:
@@ -1883,12 +2191,8 @@ async def inbox_create_handler(request: web.Request) -> web.Response:
     read_token = secrets.token_urlsafe(_INBOX_TOKEN_BYTES)
     drop_token = secrets.token_urlsafe(_INBOX_TOKEN_BYTES)
     expires_at = time.time() + ttl_seconds
-    slot: dict = {
-        "messages":   [],
-        "expires_at": expires_at,
-    }
-    _inbox_slots[read_token] = slot
-    _inbox_drop_tokens[drop_token] = read_token
+
+    await asyncio.to_thread(_inbox_create_sync, db, read_token, drop_token, expires_at)
     _stats["inbox_created_total"] += 1
 
     # ── Determine the real email address ──────────────────────────────────
@@ -1902,7 +2206,13 @@ async def inbox_create_handler(request: web.Request) -> web.Response:
         # Auto-provision a free mail.tm mailbox so any server can deliver here
         mailtm_extras = await _mailtm_provision(_INBOX_TOKEN_BYTES)
         if mailtm_extras:
-            slot.update(mailtm_extras)
+            await asyncio.to_thread(
+                _inbox_update_mailtm_sync,
+                db,
+                read_token,
+                mailtm_extras["mailtm_address"],
+                mailtm_extras["mailtm_bearer"],
+            )
             address = mailtm_extras["mailtm_address"]
             mailtm_enabled = True
             logger.info("mail.tm inbox provisioned  address=%s  ttl=%dm", address, ttl_minutes)
@@ -1932,14 +2242,13 @@ async def inbox_create_handler(request: web.Request) -> web.Response:
 
 async def inbox_drop_handler(request: web.Request) -> web.Response:
     """POST /inbox/{token}/drop — sender deposits a message (unlimited deposits allowed)."""
+    db: Path = request.app["db_path"]
     drop_token = request.match_info["token"]
-    read_token = _inbox_drop_tokens.get(drop_token)
-    slot = _inbox_slots.get(read_token) if read_token is not None else None
-    if slot is None:
+    result = await asyncio.to_thread(_inbox_get_by_drop_sync, db, drop_token)
+    if result is None:
         raise web.HTTPNotFound(reason="Inbox not found")
+    read_token, slot = result
     if time.time() > slot["expires_at"]:
-        _inbox_slots.pop(read_token, None)
-        _inbox_drop_tokens.pop(drop_token, None)
         raise web.HTTPGone(reason="Inbox has expired")
     try:
         body = await request.json()
@@ -1953,13 +2262,10 @@ async def inbox_drop_handler(request: web.Request) -> web.Response:
             max_size=MAX_INBOX_MESSAGE_LEN,
             actual_size=len(message),
         )
-    slot["messages"].append({
-        "body":         message,
-        "email_from":   None,
-        "subject":      None,
-        "content_type": "text/plain",
-        "received_at":  time.time(),
-    })
+    await asyncio.to_thread(
+        _inbox_add_message_sync,
+        db, read_token, message, None, None, "text/plain", time.time(),
+    )
     _stats["inbox_msgs_received_total"] += 1
     logger.info("inbox filled  token=…%s", drop_token[-6:])
     return web.json_response({"ok": True})
@@ -1981,29 +2287,30 @@ async def inbox_read_handler(request: web.Request) -> web.Response:
           "count": <int>
         }
     """
+    db: Path = request.app["db_path"]
     token = request.match_info["token"]
-    slot = _inbox_slots.get(token)
+    slot = await asyncio.to_thread(_inbox_get_sync, db, token)
     if slot is None:
         raise web.HTTPGone(reason="Inbox not found or expired")
     if time.time() > slot["expires_at"]:
-        _inbox_slots.pop(token, None)
         raise web.HTTPGone(reason="Inbox has expired")
-    if token not in _inbox_logged_tokens:
-        _inbox_logged_tokens.add(token)
-        logger.info("inbox read  token=…%s  count=%d", token[-6:], len(slot["messages"]))
+    msgs = await asyncio.to_thread(_inbox_get_messages_sync, db, token)
+    is_first = await asyncio.to_thread(_inbox_mark_first_read_sync, db, token)
+    if is_first:
+        logger.info("inbox read  token=…%s  count=%d", token[-6:], len(msgs))
     return web.json_response({
-        "messages":   slot["messages"],
+        "messages":   msgs,
         "expires_at": slot["expires_at"],
-        "count":      len(slot["messages"]),
+        "count":      len(msgs),
     })
 
 
 async def inbox_read_page_handler(request: web.Request) -> web.Response:
     """GET /inbox/{token} — serve the full HTML mail-reader page."""
+    db: Path = request.app["db_path"]
     token = request.match_info["token"]
-    slot = _inbox_slots.get(token)
+    slot = await asyncio.to_thread(_inbox_get_sync, db, token)
     if slot is None or time.time() > slot["expires_at"]:
-        _inbox_slots.pop(token, None)
         raise web.HTTPGone(reason="Inbox not found or expired")
     mail_host = MAIL_DOMAIN or request.host or "localhost"
     address = f"{token}@{mail_host}"
@@ -2016,13 +2323,13 @@ async def inbox_read_page_handler(request: web.Request) -> web.Response:
 
 async def inbox_drop_page_handler(request: web.Request) -> web.Response:
     """GET /inbox/{token}/drop — serve the sender HTML page."""
+    db: Path = request.app["db_path"]
     drop_token = request.match_info["token"]
-    read_token = _inbox_drop_tokens.get(drop_token)
-    slot = _inbox_slots.get(read_token) if read_token else None
-    if slot is None or time.time() > slot["expires_at"]:
-        if read_token:
-            _inbox_slots.pop(read_token, None)
-        _inbox_drop_tokens.pop(drop_token, None)
+    result = await asyncio.to_thread(_inbox_get_by_drop_sync, db, drop_token)
+    if result is None:
+        raise web.HTTPGone(reason="Inbox not found or expired")
+    read_token, slot = result
+    if time.time() > slot["expires_at"]:
         raise web.HTTPGone(reason="Inbox not found or expired")
     host = MAIL_DOMAIN or request.host or "localhost"
     address = f"{read_token}@{host}"
@@ -2080,6 +2387,8 @@ async def inbox_relay_handler(request: web.Request) -> web.Response:
     """
     if not RELAY_SECRET:
         raise web.HTTPNotFound()  # endpoint doesn't exist unless configured
+
+    db: Path = request.app["db_path"]
 
     # ── Authenticate ────────────────────────────────────────────────────────
     # Accept the secret via header, query-string, or body field.
@@ -2149,22 +2458,25 @@ async def inbox_relay_handler(request: web.Request) -> web.Response:
         raise web.HTTPBadRequest(reason="Missing inbox token (recipient/to/token field)")
 
     # ── Deposit into inbox ───────────────────────────────────────────────────
-    slot = _inbox_slots.get(token)
+    slot = await asyncio.to_thread(_inbox_get_sync, db, token)
     if slot is None or time.time() > slot["expires_at"]:
-        _inbox_slots.pop(token, None)
         raise web.HTTPNotFound(reason="Inbox not found or expired")
 
     body = body_html or body_text or "(empty message)"
     if len(body) > MAX_INBOX_MESSAGE_LEN:
         body = body[:MAX_INBOX_MESSAGE_LEN]
 
-    slot["messages"].append({
-        "body":         body,
-        "email_from":   from_addr or None,
-        "subject":      subject or None,
-        "content_type": "text/html" if body_html else "text/plain",
-        "received_at":  time.time(),
-    })
+    await asyncio.to_thread(
+        _inbox_add_message_sync,
+        db,
+        token,
+        body,
+        from_addr or None,
+        subject or None,
+        "text/html" if body_html else "text/plain",
+        time.time(),
+    )
+    _stats["inbox_msgs_received_total"] += 1
     logger.info(
         "inbox relay received  token=…%s  from=%.40s  subject=%r",
         token[-6:],
@@ -2175,18 +2487,12 @@ async def inbox_relay_handler(request: web.Request) -> web.Response:
 
 
 async def _cleanup_expired_inbox_slots() -> None:
-    """Background task: sweep expired inbox slots every 5 minutes."""
+    """Background task: sweep expired inbox slots from the DB every 5 minutes."""
     while True:
         await asyncio.sleep(300)
-        now = time.time()
-        expired = [t for t, s in list(_inbox_slots.items()) if now > s["expires_at"]]
-        for t in expired:
-            _inbox_slots.pop(t, None)
-            _inbox_logged_tokens.discard(t)
-        # Also remove any drop tokens that point to a now-removed read token
-        stale_drops = [dt for dt, rt in list(_inbox_drop_tokens.items()) if rt not in _inbox_slots]
-        for dt in stale_drops:
-            _inbox_drop_tokens.pop(dt, None)
+        if _inbox_db_path is None:
+            continue
+        expired = await asyncio.to_thread(_inbox_cleanup_expired_sync, _inbox_db_path)
         if expired:
             logger.info("cleaned up %d expired inbox slot(s)", len(expired))
 
@@ -2625,7 +2931,9 @@ async def _admin_stats_handler(request: web.Request) -> web.Response:
         "inactive_rooms": len(inactive_rooms),
         "invite_rooms": len(meta_rooms),
         "open_file_transfers": len(_share_slots),
-        "open_inbox_slots": len(_inbox_slots),
+        "open_inbox_slots": await asyncio.to_thread(
+            _inbox_count_sync, request.app["db_path"]
+        ),
         "rooms_by_destruct": by_destruct,
         **_get_sys_metrics(),
     })
@@ -3374,7 +3682,7 @@ async def _metrics_collector_task(db_path: Path) -> None:
                 m.get("sys_disk_percent"),
                 len(rooms),
                 len(_share_slots),
-                len(_inbox_slots),
+                _inbox_count_sync(db_path),
                 len(_mesh_peers),
             )
             if now - last_prune >= _PRUNE_EVERY:
@@ -3628,10 +3936,7 @@ async def _admin_lockdown_handler(request: web.Request) -> web.Response:
                 except Exception:  # noqa: BLE001
                     pass
 
-        # 3. Wipe in-memory data stores
-        _inbox_slots.clear()
-        _inbox_drop_tokens.clear()
-        _inbox_logged_tokens.clear()
+        # 3. Wipe in-memory data stores and DB inbox rows
         _share_slots.clear()
         _room_meta.clear()
         # Also clear login failure tracking so the admin can log back in after lockdown
@@ -3707,7 +4012,7 @@ def build_admin_app(db_path: Path | None = None) -> web.Application:
     app = web.Application()
 
     async def on_startup(app: web.Application) -> None:
-        global _admin_event_loop  # noqa: PLW0603
+        global _admin_event_loop, _inbox_db_path  # noqa: PLW0603
         _admin_event_loop = asyncio.get_running_loop()
         handler = _SseLogHandler()
         handler.setFormatter(logging.Formatter(
@@ -3726,6 +4031,7 @@ def build_admin_app(db_path: Path | None = None) -> web.Application:
             resolved = Path(_tmp)
         await init_db(resolved)
         app["db_path"] = resolved
+        _inbox_db_path = resolved
         logger.info("admin panel ready  (credentials printed to console at startup)")
 
     app.on_startup.append(on_startup)
@@ -3938,7 +4244,9 @@ async def local_mesh_stats_handler(request: web.Request) -> web.Response:
         "server_name":         SERVER_NAME,
         "open_rooms":          len(rooms),
         "open_file_transfers": len(_share_slots),
-        "open_inbox_slots":    len(_inbox_slots),
+        "open_inbox_slots":    (
+            _inbox_count_sync(_inbox_db_path) if _inbox_db_path else 0
+        ),
         "mesh_peers":          len(_mesh_peers),
         **_stats,
         **_get_sys_metrics(),
@@ -3979,9 +4287,6 @@ async def local_mesh_lockdown_handler(request: web.Request) -> web.Response:
                     shutil.rmtree(tmp_dir, ignore_errors=True)
                 except Exception:  # noqa: BLE001
                     pass
-        _inbox_slots.clear()
-        _inbox_drop_tokens.clear()
-        _inbox_logged_tokens.clear()
         _share_slots.clear()
         _room_meta.clear()
         _ADMIN_LOGIN_FAILURES.clear()
@@ -4535,7 +4840,7 @@ def build_app(db_path: Path | None = None) -> web.Application:
     app["db_path"] = resolved_db
 
     async def on_startup(app: web.Application) -> None:
-        global _admin_event_loop, _smtp_controller  # noqa: PLW0603
+        global _admin_event_loop, _smtp_controller, _inbox_db_path  # noqa: PLW0603
         _admin_event_loop = asyncio.get_running_loop()
         # Attach SSE log handler so live-log stream works
         handler = _SseLogHandler()
@@ -4546,6 +4851,7 @@ def build_app(db_path: Path | None = None) -> web.Application:
         logging.root.addHandler(handler)
 
         await init_db(app["db_path"])
+        _inbox_db_path = app["db_path"]
         logger.info("database ready  path=%s", app["db_path"])
         app["_cleanup_share_task"] = asyncio.create_task(_cleanup_expired_share_slots())
         app["_cleanup_inbox_task"] = asyncio.create_task(_cleanup_expired_inbox_slots())

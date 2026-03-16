@@ -1737,26 +1737,32 @@ async def test_inbox_create_ttl_minutes(ws_client) -> None:
     import server as _s
     import time
 
-    # Custom TTL = 15 minutes — look up by read_token (keyed in _inbox_slots)
+    # Custom TTL = 15 minutes — verify via DB helper
     resp = await ws_client.post("/inbox/create", json={"ttl_minutes": 15})
     body = await resp.json()
     read_token = body["read_url"].split("/")[2]
     expected = time.time() + 15 * 60
-    assert abs(_s._inbox_slots[read_token]["expires_at"] - expected) < 5
+    slot = _s._inbox_get_sync(_s._inbox_db_path, read_token)
+    assert slot is not None
+    assert abs(slot["expires_at"] - expected) < 5
 
     # TTL above maximum should be clamped to 1440 min (24 h)
     resp2 = await ws_client.post("/inbox/create", json={"ttl_minutes": 99999})
     body2 = await resp2.json()
     read_token2 = body2["read_url"].split("/")[2]
     max_expected = time.time() + 1440 * 60
-    assert _s._inbox_slots[read_token2]["expires_at"] <= max_expected + 5
+    slot2 = _s._inbox_get_sync(_s._inbox_db_path, read_token2)
+    assert slot2 is not None
+    assert slot2["expires_at"] <= max_expected + 5
 
     # TTL below minimum should be clamped to 1 min
     resp3 = await ws_client.post("/inbox/create", json={"ttl_minutes": 0})
     body3 = await resp3.json()
     read_token3 = body3["read_url"].split("/")[2]
     min_expected = time.time() + 1 * 60
-    assert abs(_s._inbox_slots[read_token3]["expires_at"] - min_expected) < 5
+    slot3 = _s._inbox_get_sync(_s._inbox_db_path, read_token3)
+    assert slot3 is not None
+    assert abs(slot3["expires_at"] - min_expected) < 5
 
 
 @pytest.mark.asyncio
@@ -1814,12 +1820,12 @@ async def test_inbox_accepts_multiple_messages(ws_client) -> None:
     assert first.status == 200
     assert second.status == 200
 
-    # Both messages should be stored — look up by read_token
-    import server as _s
+    # Both messages should be stored — check via the read API
     read_token = body["read_url"].split("/")[2]
-    slot = _s._inbox_slots.get(read_token)
-    assert slot is not None
-    assert len(slot["messages"]) == 2
+    read_resp = await ws_client.get(f"/inbox/{read_token}/read")
+    assert read_resp.status == 200
+    read_body = await read_resp.json()
+    assert read_body["count"] == 2
 
 
 @pytest.mark.asyncio
@@ -1858,9 +1864,9 @@ async def test_inbox_expired_drop_returns_410(ws_client) -> None:
     resp = await ws_client.post("/inbox/create", json={"ttl_minutes": 10})
     data = await resp.json()
     drop_token = data["drop_url"].split("/")[2]
-    read_token = _s._inbox_drop_tokens[drop_token]
-    # Force expiry via the read_token key in _inbox_slots
-    _s._inbox_slots[read_token]["expires_at"] = 0.0
+    read_token = data["read_url"].split("/")[2]
+    # Force expiry by writing 0.0 to the DB
+    _s._inbox_set_expires_sync(_s._inbox_db_path, read_token, 0.0)
     gone = await ws_client.post(f"/inbox/{drop_token}/drop", json={"message": "hi"})
     assert gone.status == 410
 
@@ -1899,10 +1905,9 @@ async def test_smtp_handler_fills_slot_plaintext(ws_client) -> None:
     result = await handler.handle_DATA(None, None, envelope)
 
     assert result.startswith("250")
-    slot = _s._inbox_slots.get(read_token)
-    assert slot is not None
-    assert len(slot["messages"]) == 1
-    msg = slot["messages"][0]
+    msgs = _s._inbox_get_messages_sync(_s._inbox_db_path, read_token)
+    assert len(msgs) == 1
+    msg = msgs[0]
     assert "123456" in msg["body"]
     assert msg["email_from"] == "alice@example.com"
     assert msg["subject"] == "Test verification code"
@@ -1932,10 +1937,9 @@ async def test_smtp_handler_fills_slot_html_email(ws_client) -> None:
     result = await handler.handle_DATA(None, None, envelope)
 
     assert result.startswith("250")
-    slot = _s._inbox_slots.get(read_token)
-    assert slot is not None
-    assert len(slot["messages"]) == 1
-    msg = slot["messages"][0]
+    msgs = _s._inbox_get_messages_sync(_s._inbox_db_path, read_token)
+    assert len(msgs) == 1
+    msg = msgs[0]
     assert "654321" in msg["body"]
     assert msg["content_type"] == "text/html"
 
@@ -2265,8 +2269,8 @@ async def test_lockdown_toggle_and_wipe(ws_client) -> None:
         assert (await act.json())["lockdown"] is True
         assert _s._lockdown_active is True
 
-        # Inbox should now be wiped (keyed by read_token in _inbox_slots)
-        assert read_token not in _s._inbox_slots
+        # Inbox should now be wiped (DB row deleted during lockdown)
+        assert _s._inbox_get_sync(_s._inbox_db_path, read_token) is None
 
         # Status endpoint should report lockdown active
         status = await ws_client.get(f"/{ap}/api/lockdown")
