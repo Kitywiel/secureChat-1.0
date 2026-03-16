@@ -801,6 +801,14 @@ def _join_mesh_peer(
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    # On Windows the default ProactorEventLoop uses IOCP which can emit
+    # WinError 995 ("I/O operation aborted") during aiohttp shutdown when a
+    # Tor subprocess is still open, producing an unhandled-exception traceback.
+    # The SelectorEventLoop is stable for all server workloads and avoids this.
+    if sys.platform == "win32":
+        import asyncio as _asyncio
+        _asyncio.set_event_loop_policy(_asyncio.WindowsSelectorEventLoopPolicy())
+
     parser = argparse.ArgumentParser(
         description="secureChat zero-config launcher",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1063,8 +1071,17 @@ def main() -> None:
 
     try:
         web.run_app(srv.build_app(), host=host, port=server_port, access_log=None)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, SystemExit):
         pass
+    except OSError as exc:
+        print(f"\n  ⚠️  Cannot start server: {exc}")
+        print(f"  Is another process already using port {server_port}?")
+    except RuntimeError as exc:
+        # On Windows the ProactorEventLoop can raise RuntimeError("Event loop is
+        # closed") during aiohttp's asyncio cleanup when a Tor subprocess is still
+        # open.  The SelectorEventLoop policy set above prevents this, but catch
+        # it here as a safety net for any remaining edge cases.
+        print(f"\n  ⚠️  Server stopped with an error: {exc}")
     finally:
         if tor_process is not None:
             try:

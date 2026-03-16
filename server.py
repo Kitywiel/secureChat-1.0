@@ -378,13 +378,16 @@ _room_meta: dict[str, dict] = {}
 _share_slots: dict[str, dict] = {}
 
 # Inbox registry
-# token → {
+# read_token → {
 #   "messages":   list[{body, email_from, subject, content_type, received_at}],
 #   "expires_at": float,   # Unix timestamp — inbox is destroyed at this time
 # }
 # Inboxes accept unlimited messages and allow unlimited reads until the TTL expires.
 _inbox_slots: dict[str, dict] = {}
-# Tracks which inbox tokens have already emitted their first-read log line.
+# Separate sender tokens — drop_token → read_token.
+# Senders are only given the drop_token so they cannot derive the read URL.
+_inbox_drop_tokens: dict[str, str] = {}
+# Tracks which inbox read_tokens have already emitted their first-read log line.
 _inbox_logged_tokens: set[str] = set()
 
 # Lockdown state — set True by admin panel; cleared by admin panel deactivate.
@@ -1833,20 +1836,24 @@ async def inbox_create_handler(request: web.Request) -> web.Response:
     ttl_minutes = int(body.get("ttl_minutes", INBOX_DEFAULT_TTL_MINUTES))
     ttl_minutes = max(INBOX_MIN_TTL_MINUTES, min(ttl_minutes, INBOX_MAX_TTL_MINUTES))
     ttl_seconds = ttl_minutes * 60
-    token = secrets.token_urlsafe(_INBOX_TOKEN_BYTES)
+    read_token = secrets.token_urlsafe(_INBOX_TOKEN_BYTES)
+    drop_token = secrets.token_urlsafe(_INBOX_TOKEN_BYTES)
     expires_at = time.time() + ttl_seconds
     slot: dict = {
         "messages":   [],
         "expires_at": expires_at,
     }
-    _inbox_slots[token] = slot
+    _inbox_slots[read_token] = slot
+    _inbox_drop_tokens[drop_token] = read_token
     _stats["inbox_created_total"] += 1
 
     # ── Determine the real email address ──────────────────────────────────
+    # Email addresses use the read_token so SMTP/relay delivery maps directly
+    # to the inbox slot without exposing the drop token to third parties.
     mailtm_enabled = False
     if MAIL_DOMAIN:
         # Local SMTP — use the configured domain
-        address = f"{token}@{MAIL_DOMAIN}"
+        address = f"{read_token}@{MAIL_DOMAIN}"
     elif MAILTM_ENABLED:
         # Auto-provision a free mail.tm mailbox so any server can deliver here
         mailtm_extras = await _mailtm_provision(_INBOX_TOKEN_BYTES)
@@ -1858,20 +1865,20 @@ async def inbox_create_handler(request: web.Request) -> web.Response:
         else:
             # mail.tm unavailable — fall back to request host
             mail_host = request.host or "localhost"
-            address = f"{token}@{mail_host}"
+            address = f"{read_token}@{mail_host}"
             logger.warning("mail.tm provisioning failed — inbox will be HTTP-drop only")
     else:
         mail_host = request.host or "localhost"
-        address = f"{token}@{mail_host}"
+        address = f"{read_token}@{mail_host}"
 
     if not mailtm_enabled:
-        logger.info("inbox created  address=%.6s@…  ttl=%dm", token, ttl_minutes)
+        logger.info("inbox created  address=%.6s@…  ttl=%dm", read_token, ttl_minutes)
 
     return web.json_response({
         "address":        address,
-        "drop_url":       f"/inbox/{token}/drop",
-        "read_url":       f"/inbox/{token}/read",
-        "reader_url":     f"/inbox/{token}",
+        "drop_url":       f"/inbox/{drop_token}/drop",
+        "read_url":       f"/inbox/{read_token}/read",
+        "reader_url":     f"/inbox/{read_token}",
         "expires_at":     expires_at,
         "smtp_enabled":   bool(MAIL_DOMAIN),
         "relay_enabled":  bool(RELAY_SECRET),
@@ -1881,12 +1888,14 @@ async def inbox_create_handler(request: web.Request) -> web.Response:
 
 async def inbox_drop_handler(request: web.Request) -> web.Response:
     """POST /inbox/{token}/drop — sender deposits a message (unlimited deposits allowed)."""
-    token = request.match_info["token"]
-    slot = _inbox_slots.get(token)
+    drop_token = request.match_info["token"]
+    read_token = _inbox_drop_tokens.get(drop_token)
+    slot = _inbox_slots.get(read_token) if read_token is not None else None
     if slot is None:
         raise web.HTTPNotFound(reason="Inbox not found")
     if time.time() > slot["expires_at"]:
-        _inbox_slots.pop(token, None)
+        _inbox_slots.pop(read_token, None)
+        _inbox_drop_tokens.pop(drop_token, None)
         raise web.HTTPGone(reason="Inbox has expired")
     try:
         body = await request.json()
@@ -1908,7 +1917,7 @@ async def inbox_drop_handler(request: web.Request) -> web.Response:
         "received_at":  time.time(),
     })
     _stats["inbox_msgs_received_total"] += 1
-    logger.info("inbox filled  token=…%s", token[-6:])
+    logger.info("inbox filled  token=…%s", drop_token[-6:])
     return web.json_response({"ok": True})
 
 
@@ -1963,15 +1972,18 @@ async def inbox_read_page_handler(request: web.Request) -> web.Response:
 
 async def inbox_drop_page_handler(request: web.Request) -> web.Response:
     """GET /inbox/{token}/drop — serve the sender HTML page."""
-    token = request.match_info["token"]
-    slot = _inbox_slots.get(token)
+    drop_token = request.match_info["token"]
+    read_token = _inbox_drop_tokens.get(drop_token)
+    slot = _inbox_slots.get(read_token) if read_token else None
     if slot is None or time.time() > slot["expires_at"]:
-        _inbox_slots.pop(token, None)
+        if read_token:
+            _inbox_slots.pop(read_token, None)
+        _inbox_drop_tokens.pop(drop_token, None)
         raise web.HTTPGone(reason="Inbox not found or expired")
     host = MAIL_DOMAIN or request.host or "localhost"
-    address = f"{token}@{host}"
+    address = f"{read_token}@{host}"
     html = (STATIC_DIR / "inbox.html").read_text(encoding="utf-8")
-    html = html.replace("__INBOX_TOKEN__", token)
+    html = html.replace("__INBOX_TOKEN__", drop_token)
     html = html.replace("__INBOX_ADDRESS__", address)
     html = html.replace("__INBOX_EXPIRES_AT__", str(slot["expires_at"]))
     return web.Response(text=html, content_type="text/html")
@@ -2127,6 +2139,10 @@ async def _cleanup_expired_inbox_slots() -> None:
         for t in expired:
             _inbox_slots.pop(t, None)
             _inbox_logged_tokens.discard(t)
+        # Also remove any drop tokens that point to a now-removed read token
+        stale_drops = [dt for dt, rt in list(_inbox_drop_tokens.items()) if rt not in _inbox_slots]
+        for dt in stale_drops:
+            _inbox_drop_tokens.pop(dt, None)
         if expired:
             logger.info("cleaned up %d expired inbox slot(s)", len(expired))
 
@@ -3236,6 +3252,7 @@ async def _admin_lockdown_handler(request: web.Request) -> web.Response:
 
         # 3. Wipe in-memory data stores
         _inbox_slots.clear()
+        _inbox_drop_tokens.clear()
         _inbox_logged_tokens.clear()
         _share_slots.clear()
         _room_meta.clear()
