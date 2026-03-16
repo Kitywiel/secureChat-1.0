@@ -179,6 +179,26 @@ Automatically join a remote peer at startup.  Set `--mesh-join` and
 
 ---
 
+## Local Mesh (multi-instance on the same machine)
+
+Run multiple secureChat instances on the same machine and keep them in sync
+over the loopback interface.  Start `local_mesh.py` once (in its own window or
+as a background process), then start each server instance with both options set
+to the same values.
+
+```
+python local_mesh.py                                        # start the hub
+python run.py --local-mesh-port 9000 --file-storage storage --port 5000
+python run.py --local-mesh-port 9000 --file-storage storage --port 5001
+```
+
+| Flag | Env var | Default | Description |
+|---|---|---|---|
+| `--local-mesh-port PORT` | `LOCAL_MESH_PORT` | not set (disabled) | Port of the `local_mesh.py` hub on `127.0.0.1`. When set, chat messages are synced to all other registered instances in real time over loopback. |
+| `--file-storage PATH` | `FILE_STORAGE` | not set (temp dirs) | Shared directory for uploaded files. When set, any instance can serve any upload — downloads work regardless of which URL the client used. Set the same path on every instance. |
+
+---
+
 ## Requirements
 
 - Python 3.9 or newer — <https://www.python.org/downloads/>
