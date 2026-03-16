@@ -44,11 +44,19 @@ _FILE_STORAGE_PATH = os.environ.get("FILE_STORAGE", "storage")
 # Default timeout for outbound HTTP calls to registered instances.
 _CLIENT_TIMEOUT_SEC: float = 5.0
 
+# Seconds of silence before an instance is considered stale and evicted.
+# A successful /local-mesh/stats response resets the clock; an instance that
+# can't be reached for this long is automatically removed from the registry.
+_EVICT_AFTER_SEC: float = float(os.environ.get("MESH_EVICT_SEC", "120"))
+
+# How often the background eviction task runs (seconds).
+_EVICT_POLL_SEC: float = 30.0
+
 # ---------------------------------------------------------------------------
 # In-memory registries
 # ---------------------------------------------------------------------------
 
-# instance_id → {"url": str, "registered_at": float}
+# instance_id → {"url": str, "registered_at": float, "last_seen": float}
 _instances: dict[str, dict] = {}
 
 # ---------------------------------------------------------------------------
