@@ -41,6 +41,9 @@ from aiohttp import web
 LOCAL_MESH_PORT: int = int(os.environ.get("LOCAL_MESH_PORT", "9000"))
 _FILE_STORAGE_PATH = os.environ.get("FILE_STORAGE", "storage")
 
+# Default timeout for outbound HTTP calls to registered instances.
+_CLIENT_TIMEOUT_SEC: float = 5.0
+
 # ---------------------------------------------------------------------------
 # In-memory registries
 # ---------------------------------------------------------------------------
@@ -58,7 +61,11 @@ async def register_handler(request: web.Request) -> web.Response:
 
     Body::
 
-        {"instance_id": "<unique hex>", "url": "http://127.0.0.1:5000"}
+        {
+            "instance_id": "<unique hex>",
+            "url":         "http://127.0.0.1:5000",
+            "server_name": "<optional display name>"
+        }
     """
     try:
         body = await request.json()
@@ -67,11 +74,20 @@ async def register_handler(request: web.Request) -> web.Response:
 
     instance_id = str(body.get("instance_id", "")).strip()
     url = str(body.get("url", "")).strip().rstrip("/")
+    server_name = str(body.get("server_name", "")).strip()
 
     if not instance_id or not url:
         raise web.HTTPBadRequest(reason="instance_id and url required")
 
-    _instances[instance_id] = {"url": url, "registered_at": time.time()}
+    # Preserve registration time when the instance is re-registering
+    # (e.g. after a restart) so the cluster table shows the original join time.
+    existing = _instances.get(instance_id)
+    registered_at = existing["registered_at"] if existing else time.time()
+    _instances[instance_id] = {
+        "url": url,
+        "server_name": server_name,
+        "registered_at": registered_at,
+    }
     return web.json_response({"ok": True, "instance_id": instance_id})
 
 
@@ -126,7 +142,7 @@ async def _fanout(from_id: str, room_id: str, payload: str) -> None:
     if not targets:
         return
     async with aiohttp.ClientSession(
-        timeout=aiohttp.ClientTimeout(total=5.0)
+        timeout=aiohttp.ClientTimeout(total=_CLIENT_TIMEOUT_SEC)
     ) as sess:
         for _iid, url in targets:
             try:
@@ -154,12 +170,13 @@ async def stats_handler(request: web.Request) -> web.Response:
     """
     results: list[dict] = []
     async with aiohttp.ClientSession(
-        timeout=aiohttp.ClientTimeout(total=5.0)
+        timeout=aiohttp.ClientTimeout(total=_CLIENT_TIMEOUT_SEC)
     ) as sess:
         for iid, info in list(_instances.items()):
             entry: dict = {
                 "instance_id": iid,
                 "url": info["url"],
+                "server_name": info.get("server_name", ""),
                 "registered_at": info["registered_at"],
                 "ok": False,
             }
@@ -174,10 +191,18 @@ async def stats_handler(request: web.Request) -> web.Response:
                 entry["error"] = str(exc)
             results.append(entry)
 
+    # Compute cluster-wide totals for the admin panel.
+    total_inbox_msgs = sum(
+        inst.get("inbox_msgs_received_total", 0)
+        for inst in results
+        if inst.get("ok")
+    )
+
     return web.json_response({
         "instances": results,
         "hub_port": LOCAL_MESH_PORT,
         "file_storage": _FILE_STORAGE_PATH,
+        "cluster_inbox_msgs_total": total_inbox_msgs,
     })
 
 

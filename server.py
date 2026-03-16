@@ -211,6 +211,10 @@ _FILE_STORAGE_DIR: Path | None = (
 # so that conversations are in sync regardless of which URL the client used.
 LOCAL_MESH_PORT: int = int(os.environ.get("LOCAL_MESH_PORT", "0"))  # 0 = disabled
 
+# Optional human-readable display name for this server instance.  Shown in
+# the cluster admin table as "{url} | {SERVER_NAME}" when set.
+SERVER_NAME: str = os.environ.get("SERVER_NAME", "").strip()
+
 # Inbox constants
 _INBOX_TOKEN_BYTES = 16                      # 128-bit token → ~22-char URL-safe base64 local part
 MAX_INBOX_MESSAGE_LEN = 65536                # max bytes per message body
@@ -3442,6 +3446,129 @@ async def _admin_cluster_stats_handler(request: web.Request) -> web.Response:
     return resp
 
 
+async def _admin_cluster_lockdown_handler(request: web.Request) -> web.Response:
+    """POST /{admin}/api/cluster-lockdown — activate/deactivate lockdown on all cluster instances.
+
+    Body: ``{"action": "activate" | "deactivate", "instance_id": "<id>"}``
+
+    When ``instance_id`` is omitted or ``"all"``, the action is sent to every
+    registered instance (global cluster lockdown).  When a specific
+    ``instance_id`` is provided, only that instance is affected.
+
+    Requires an active admin session cookie.
+    """
+    if not _valid_admin_session(request):
+        raise web.HTTPForbidden(reason="Not authenticated")
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    action = str(body.get("action", "")).strip().lower()
+    target_id = str(body.get("instance_id", "all")).strip()
+    if action not in ("activate", "deactivate"):
+        raise web.HTTPBadRequest(reason="action must be 'activate' or 'deactivate'")
+
+    if not LOCAL_MESH_PORT:
+        raise web.HTTPBadRequest(reason="LOCAL_MESH_PORT not configured")
+
+    # Fetch the current instance list from the hub.
+    try:
+        async with _build_session("", 5.0) as sess:
+            async with sess.get(
+                f"http://127.0.0.1:{LOCAL_MESH_PORT}/local/stats"
+            ) as hub_resp:
+                hub_data = await hub_resp.json(content_type=None)
+    except Exception as exc:  # noqa: BLE001
+        raise web.HTTPBadGateway(reason=f"Cannot reach hub: {exc}") from exc
+
+    results: list[dict] = []
+    instances = hub_data.get("instances", [])
+    for inst in instances:
+        iid = inst.get("instance_id", "")
+        iurl = inst.get("url", "")
+        if not iurl:
+            continue
+        if target_id not in ("all", "") and iid != target_id:
+            continue
+        try:
+            async with _build_session("", 5.0) as sess:
+                async with sess.post(
+                    f"{iurl}/local-mesh/lockdown",
+                    json={"action": action},
+                ) as resp:
+                    results.append({
+                        "instance_id": iid,
+                        "url": iurl,
+                        "ok": resp.status == 200,
+                    })
+        except Exception as exc:  # noqa: BLE001
+            results.append({"instance_id": iid, "url": iurl, "ok": False, "error": str(exc)})
+
+    resp = web.json_response({"action": action, "results": results})
+    _add_admin_security_headers(resp)
+    return resp
+
+
+async def _admin_cluster_logs_handler(request: web.Request) -> web.Response:
+    """GET /{admin}/api/cluster-logs?instance_url=<url>&n=<lines> — fetch log lines from a cluster instance.
+
+    Proxies ``GET /local-mesh/logs`` on the target instance through the admin
+    panel so operators can view logs from any instance without leaving the panel.
+    ``instance_url`` must be one of the URLs returned by ``/api/cluster-stats``.
+
+    Requires an active admin session cookie.
+    """
+    if not _valid_admin_session(request):
+        raise web.HTTPForbidden(reason="Not authenticated")
+
+    instance_url = request.rel_url.query.get("instance_url", "").strip().rstrip("/")
+    if not instance_url:
+        raise web.HTTPBadRequest(reason="instance_url required")
+
+    # Defence-in-depth: only allow loopback HTTP URLs so this endpoint cannot
+    # be used as an SSRF proxy even if the hub is somehow compromised.
+    import urllib.parse as _urlparse  # noqa: PLC0415
+    _parsed = _urlparse.urlparse(instance_url)
+    if _parsed.scheme != "http" or _parsed.hostname not in ("127.0.0.1", "localhost", "::1"):
+        raise web.HTTPForbidden(reason="instance_url must be a loopback http:// URL")
+
+    # Validate the URL is a registered cluster instance (security: prevent
+    # the admin panel from being used as an open SSRF proxy).
+    if not LOCAL_MESH_PORT:
+        raise web.HTTPBadRequest(reason="LOCAL_MESH_PORT not configured")
+    try:
+        async with _build_session("", 5.0) as sess:
+            async with sess.get(
+                f"http://127.0.0.1:{LOCAL_MESH_PORT}/local/stats"
+            ) as hub_resp:
+                hub_data = await hub_resp.json(content_type=None)
+    except Exception as exc:  # noqa: BLE001
+        raise web.HTTPBadGateway(reason=f"Cannot reach hub: {exc}") from exc
+
+    known_urls = {inst.get("url", "").rstrip("/") for inst in hub_data.get("instances", [])}
+    if instance_url not in known_urls:
+        raise web.HTTPForbidden(reason="instance_url is not a registered cluster instance")
+
+    try:
+        n = int(request.rel_url.query.get("n", "200"))
+        n = max(1, min(n, 500))
+    except (ValueError, TypeError):
+        n = 200
+
+    try:
+        async with _build_session("", 5.0) as sess:
+            async with sess.get(f"{instance_url}/local-mesh/logs?n={n}") as logs_resp:
+                data = await logs_resp.json(content_type=None)
+    except Exception as exc:  # noqa: BLE001
+        raise web.HTTPBadGateway(reason=f"Cannot reach instance: {exc}") from exc
+
+    resp = web.json_response(data)
+    _add_admin_security_headers(resp)
+    return resp
+
+
 def _register_admin_routes(app: web.Application) -> None:
     """Add admin-panel routes to *app* under the secret path prefix."""
     p = _ADMIN_PATH
@@ -3460,6 +3587,8 @@ def _register_admin_routes(app: web.Application) -> None:
     app.router.add_post(f"/{p}/api/slow-mode", _admin_slow_mode_handler)
     app.router.add_get(f"/{p}/api/metrics-history", _admin_metrics_history_handler)
     app.router.add_get(f"/{p}/api/cluster-stats", _admin_cluster_stats_handler)
+    app.router.add_post(f"/{p}/api/cluster-lockdown", _admin_cluster_lockdown_handler)
+    app.router.add_get(f"/{p}/api/cluster-logs", _admin_cluster_logs_handler)
 
 
 # ---------------------------------------------------------------------------
@@ -3618,6 +3747,10 @@ def build_admin_app(db_path: Path | None = None) -> web.Application:
     app.router.add_post("/admin/api/slow-mode", _admin_slow_mode_handler)
     app.router.add_get("/admin/api/metrics-history", _admin_metrics_history_handler)
     app.router.add_get("/admin/api/cluster-stats", _admin_cluster_stats_handler)
+    app.router.add_post("/admin/api/cluster-lockdown", _admin_cluster_lockdown_handler)
+    app.router.add_get("/admin/api/cluster-logs", _admin_cluster_logs_handler)
+    app.router.add_post("/local-mesh/lockdown", local_mesh_lockdown_handler)
+    app.router.add_get("/local-mesh/logs", local_mesh_logs_handler)
     return app
 
 
@@ -3645,7 +3778,33 @@ _mesh_peers: dict[str, dict] = {}   # peer_id → {url, token, mesh_path, connec
 
 # Local mesh state — unique ID for this process instance so the hub can
 # distinguish it from sibling instances running on the same machine.
+# The ID is persisted to a per-port file so a restarting instance always
+# re-uses the same ID and the hub keeps it at its original slot instead of
+# showing a stale offline entry alongside a brand-new entry.
 _LOCAL_MESH_INSTANCE_ID: str = secrets.token_hex(8)
+
+
+def _get_or_create_instance_id(port: int) -> str:
+    """Load the persisted instance ID for *port* or create and save a new one.
+
+    The ID is stored in ``_HERE/.local_instance_<port>.id`` next to
+    server.py.  This ensures that a restarted instance re-registers with the
+    same ID so the hub doesn't accumulate stale duplicate entries.
+    """
+    id_file = _HERE / f".local_instance_{port}.id"
+    try:
+        if id_file.is_file():
+            existing = id_file.read_text(encoding="utf-8").strip()
+            if existing:
+                return existing
+    except OSError:
+        pass
+    new_id = secrets.token_hex(8)
+    try:
+        id_file.write_text(new_id, encoding="utf-8")
+    except OSError:
+        pass
+    return new_id
 
 
 # ---------------------------------------------------------------------------
@@ -3666,7 +3825,11 @@ async def _local_mesh_register(local_url: str) -> None:
         async with _build_session("", 5.0) as sess:
             async with sess.post(
                 f"{base}/local/register",
-                json={"instance_id": _LOCAL_MESH_INSTANCE_ID, "url": local_url},
+                json={
+                    "instance_id": _LOCAL_MESH_INSTANCE_ID,
+                    "url": local_url,
+                    "server_name": SERVER_NAME,
+                },
             ) as resp:
                 if resp.status == 200:
                     logger.info(
@@ -3772,6 +3935,7 @@ async def local_mesh_stats_handler(request: web.Request) -> web.Response:
 
     return web.json_response({
         "instance_id":         _LOCAL_MESH_INSTANCE_ID,
+        "server_name":         SERVER_NAME,
         "open_rooms":          len(rooms),
         "open_file_transfers": len(_share_slots),
         "open_inbox_slots":    len(_inbox_slots),
@@ -3779,6 +3943,87 @@ async def local_mesh_stats_handler(request: web.Request) -> web.Response:
         **_stats,
         **_get_sys_metrics(),
         "ts": time.time(),
+    })
+
+
+async def local_mesh_lockdown_handler(request: web.Request) -> web.Response:
+    """POST /local-mesh/lockdown — trigger or deactivate lockdown on this instance.
+
+    Loopback-only.  Called by the local mesh hub when a cluster-wide lockdown
+    is requested from the admin panel.
+
+    Body: ``{"action": "activate" | "deactivate"}``
+    """
+    if not _is_loopback(request):
+        raise web.HTTPForbidden(reason="Local-only endpoint")
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise web.HTTPBadRequest(reason="JSON body required")
+
+    action = str(body.get("action", "")).strip().lower()
+    if action not in ("activate", "deactivate"):
+        raise web.HTTPBadRequest(reason="action must be 'activate' or 'deactivate'")
+
+    # Delegate to the shared lockdown logic used by the admin handler.
+    global _lockdown_active  # noqa: PLW0603
+    if action == "activate":
+        _lockdown_active = True
+        db_path: Path = request.app["db_path"]
+        await asyncio.to_thread(_wipe_all_data_sync, db_path)
+        for slot in list(_share_slots.values()):
+            tmp_dir: Path | None = slot.get("tmp_dir")
+            if tmp_dir is not None:
+                try:
+                    shutil.rmtree(tmp_dir, ignore_errors=True)
+                except Exception:  # noqa: BLE001
+                    pass
+        _inbox_slots.clear()
+        _inbox_drop_tokens.clear()
+        _inbox_logged_tokens.clear()
+        _share_slots.clear()
+        _room_meta.clear()
+        _ADMIN_LOGIN_FAILURES.clear()
+        _ADMIN_LOGIN_HARD_LOCKOUT.clear()
+        for ws_set in list(rooms.values()):
+            for ws in list(ws_set):
+                try:
+                    await ws.close(message=b"lockdown")
+                except Exception:  # noqa: BLE001
+                    pass
+        rooms.clear()
+        logger.warning("🔴 LOCKDOWN ACTIVATED via cluster command")
+        _print_lockdown_console_banner()
+    else:
+        _lockdown_active = False
+        logger.info("🟢 LOCKDOWN DEACTIVATED via cluster command")
+
+    return web.json_response({"lockdown": _lockdown_active})
+
+
+async def local_mesh_logs_handler(request: web.Request) -> web.Response:
+    """GET /local-mesh/logs — return the most recent log lines (loopback-only).
+
+    Returns a JSON array of the last N log lines from the in-memory ring
+    buffer, newest first.  The admin panel uses this endpoint to let operators
+    switch between the live logs of each cluster instance without leaving the
+    admin panel.
+    """
+    if not _is_loopback(request):
+        raise web.HTTPForbidden(reason="Local-only endpoint")
+
+    try:
+        n = int(request.rel_url.query.get("n", "200"))
+        n = max(1, min(n, 500))
+    except (ValueError, TypeError):
+        n = 200
+
+    lines = list(_log_recent)[-n:]
+    return web.json_response({
+        "instance_id": _LOCAL_MESH_INSTANCE_ID,
+        "server_name": SERVER_NAME,
+        "lines": lines,
     })
 
 
@@ -4387,8 +4632,10 @@ def build_app(db_path: Path | None = None) -> web.Application:
 
     # Local mesh — loopback-only internal endpoints used by the local_mesh.py
     # hub to deliver forwarded chat messages and collect per-instance stats.
-    app.router.add_post("/local-mesh/receive", local_mesh_receive_handler)
-    app.router.add_get("/local-mesh/stats",    local_mesh_stats_handler)
+    app.router.add_post("/local-mesh/receive",   local_mesh_receive_handler)
+    app.router.add_get("/local-mesh/stats",      local_mesh_stats_handler)
+    app.router.add_post("/local-mesh/lockdown",  local_mesh_lockdown_handler)
+    app.router.add_get("/local-mesh/logs",       local_mesh_logs_handler)
 
     # Mesh peer federation routes — all hidden behind the 50-char secret path.
     # The forward and link endpoints are authenticated by peer token; the

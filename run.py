@@ -1202,6 +1202,23 @@ def main() -> None:
     if local_mesh_port:
         _ensure_local_mesh_hub(local_mesh_port)
 
+        # Auto-create a shared storage directory for this cluster so all
+        # instances running on the same machine can share files and chat
+        # history without any extra configuration.
+        _cluster_dir = _HERE / f".cluster_{local_mesh_port}"
+        _cluster_dir.mkdir(exist_ok=True)
+
+        if not os.environ.get("FILE_STORAGE", "").strip():
+            _shared_files = _cluster_dir / "files"
+            _shared_files.mkdir(exist_ok=True)
+            os.environ["FILE_STORAGE"] = str(_shared_files)
+            print(f"  🗂️   Shared file storage : {_shared_files}")
+
+        if not os.environ.get("DB_PATH", "").strip():
+            _shared_db = _cluster_dir / "securechat.db"
+            os.environ["DB_PATH"] = str(_shared_db)
+            print(f"  🗄️   Shared chat history  : {_shared_db}")
+
     # ── 4. Import server (now dependencies are guaranteed to be present) ──
     # We must import AFTER pip-installing, and AFTER setting env vars.
     try:
@@ -1223,6 +1240,12 @@ def main() -> None:
     # overwrite MESH_TOKEN with the remote server's token).  Generate a
     # fresh one only on the very first run when nothing is persisted yet.
     srv._MESH_TOKEN = _own_persisted_mesh_token or _secrets.token_urlsafe(32)
+
+    # Assign a stable instance ID for the local cluster hub.  The ID is
+    # persisted to a per-port file so a restarted instance re-uses its
+    # original ID instead of appearing as a brand-new entry in the hub.
+    if local_mesh_port:
+        srv._LOCAL_MESH_INSTANCE_ID = srv._get_or_create_instance_id(server_port)
     srv._MESH_PATH  = srv._init_mesh_path()
     srv._CLEARNET_PATH = srv._init_clearnet_path()
 
