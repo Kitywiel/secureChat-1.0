@@ -4741,3 +4741,153 @@ async def test_share_upload_uses_file_storage_dir(tmp_path, ws_client) -> None:
     finally:
         _s._FILE_STORAGE_DIR = original_dir
         _s._share_slots.clear()
+
+
+# ---------------------------------------------------------------------------
+# Tor launch — Windows timeout fix (run.py and start_with_tor.py)
+# ---------------------------------------------------------------------------
+
+def test_start_tor_omits_timeout_on_windows() -> None:
+    """On Windows, _start_tor must not pass timeout= to stem to avoid:
+       OSError: You cannot launch tor with a timeout on Windows
+    """
+    import sys
+    import os
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    import run as _run
+    from unittest.mock import patch, MagicMock
+    from pathlib import Path
+
+    captured_kwargs: list[dict] = []
+
+    def fake_launch(**kwargs):
+        captured_kwargs.append(kwargs)
+        proc = MagicMock()
+        proc.poll = MagicMock(return_value=None)
+        return proc
+
+    fake_hs_dir = MagicMock()
+    fake_hs_dir.__truediv__ = lambda self, other: MagicMock(
+        is_file=lambda: True,
+        read_text=lambda **kw: "abcdef1234567890.onion\n",
+    )
+
+    with patch("platform.system", return_value="Windows"), \
+         patch.object(_run, "_HS_DIR", fake_hs_dir), \
+         patch.object(_run, "_TOR_DATA_DIR", MagicMock()), \
+         patch.object(_run, "_free_port", return_value=9051), \
+         patch.object(_run, "_socks_port_for_tor", return_value="9050"), \
+         patch.object(_run, "_find_geoip_files", return_value={}), \
+         patch("stem.process.launch_tor_with_config", side_effect=fake_launch):
+        result = _run._start_tor(Path("/fake/tor"), 5000)
+
+    assert len(captured_kwargs) == 1
+    assert "timeout" not in captured_kwargs[0], (
+        "timeout= must NOT be passed to stem on Windows"
+    )
+
+
+def test_start_tor_passes_timeout_on_linux() -> None:
+    """On Linux, _start_tor must pass timeout=120 to stem."""
+    import sys
+    import os
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    import run as _run
+    from unittest.mock import patch, MagicMock
+    from pathlib import Path
+
+    captured_kwargs: list[dict] = []
+
+    def fake_launch(**kwargs):
+        captured_kwargs.append(kwargs)
+        proc = MagicMock()
+        proc.poll = MagicMock(return_value=None)
+        return proc
+
+    fake_hs_dir = MagicMock()
+    fake_hs_dir.__truediv__ = lambda self, other: MagicMock(
+        is_file=lambda: True,
+        read_text=lambda **kw: "abcdef1234567890.onion\n",
+    )
+
+    with patch("platform.system", return_value="Linux"), \
+         patch.object(_run, "_HS_DIR", fake_hs_dir), \
+         patch.object(_run, "_TOR_DATA_DIR", MagicMock()), \
+         patch.object(_run, "_free_port", return_value=9051), \
+         patch.object(_run, "_socks_port_for_tor", return_value="9050"), \
+         patch.object(_run, "_find_geoip_files", return_value={}), \
+         patch("stem.process.launch_tor_with_config", side_effect=fake_launch):
+        result = _run._start_tor(Path("/fake/tor"), 5000)
+
+    assert len(captured_kwargs) == 1
+    assert captured_kwargs[0].get("timeout") == 120, (
+        "timeout=120 must be passed to stem on Linux"
+    )
+
+
+def test_start_tor_windows_no_retry_on_timeout_error() -> None:
+    """On Windows, OSError('timeout on Windows') must stop retries immediately."""
+    import sys
+    import os
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    import run as _run
+    from unittest.mock import patch, MagicMock
+    from pathlib import Path
+
+    call_count = 0
+
+    def fake_launch(**kwargs):
+        nonlocal call_count
+        call_count += 1
+        raise OSError("You cannot launch tor with a timeout on Windows")
+
+    with patch("platform.system", return_value="Windows"), \
+         patch.object(_run, "_HS_DIR", MagicMock()), \
+         patch.object(_run, "_TOR_DATA_DIR", MagicMock()), \
+         patch.object(_run, "_free_port", return_value=9051), \
+         patch.object(_run, "_socks_port_for_tor", return_value="9050"), \
+         patch.object(_run, "_find_geoip_files", return_value={}), \
+         patch("stem.process.launch_tor_with_config", side_effect=fake_launch):
+        result = _run._start_tor(Path("/fake/tor"), 5000)
+
+    assert result is None
+    assert call_count == 1, (
+        "Should not retry when OSError is the Windows-timeout error"
+    )
+
+
+def test_start_with_tor_omits_timeout_on_windows() -> None:
+    """start_with_tor._start_tor_hidden_service must not pass timeout= on Windows."""
+    import sys
+    import os
+    import importlib
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    import start_with_tor as _swt
+    from unittest.mock import patch, MagicMock
+
+    captured_kwargs: list[dict] = []
+
+    def fake_launch(**kwargs):
+        captured_kwargs.append(kwargs)
+        proc = MagicMock()
+        return proc
+
+    fake_hs_dir = MagicMock()
+    hostname_mock = MagicMock()
+    hostname_mock.is_file.return_value = True
+    hostname_mock.read_text.return_value = "xxxxxxxxxxxxxxxx.onion\n"
+    fake_hs_dir.__truediv__ = lambda self, other: hostname_mock
+
+    with patch("platform.system", return_value="Windows"), \
+         patch.object(_swt, "_HS_DIR", fake_hs_dir), \
+         patch.object(_swt, "_TOR_DATA_DIR", MagicMock()), \
+         patch.object(_swt, "_free_port", return_value=9051), \
+         patch.object(_swt, "_socks_port_for_tor", return_value="9050"), \
+         patch.object(_swt, "_find_geoip_files", return_value={}), \
+         patch("stem.process.launch_tor_with_config", side_effect=fake_launch):
+        result = _swt._start_tor_hidden_service(_swt.Path("/fake/tor.exe"))
+
+    assert len(captured_kwargs) == 1
+    assert "timeout" not in captured_kwargs[0], (
+        "timeout= must NOT be passed to stem on Windows (start_with_tor)"
+    )

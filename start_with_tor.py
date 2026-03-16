@@ -328,15 +328,23 @@ def _start_tor_hidden_service(tor_exe: Path) -> Optional[tuple]:
         if attempt > 0:
             config["ControlPort"] = str(_free_port())
         try:
-            tor_process = stem.process.launch_tor_with_config(
-                tor_cmd=str(tor_exe),
-                config=config,
-                timeout=120,
-                init_msg_handler=_tor_log,
-            )
+            launch_kwargs: dict = {
+                "tor_cmd": str(tor_exe),
+                "config": config,
+                "init_msg_handler": _tor_log,
+            }
+            # stem uses signal.alarm() to implement the timeout, which is not
+            # available on Windows.  Passing timeout= on Windows raises:
+            #   OSError: You cannot launch tor with a timeout on Windows
+            if platform.system() != "Windows":
+                launch_kwargs["timeout"] = 120
+            tor_process = stem.process.launch_tor_with_config(**launch_kwargs)
             break
         except OSError as exc:
             last_exc = exc
+            # The Windows-timeout error is permanent; retrying is pointless.
+            if "timeout on Windows" in str(exc):
+                break
         except Exception as exc:  # noqa: BLE001
             last_exc = exc
             break  # non-OS errors are not port-conflict related; stop retrying
