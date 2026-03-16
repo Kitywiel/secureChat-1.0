@@ -86,6 +86,8 @@ async def register_handler(request: web.Request) -> web.Response:
     _instances[instance_id] = {
         "url": url,
         "server_name": server_name,
+        "is_main": bool(body.get("is_main", False)),
+        "admin_url": str(body.get("admin_url", "")).strip(),
         "registered_at": registered_at,
     }
     return web.json_response({"ok": True, "instance_id": instance_id})
@@ -167,6 +169,11 @@ async def stats_handler(request: web.Request) -> web.Response:
     Each instance exposes ``GET /local-mesh/stats`` (loopback-only).  This
     endpoint collects all responses and returns them as a list so the admin
     panel can display per-instance load figures.
+
+    The top-level ``main_admin_url`` field contains the admin-panel URL of the
+    instance that registered with ``is_main=True``, or an empty string when no
+    main server is configured.  Non-main admin panels use this URL to redirect
+    their visitors to the centralised management panel.
     """
     results: list[dict] = []
     async with aiohttp.ClientSession(
@@ -177,6 +184,7 @@ async def stats_handler(request: web.Request) -> web.Response:
                 "instance_id": iid,
                 "url": info["url"],
                 "server_name": info.get("server_name", ""),
+                "is_main": info.get("is_main", False),
                 "registered_at": info["registered_at"],
                 "ok": False,
             }
@@ -198,11 +206,21 @@ async def stats_handler(request: web.Request) -> web.Response:
         if inst.get("ok")
     )
 
+    # Expose the main server's admin URL so non-main instances can redirect
+    # admin-panel requests to it.  Use the registered admin_url (set at
+    # registration time) of the first online main instance.
+    main_admin_url = ""
+    for iid, info in list(_instances.items()):
+        if info.get("is_main") and info.get("admin_url"):
+            main_admin_url = info["admin_url"]
+            break
+
     return web.json_response({
         "instances": results,
         "hub_port": LOCAL_MESH_PORT,
         "file_storage": _FILE_STORAGE_PATH,
         "cluster_inbox_msgs_total": total_inbox_msgs,
+        "main_admin_url": main_admin_url,
     })
 
 

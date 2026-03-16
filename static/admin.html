@@ -99,6 +99,7 @@ section h2{font-size:1rem;font-weight:700;margin-bottom:.75rem;padding-bottom:.4
 .cluster-ok{color:var(--accent)}
 .cluster-err{color:var(--red)}
 .cluster-na{color:#444;font-size:.82rem;padding:.5rem 0}
+.cluster-main{color:#f59e0b;font-weight:700;margin-left:.35rem}
 </style>
 </head>
 <body>
@@ -640,9 +641,10 @@ function renderCluster(data){
     const rooms=inst.open_rooms!=null?inst.open_rooms:'—';
     const files=inst.open_file_transfers!=null?inst.open_file_transfers:'—';
     const inboxMsgs=inst.inbox_msgs_received_total!=null?inst.inbox_msgs_received_total:'—';
+    const mainBadge=inst.is_main?`<span title="Main server — admin panel redirects here" style="color:#f59e0b;font-weight:700;margin-left:.35rem">⭐ Main</span>`:'';
     const displayUrl=(inst.server_name&&inst.server_name.trim())
-      ?`${inst.url||inst.instance_id} | <strong>${_esc(inst.server_name)}</strong>`
-      :(inst.url||inst.instance_id);
+      ?`${inst.url||inst.instance_id} | <strong>${_esc(inst.server_name)}</strong>${mainBadge}`
+      :`${inst.url||inst.instance_id}${mainBadge}`;
     const iid=_esc(inst.instance_id||'');
     const lockBtn=inst.ok
       ?`<button onclick="clusterLockdown('${iid}')" style="padding:.25rem .6rem;background:#b91c1c;border:none;border-radius:5px;color:#fff;font-size:.72rem;cursor:pointer;font-family:var(--font)">🔴 Lockdown</button>`

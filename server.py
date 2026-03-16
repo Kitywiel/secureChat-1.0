@@ -215,6 +215,12 @@ LOCAL_MESH_PORT: int = int(os.environ.get("LOCAL_MESH_PORT", "0"))  # 0 = disabl
 # the cluster admin table as "{url} | {SERVER_NAME}" when set.
 SERVER_NAME: str = os.environ.get("SERVER_NAME", "").strip()
 
+# When True, this instance is the designated "main" server in a local cluster.
+# Other instances that have LOCAL_MESH_PORT set will redirect their admin panel
+# to this instance so the whole cluster can be managed from one place.
+# Set via:  MAIN_SERVER=1  (or "true" / "yes")
+MAIN_SERVER: bool = os.environ.get("MAIN_SERVER", "").strip().lower() in ("1", "true", "yes")
+
 # Inbox constants
 _INBOX_TOKEN_BYTES = 16                      # 128-bit token → ~22-char URL-safe base64 local part
 MAX_INBOX_MESSAGE_LEN = 65536                # max bytes per message body
@@ -2812,7 +2818,21 @@ async def _admin_login_handler(request: web.Request) -> web.Response:
 
 
 async def _admin_index_handler(request: web.Request) -> web.Response:
-    """GET /{path}/ — return admin panel HTML with the admin path injected."""
+    """GET /{path}/ — return admin panel HTML with the admin path injected.
+
+    When ``LOCAL_MESH_PORT`` is configured and another instance has registered
+    with ``MAIN_SERVER=1``, this handler redirects the browser to that
+    instance's admin panel so the whole cluster can be managed from one place.
+    If the hub is unreachable or no main server is registered the local admin
+    panel is served normally (fail-open, no redirect).
+    """
+    # Redirect to the designated main server admin panel when this is a
+    # non-main cluster instance and the hub can tell us where the main is.
+    if LOCAL_MESH_PORT and not MAIN_SERVER:
+        main_url = await _fetch_main_admin_url()
+        if main_url:
+            raise web.HTTPFound(location=main_url)
+
     html = (STATIC_DIR / "admin.html").read_text(encoding="utf-8")
     # Inject the admin path as a JS constant so all fetch() calls use the right URLs.
     # The placeholder __ADMIN_PATH__ is replaced once at serve time.
@@ -4117,9 +4137,47 @@ def _get_or_create_instance_id(port: int) -> str:
 # Local mesh helpers — loopback-only inter-instance communication
 # ---------------------------------------------------------------------------
 
+# Cache for the main server's admin URL, refreshed every 30 s.
+# Tuple of (url, timestamp) or None when not yet fetched.
+_main_admin_url_cache: tuple[str, float] | None = None
+_MAIN_ADMIN_CACHE_TTL: float = 30.0
+
+
 def _local_mesh_base() -> str:
     """Return the base URL of the local mesh hub, or empty string when disabled."""
     return f"http://127.0.0.1:{LOCAL_MESH_PORT}" if LOCAL_MESH_PORT else ""
+
+
+async def _fetch_main_admin_url() -> str:
+    """Return the main server's admin URL from the hub, cached for 30 s.
+
+    Returns an empty string when:
+      - LOCAL_MESH_PORT is not set
+      - The hub is unreachable
+      - No instance has registered with ``is_main=True``
+    """
+    global _main_admin_url_cache  # noqa: PLW0603
+    now = time.time()
+    if _main_admin_url_cache is not None:
+        cached_url, cached_ts = _main_admin_url_cache
+        if now - cached_ts < _MAIN_ADMIN_CACHE_TTL:
+            return cached_url
+    base = _local_mesh_base()
+    if not base:
+        return ""
+    try:
+        async with _build_session("", 3.0) as sess:
+            async with sess.get(f"{base}/local/stats") as resp:
+                if resp.status == 200:
+                    data = await resp.json(content_type=None)
+                    url = str(data.get("main_admin_url") or "")
+                    _main_admin_url_cache = (url, now)
+                    return url
+    except Exception:  # noqa: BLE001
+        pass
+    # On failure: cache empty result briefly to avoid hammering the hub.
+    _main_admin_url_cache = ("", now)
+    return ""
 
 
 async def _local_mesh_register(local_url: str) -> None:
@@ -4127,6 +4185,10 @@ async def _local_mesh_register(local_url: str) -> None:
     base = _local_mesh_base()
     if not base:
         return
+    # Include the admin URL only for the main server so the hub can broadcast
+    # it to sibling instances that want to redirect their admin visitors there.
+    # _ADMIN_PATH has no leading slash; local_url has no trailing slash.
+    admin_url = f"{local_url.rstrip('/')}/{_ADMIN_PATH}" if MAIN_SERVER else ""
     try:
         async with _build_session("", 5.0) as sess:
             async with sess.post(
@@ -4135,13 +4197,16 @@ async def _local_mesh_register(local_url: str) -> None:
                     "instance_id": _LOCAL_MESH_INSTANCE_ID,
                     "url": local_url,
                     "server_name": SERVER_NAME,
+                    "is_main": MAIN_SERVER,
+                    "admin_url": admin_url,
                 },
             ) as resp:
                 if resp.status == 200:
                     logger.info(
-                        "local mesh registered  instance=%s  hub=%s",
+                        "local mesh registered  instance=%s  hub=%s%s",
                         _LOCAL_MESH_INSTANCE_ID,
                         base,
+                        "  [MAIN SERVER]" if MAIN_SERVER else "",
                     )
                 else:
                     logger.warning(
@@ -4242,6 +4307,7 @@ async def local_mesh_stats_handler(request: web.Request) -> web.Response:
     return web.json_response({
         "instance_id":         _LOCAL_MESH_INSTANCE_ID,
         "server_name":         SERVER_NAME,
+        "is_main":             MAIN_SERVER,
         "open_rooms":          len(rooms),
         "open_file_transfers": len(_share_slots),
         "open_inbox_slots":    (
