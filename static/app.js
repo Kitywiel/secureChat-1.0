@@ -555,6 +555,36 @@ function stopDestructTimer() {
   if (el) el.classList.add('hidden');
 }
 
+/**
+ * Attach a live countdown to any element.  The interval automatically
+ * clears itself once the element is detached from the DOM or time runs out.
+ * @param {HTMLElement} el        Element whose textContent will be updated.
+ * @param {number}      expiresAt Unix epoch seconds.
+ * @returns {number} interval ID
+ */
+function _attachCountdown(el, expiresAt) {
+  let id;
+  const tick = () => {
+    if (!el.isConnected) { clearInterval(id); return; }
+    const remaining = Math.max(0, expiresAt - Date.now() / 1000);
+    if (remaining <= 0) {
+      el.textContent = '💣 Expired';
+      clearInterval(id);
+      return;
+    }
+    const h = Math.floor(remaining / 3600);
+    const m = Math.floor((remaining % 3600) / 60);
+    const s = Math.floor(remaining % 60);
+    let label = '⏱ ';
+    if (h > 0) label += `${h}h `;
+    label += `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+    el.textContent = label;
+  };
+  tick();
+  id = setInterval(tick, 1000);
+  return id;
+}
+
 // ─── WebSocket ────────────────────────────────────────────────────────────────
 
 /**
@@ -1115,10 +1145,14 @@ function _appendShareResult(data, passcode) {
     wrap.appendChild(pcRow);
   }
 
-  // Expiry note
+  // Expiry note with live countdown
   const expEl = document.createElement('p');
   expEl.className = 'notice';
-  expEl.textContent = `⚠️ One-time link — expires ${expiresAt.toLocaleString()}`;
+  expEl.textContent = `⚠️ One-time link — expires ${expiresAt.toLocaleString()} `;
+  const shareTimerSpan = document.createElement('span');
+  shareTimerSpan.style.cssText = 'margin-left:.4rem;color:#f0a844;font-weight:600';
+  expEl.appendChild(shareTimerSpan);
+  _attachCountdown(shareTimerSpan, data.expires_at);
   wrap.appendChild(expEl);
 
   container.appendChild(wrap);
@@ -1624,7 +1658,7 @@ function buildInboxCard(data, idx) {
       <button type="button" class="btn-copy inbox-copy-drop">Copy</button>
     </div>
 
-    <p class="notice" style="margin-top:.5rem">⏰ Expires ${escHtml(expiresLabel)}</p>
+    <p class="notice" style="margin-top:.5rem">⏰ Expires ${escHtml(expiresLabel)} <span class="inbox-expiry-timer" style="margin-left:.4rem;color:#f0a844;font-weight:600"></span></p>
 
     <div style="display:flex;gap:.5rem;margin-top:.75rem;flex-wrap:wrap">
       <button type="button" class="inbox-open-reader-btn"
@@ -1643,6 +1677,9 @@ function buildInboxCard(data, idx) {
     <div class="inbox-preview" style="margin-top:.75rem;display:none"></div>
     <div class="inbox-status" style="margin-top:.4rem;font-size:.8rem;color:#666"></div>
   `;
+
+  // Attach live countdown to the expiry timer span
+  _attachCountdown(card.querySelector('.inbox-expiry-timer'), data.expires_at);
 
   // Remove button
   card.querySelector('.inbox-remove-btn').addEventListener('click', () => {
