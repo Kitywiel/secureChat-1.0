@@ -3076,6 +3076,10 @@ def _init_clearnet_path() -> str:
 def _folder_lock() -> str:
     """Return a 16-char hex digest of this installation's absolute directory.
 
+    16 hex chars = 64 bits of the SHA-256 digest — more than enough entropy
+    to distinguish any two folder paths on the same machine while keeping the
+    stored value short.
+
     Written to ``.env`` / ``.bat`` alongside ``MESH_PATH`` so that a copied
     installation can be detected on the next startup: if ``MESH_LOCK`` is
     present but does not match the current directory's digest, the stored
@@ -3115,6 +3119,12 @@ def _init_mesh_path() -> str:
     if stored_lock and stored_lock != current_lock:
         # The .env / .bat was copied from a different folder — discard the
         # stale path so a fresh one is generated below.
+        logger.warning(
+            "mesh URL reset: installation folder mismatch "
+            "(stored lock %s != current %s) — generating new MESH_PATH",
+            stored_lock,
+            current_lock,
+        )
         os.environ.pop("MESH_PATH", None)
         os.environ.pop("MESH_LOCK", None)
 
@@ -3643,6 +3653,23 @@ async def mesh_peer_link_handler(request: web.Request) -> web.Response:
         }
 
     Returns ``{"ok": true, "peer_id": "…"}`` on success.
+
+    Full-mesh fanout
+    ----------------
+    When a peer arrives here that this server has *not* seen before, two
+    fire-and-forget tasks are spawned:
+
+    1. **Cascade** (``_announce_peer_to_all``) — this server tells all of its
+       other known peers about the newly-linked peer, so nodes that joined at
+       different bootstrap points still learn about each other.
+
+    2. **Back-announce** (``_back_announce_to_peer``) — this server tells the
+       newly-linked peer about all of *its* other known peers, so the new peer
+       gains a complete view of the mesh even when it bootstrapped from a node
+       that had an incomplete peer list.
+
+    URL deduplication prevents announcement loops: if the peer's base URL is
+    already registered the entry is refreshed but no further fanout occurs.
     """
     try:
         body = await request.json()
@@ -3661,6 +3688,16 @@ async def mesh_peer_link_handler(request: web.Request) -> web.Response:
     if not peer_url:
         raise web.HTTPBadRequest(reason="peer_url required")
 
+    # URL deduplication: if we already know this peer, refresh its entry but
+    # skip cascade and back-announce to prevent announcement loops.
+    is_new = not _peer_url_known(peer_url)
+    if not is_new:
+        # Remove stale entries so the record is always current.
+        stale = [pid for pid, p in _mesh_peers.items()
+                 if _normalize_peer_url(p["url"]) == peer_url]
+        for pid in stale:
+            del _mesh_peers[pid]
+
     peer_id = secrets.token_hex(16)
     _mesh_peers[peer_id] = {
         "url":          peer_url,
@@ -3668,20 +3705,38 @@ async def mesh_peer_link_handler(request: web.Request) -> web.Response:
         "mesh_path":    peer_mesh_path,
         "connected_at": time.time(),
     }
-    logger.info("mesh peer linked  peer_id=…%s  url=%s", peer_id[-6:], peer_url[:60])
+    logger.info("mesh peer linked  peer_id=…%s  url=%s  new=%s",
+                peer_id[-6:], peer_url[:60], is_new)
+
+    if is_new:
+        # Cascade: tell our other known peers about this newly-linked peer so
+        # they can build a direct link even if they didn't get this peer via
+        # the original bootstrap /connect.
+        asyncio.ensure_future(_announce_peer_to_all(peer_id))
+        # Back-announce: tell this new peer about all the peers we already
+        # know so it gains a full view of the mesh topology.
+        asyncio.ensure_future(_back_announce_to_peer(peer_id))
+
     return web.json_response({"ok": True, "peer_id": peer_id})
 
 
 async def _announce_peer_to_all(new_peer_id: str) -> None:
     """Fire-and-forget: tell every existing peer about a newly connected peer.
 
-    Called after ``mesh_peer_connect_handler`` registers a new peer.  Each
-    already-connected peer receives a POST to its ``/<mesh_path>/mesh/link``
-    endpoint with the new peer's URL, token, and mesh path so every node can
-    build a direct link without routing through this server.
+    Called after ``mesh_peer_connect_handler`` registers a new peer and from
+    ``mesh_peer_link_handler`` when a truly-new peer arrives via cascade.
+    Each already-connected peer receives a POST to its
+    ``/<mesh_path>/mesh/link`` endpoint with the new peer's details so every
+    node can build a direct link without routing through this server.
 
-    Peers that have no ``mesh_path`` stored (legacy connections) are skipped
-    because we don't know their link endpoint URL.
+    Routing
+    -------
+    * ``.onion`` peer URLs are routed through Tor.
+    * All other peer URLs use a direct connection — Tor cannot route to
+      private IP ranges so clearnet peers would never receive the link.
+
+    Peers that have no ``mesh_path`` stored are skipped because we don't
+    know their link endpoint URL.
     """
     new_peer = _mesh_peers.get(new_peer_id)
     if not new_peer:
@@ -3694,8 +3749,12 @@ async def _announce_peer_to_all(new_peer_id: str) -> None:
             continue  # can't construct link URL without the secret path
         link_url = peer["url"].rstrip("/") + f"/{peer_mesh_path}/mesh/link"
         try:
-            async with await _make_proxied_session(timeout=5.0) as sess:
-                await sess.post(
+            if ".onion" in peer["url"]:
+                sess_ctx = await _make_proxied_session(timeout=15.0)
+            else:
+                sess_ctx = _build_session("", 15.0)
+            async with sess_ctx as sess:
+                async with sess.post(
                     link_url,
                     json={
                         "token":          peer["token"],
@@ -3703,9 +3762,91 @@ async def _announce_peer_to_all(new_peer_id: str) -> None:
                         "peer_token":     new_peer["token"],
                         "peer_mesh_path": new_peer.get("mesh_path", ""),
                     },
-                )
-        except Exception:  # noqa: BLE001
-            pass
+                ) as resp:
+                    if resp.status >= 400:
+                        logger.warning(
+                            "mesh announce rejected  target_url=%s  status=%d",
+                            peer["url"][:60],
+                            resp.status,
+                        )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "mesh announce failed  target_url=%s  error=%s",
+                peer["url"][:60],
+                exc,
+            )
+
+
+def _normalize_peer_url(url: str) -> str:
+    """Return the canonical form of a peer base URL (stripped of trailing slashes).
+
+    All peer URL comparisons must go through this function so that
+    ``http://host:5000`` and ``http://host:5000/`` are treated as identical.
+    """
+    return url.rstrip("/")
+
+
+def _peer_url_known(url: str) -> bool:
+    """Return ``True`` if a peer with the given base URL is already registered.
+
+    Used to prevent duplicate registrations and announcement loops when the
+    same peer is announced via multiple paths (e.g. direct connect + cascade).
+    """
+    norm = _normalize_peer_url(url)
+    return any(_normalize_peer_url(p["url"]) == norm for p in _mesh_peers.values())
+
+
+async def _back_announce_to_peer(new_peer_id: str) -> None:
+    """Fire-and-forget: tell a newly-linked peer about all other peers we know.
+
+    When this server learns about a new peer via ``/mesh/link`` (i.e. a
+    cascaded announcement from another node), the new peer may not yet know
+    about every server in the mesh — especially if it bootstrapped from a
+    different node.  This function closes that gap by posting a ``/mesh/link``
+    message to the new peer for each other peer this server knows about.
+
+    Routing follows the same direct/Tor logic as ``_announce_peer_to_all``.
+    """
+    new_peer = _mesh_peers.get(new_peer_id)
+    if not new_peer or not new_peer.get("mesh_path"):
+        return
+    new_peer_link_url = (
+        new_peer["url"].rstrip("/") + f"/{new_peer['mesh_path']}/mesh/link"
+    )
+    for peer_id, peer in list(_mesh_peers.items()):
+        if peer_id == new_peer_id:
+            continue
+        if not peer.get("mesh_path"):
+            continue
+        try:
+            if ".onion" in new_peer["url"]:
+                sess_ctx = await _make_proxied_session(timeout=15.0)
+            else:
+                sess_ctx = _build_session("", 15.0)
+            async with sess_ctx as sess:
+                async with sess.post(
+                    new_peer_link_url,
+                    json={
+                        "token":          new_peer["token"],
+                        "peer_url":       peer["url"],
+                        "peer_token":     peer["token"],
+                        "peer_mesh_path": peer.get("mesh_path", ""),
+                    },
+                ) as resp:
+                    if resp.status >= 400:
+                        logger.warning(
+                            "mesh back-announce rejected  target=%s  peer=%s  status=%d",
+                            new_peer["url"][:60],
+                            peer["url"][:60],
+                            resp.status,
+                        )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "mesh back-announce failed  target=%s  peer=%s  error=%s",
+                new_peer["url"][:60],
+                peer["url"][:60],
+                exc,
+            )
 
 
 async def mesh_peer_forward_handler(request: web.Request) -> web.Response:

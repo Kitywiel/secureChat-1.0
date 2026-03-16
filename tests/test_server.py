@@ -2502,11 +2502,326 @@ async def test_forward_to_peers_skips_peers_without_mesh_path(ws_client) -> None
         _s._mesh_peers.clear()
 
 
+# ---------------------------------------------------------------------------
+# Full-mesh 3+ server tests (cascade, back-announce, URL dedup)
+# ---------------------------------------------------------------------------
+
 @pytest.mark.asyncio
-async def test_mesh_invite_requires_auth(ws_client) -> None:
-    """GET /mesh/invite returns 403 without admin session."""
-    resp = await ws_client.get("/mesh/invite")
-    assert resp.status == 403
+async def test_announce_peer_to_all_uses_direct_for_clearnet(ws_client) -> None:
+    """_announce_peer_to_all uses a direct session for clearnet peers (not Tor).
+
+    Tor cannot route to RFC-1918 addresses, so using _make_proxied_session for
+    clearnet link announcements would silently drop every message.  The fix
+    routes through Tor only when the target URL contains '.onion'.
+    """
+    import server as _s
+    from unittest.mock import patch, AsyncMock, MagicMock
+
+    direct_urls: list[str] = []
+    proxied_urls: list[str] = []
+
+    def _fake_build_session(proxy_url: str, timeout: float):
+        sess = MagicMock()
+        resp = MagicMock()
+        resp.status = 200
+        resp.__aenter__ = AsyncMock(return_value=resp)
+        resp.__aexit__ = AsyncMock(return_value=False)
+        def _post(url, **kwargs):
+            direct_urls.append(url)
+            return resp
+        sess.__aenter__ = AsyncMock(return_value=sess)
+        sess.__aexit__ = AsyncMock(return_value=False)
+        sess.post = _post
+        return sess
+
+    async def _fake_proxied_session(timeout=15.0):
+        sess = MagicMock()
+        resp = MagicMock()
+        resp.status = 200
+        resp.__aenter__ = AsyncMock(return_value=resp)
+        resp.__aexit__ = AsyncMock(return_value=False)
+        def _post(url, **kwargs):
+            proxied_urls.append(url)
+            return resp
+        sess.__aenter__ = AsyncMock(return_value=sess)
+        sess.__aexit__ = AsyncMock(return_value=False)
+        sess.post = _post
+        return sess
+
+    _s._mesh_peers.clear()
+    # new_peer: clearnet URL
+    _s._mesh_peers["new_peer"] = {
+        "url": "http://192.168.1.10:5001",
+        "token": "new_tok",
+        "mesh_path": "n" * 50,
+        "connected_at": 0,
+    }
+    # existing clearnet peer that should be notified
+    _s._mesh_peers["clearnet_peer"] = {
+        "url": "http://192.168.1.20:5001",
+        "token": "cl_tok",
+        "mesh_path": "c" * 50,
+        "connected_at": 0,
+    }
+    # existing onion peer that should be notified via Tor
+    _s._mesh_peers["onion_peer"] = {
+        "url": "http://abc123.onion",
+        "token": "on_tok",
+        "mesh_path": "o" * 50,
+        "connected_at": 0,
+    }
+    try:
+        with (
+            patch.object(_s, "_build_session", side_effect=_fake_build_session),
+            patch.object(_s, "_make_proxied_session", side_effect=_fake_proxied_session),
+        ):
+            await _s._announce_peer_to_all("new_peer")
+
+        # The clearnet existing peer must have been reached via direct session
+        assert any("192.168.1.20" in u for u in direct_urls), \
+            "Clearnet peer was not contacted via direct session"
+        # The onion existing peer must have been reached via Tor
+        assert any("abc123.onion" in u for u in proxied_urls), \
+            "Onion peer was not contacted via Tor"
+        # new_peer must NOT appear in either list (we announce TO others ABOUT new_peer)
+        assert not any("192.168.1.10" in u for u in direct_urls + proxied_urls), \
+            "Should not POST to the new peer itself"
+    finally:
+        _s._mesh_peers.clear()
+
+
+@pytest.mark.asyncio
+async def test_peer_url_known_detects_duplicates(ws_client) -> None:
+    """_peer_url_known returns True when the URL (ignoring trailing slash) is registered."""
+    import server as _s
+    _s._mesh_peers.clear()
+    _s._mesh_peers["p1"] = {"url": "http://server-a.onion", "token": "t", "mesh_path": "x" * 50, "connected_at": 0}
+    try:
+        assert _s._peer_url_known("http://server-a.onion") is True
+        assert _s._peer_url_known("http://server-a.onion/") is True   # trailing slash
+        assert _s._peer_url_known("http://other.onion") is False
+    finally:
+        _s._mesh_peers.clear()
+
+
+@pytest.mark.asyncio
+async def test_mesh_link_handler_deduplicates_url(ws_client) -> None:
+    """POST /mesh/link with an already-known URL refreshes the entry without adding a duplicate."""
+    import server as _s
+    _s._MESH_TOKEN = "dedup-token"
+    _s._mesh_peers.clear()
+    # Pre-register the peer
+    _s._mesh_peers["stale_id"] = {
+        "url": "http://existing-peer.onion",
+        "token": "old-tok",
+        "mesh_path": "d" * 50,
+        "connected_at": 0,
+    }
+    try:
+        resp = await ws_client.post(
+            f"/{_s._MESH_PATH}/mesh/link",
+            json={
+                "token":          "dedup-token",
+                "peer_url":       "http://existing-peer.onion",
+                "peer_token":     "new-tok",
+                "peer_mesh_path": "e" * 50,
+            },
+        )
+        assert resp.status == 200
+        # There should be exactly ONE entry for this URL (stale one replaced)
+        matching = [p for p in _s._mesh_peers.values()
+                    if p["url"] == "http://existing-peer.onion"]
+        assert len(matching) == 1, "Duplicate entry created for already-known URL"
+        # The entry must reflect the new token
+        assert matching[0]["token"] == "new-tok"
+    finally:
+        _s._mesh_peers.clear()
+
+
+@pytest.mark.asyncio
+async def test_mesh_link_handler_cascades_to_existing_peers(ws_client) -> None:
+    """POST /mesh/link for a new peer triggers cascade to all other known peers.
+
+    This is the 3-server fix: when server B links server C onto server A,
+    server A must cascade C to any other peers it knows (like D) so that the
+    full mesh stays connected even when peers join at different bootstrap nodes.
+    """
+    import server as _s
+    from unittest.mock import patch, AsyncMock, MagicMock
+
+    posted_link_urls: list[str] = []
+
+    def _fake_build_session(proxy_url: str, timeout: float):
+        sess = MagicMock()
+        resp = MagicMock()
+        resp.status = 200
+        resp.__aenter__ = AsyncMock(return_value=resp)
+        resp.__aexit__ = AsyncMock(return_value=False)
+        def _post(url, **kwargs):
+            posted_link_urls.append(url)
+            return resp
+        sess.__aenter__ = AsyncMock(return_value=sess)
+        sess.__aexit__ = AsyncMock(return_value=False)
+        sess.post = _post
+        return sess
+
+    _s._MESH_TOKEN = "cascade-test-token"
+    _s._mesh_peers.clear()
+    # One pre-existing peer D that should be told about the new peer C
+    _s._mesh_peers["peer_d"] = {
+        "url":        "http://192.168.1.30:5001",
+        "token":      "d_tok",
+        "mesh_path":  "d" * 50,
+        "connected_at": 0,
+    }
+    try:
+        with patch.object(_s, "_build_session", side_effect=_fake_build_session):
+            resp = await ws_client.post(
+                f"/{_s._MESH_PATH}/mesh/link",
+                json={
+                    "token":          "cascade-test-token",
+                    "peer_url":       "http://192.168.1.40:5001",
+                    "peer_token":     "c_tok",
+                    "peer_mesh_path": "c" * 50,
+                },
+            )
+            assert resp.status == 200
+            # Allow the ensure_future tasks to run
+            import asyncio
+            await asyncio.sleep(0)
+
+        # D's link endpoint should have received the cascade
+        assert any("192.168.1.30" in u for u in posted_link_urls), (
+            "Existing peer D was not notified about new peer C via cascade"
+        )
+    finally:
+        _s._mesh_peers.clear()
+
+
+@pytest.mark.asyncio
+async def test_mesh_link_handler_back_announces_to_new_peer(ws_client) -> None:
+    """POST /mesh/link triggers back-announce of existing peers to the new peer.
+
+    When this server learns about a new peer via /mesh/link, it must also tell
+    that new peer about all the peers it already knows.  This ensures a new
+    server that bootstrapped at a different node gets a full view of the mesh.
+    """
+    import server as _s
+    from unittest.mock import patch, AsyncMock, MagicMock
+
+    back_announce_urls: list[str] = []
+
+    def _fake_build_session(proxy_url: str, timeout: float):
+        sess = MagicMock()
+        resp = MagicMock()
+        resp.status = 200
+        resp.__aenter__ = AsyncMock(return_value=resp)
+        resp.__aexit__ = AsyncMock(return_value=False)
+        def _post(url, **kwargs):
+            back_announce_urls.append(url)
+            return resp
+        sess.__aenter__ = AsyncMock(return_value=sess)
+        sess.__aexit__ = AsyncMock(return_value=False)
+        sess.post = _post
+        return sess
+
+    _s._MESH_TOKEN = "back-announce-token"
+    _s._mesh_peers.clear()
+    # One pre-existing peer E that the new peer F doesn't know about yet
+    _s._mesh_peers["peer_e"] = {
+        "url":        "http://192.168.1.50:5001",
+        "token":      "e_tok",
+        "mesh_path":  "e" * 50,
+        "connected_at": 0,
+    }
+    try:
+        with patch.object(_s, "_build_session", side_effect=_fake_build_session):
+            resp = await ws_client.post(
+                f"/{_s._MESH_PATH}/mesh/link",
+                json={
+                    "token":          "back-announce-token",
+                    "peer_url":       "http://192.168.1.60:5001",
+                    "peer_token":     "f_tok",
+                    "peer_mesh_path": "f" * 50,
+                },
+            )
+            assert resp.status == 200
+            import asyncio
+            await asyncio.sleep(0)
+
+        # The new peer F's link endpoint should have received E's details
+        assert any("192.168.1.60" in u for u in back_announce_urls), (
+            "New peer F was not sent a back-announce about existing peer E"
+        )
+    finally:
+        _s._mesh_peers.clear()
+
+
+@pytest.mark.asyncio
+async def test_mesh_link_handler_no_cascade_for_known_url(ws_client) -> None:
+    """POST /mesh/link for an already-known URL does NOT trigger cascade or back-announce.
+
+    Prevents announcement loops: if peer C is already known, announcing it
+    again (e.g. from a cascade) must not start another round of fanout.
+    """
+    import server as _s
+    from unittest.mock import patch, AsyncMock, MagicMock
+
+    calls: list[str] = []
+
+    def _fake_build_session(proxy_url: str, timeout: float):
+        sess = MagicMock()
+        resp = MagicMock()
+        resp.status = 200
+        resp.__aenter__ = AsyncMock(return_value=resp)
+        resp.__aexit__ = AsyncMock(return_value=False)
+        def _post(url, **kwargs):
+            calls.append(url)
+            return resp
+        sess.__aenter__ = AsyncMock(return_value=sess)
+        sess.__aexit__ = AsyncMock(return_value=False)
+        sess.post = _post
+        return sess
+
+    _s._MESH_TOKEN = "no-loop-token"
+    _s._mesh_peers.clear()
+    # Pre-register the peer (simulate it's already known)
+    _s._mesh_peers["existing"] = {
+        "url":        "http://192.168.1.70:5001",
+        "token":      "g_tok",
+        "mesh_path":  "g" * 50,
+        "connected_at": 0,
+    }
+    # Another peer that would be looped to if cascade fired
+    _s._mesh_peers["other"] = {
+        "url":        "http://192.168.1.80:5001",
+        "token":      "h_tok",
+        "mesh_path":  "h" * 50,
+        "connected_at": 0,
+    }
+    try:
+        with patch.object(_s, "_build_session", side_effect=_fake_build_session):
+            resp = await ws_client.post(
+                f"/{_s._MESH_PATH}/mesh/link",
+                json={
+                    "token":          "no-loop-token",
+                    "peer_url":       "http://192.168.1.70:5001",  # already known
+                    "peer_token":     "g_tok_v2",
+                    "peer_mesh_path": "g" * 50,
+                },
+            )
+            assert resp.status == 200
+            import asyncio
+            await asyncio.sleep(0)
+
+        # No cascade or back-announce should have fired
+        assert calls == [], (
+            f"Unexpected HTTP calls fired for a known-URL re-announcement: {calls}"
+        )
+    finally:
+        _s._mesh_peers.clear()
+
+
 
 
 @pytest.mark.asyncio

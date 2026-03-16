@@ -551,7 +551,7 @@ def _start_tor(tor_exe: Path, server_port: int) -> tuple[str, object] | None:
 
     tor_process = None
     _tmp_data_dir: str | None = None
-    _last_exc: Exception | None = None
+    last_exc: Exception | None = None
     for attempt in range(3):
         if attempt > 0:
             config["ControlPort"] = str(_free_port())
@@ -571,15 +571,15 @@ def _start_tor(tor_exe: Path, server_port: int) -> tuple[str, object] | None:
             )
             break
         except OSError as exc:
-            _last_exc = exc
+            last_exc = exc
             continue
         except Exception as exc:  # noqa: BLE001
             print(f"  Tor error: {exc}")
             return None
 
     if tor_process is None:
-        if _last_exc:
-            print(f"  Tor failed to start: {_last_exc}")
+        if last_exc:
+            print(f"  Tor failed to start: {last_exc}")
         else:
             print("  Tor failed to start.")
         return None
