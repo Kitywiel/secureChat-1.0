@@ -119,6 +119,57 @@ If you want to expose secureChat over the clearnet without Tor:
 
 ---
 
+## Local Cluster (multiple instances on one machine)
+
+Run several secureChat instances on the same machine — each on a different port
+or URL — and keep them in sync over the loopback interface (`127.0.0.1`).
+Useful when you want to expose the same chat service on multiple URLs (Tor
+`.onion` + clearnet + LAN) while ensuring messages and file downloads always
+stay consistent.
+
+### Step 1 — Start the local mesh hub
+
+```
+python local_mesh.py
+```
+
+By default the hub listens on `127.0.0.1:9000`.  You can change the port with
+`LOCAL_MESH_PORT`:
+
+```
+LOCAL_MESH_PORT=9001 python local_mesh.py
+```
+
+### Step 2 — Start each server instance
+
+Set `LOCAL_MESH_PORT` to the hub port and `FILE_STORAGE` to a shared directory
+on **every** instance:
+
+```
+# Instance A — primary Tor hidden service
+LOCAL_MESH_PORT=9000 FILE_STORAGE=storage PORT=5000 python run.py
+
+# Instance B — clearnet / LAN
+LOCAL_MESH_PORT=9000 FILE_STORAGE=storage PORT=5001 python run.py
+```
+
+Or with command-line flags:
+
+```
+python run.py --local-mesh-port 9000 --file-storage storage --port 5000
+python run.py --local-mesh-port 9000 --file-storage storage --port 5001
+```
+
+### What you get
+
+| Feature | Detail |
+|---|---|
+| **Chat sync** | A message sent on any instance is instantly relayed to all other instances over loopback — no matter which URL the sender used. |
+| **Cross-URL file downloads** | Uploaded files land in the shared `FILE_STORAGE` directory. Any instance can serve the download link regardless of which URL was used to upload. |
+| **Head admin cluster panel** | The admin panel on any instance shows a "🕸️ Local Cluster" section with live CPU/RAM/room/file stats for every registered instance. |
+
+---
+
 ## Environment Variables
 
 All configuration can be set in a `.env` file next to `run.py`.

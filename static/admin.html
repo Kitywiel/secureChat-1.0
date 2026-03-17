@@ -90,6 +90,16 @@ section h2{font-size:1rem;font-weight:700;margin-bottom:.75rem;padding-bottom:.4
 #metrics-range:focus{border-color:var(--accent)}
 #metrics-chart-wrap{position:relative;height:280px;background:#000;
                     border:1px solid var(--border);border-radius:8px;padding:.5rem}
+/* ── Local Cluster section ── */
+.cluster-table{width:100%;border-collapse:collapse;font-size:.82rem}
+.cluster-table th{text-align:left;color:var(--dim);font-weight:600;text-transform:uppercase;
+                  letter-spacing:.05em;padding:.4rem .75rem;border-bottom:1px solid var(--border)}
+.cluster-table td{padding:.45rem .75rem;border-bottom:1px solid #1e1e1e}
+.cluster-table tr:last-child td{border-bottom:none}
+.cluster-ok{color:var(--accent)}
+.cluster-err{color:var(--red)}
+.cluster-na{color:#444;font-size:.82rem;padding:.5rem 0}
+.cluster-main{color:#f59e0b;font-weight:700;margin-left:.35rem}
 </style>
 </head>
 <body>
@@ -158,7 +168,12 @@ function renderSysResources(s){
   }
   let html='<div class="res-grid">';
   if(s.sys_cpu_percent!==undefined){
-    html+=resCard('🖥️','CPU',s.sys_cpu_percent,'','');
+    const cores=s.sys_cpu_physical&&s.sys_cpu_logical
+      ?`${s.sys_cpu_physical}P / ${s.sys_cpu_logical}L cores`:'';
+    const freq=s.sys_cpu_freq_mhz?`${(s.sys_cpu_freq_mhz/1000).toFixed(2)} GHz`:'';
+    const modelLine=s.sys_cpu_model||'';
+    const sub=freq?`${modelLine?modelLine+' · ':''}${freq}`:modelLine;
+    html+=resCard('🖥️','CPU',s.sys_cpu_percent,cores,sub);
   }
   if(s.sys_ram_percent!==undefined){
     html+=resCard('🧠','RAM',s.sys_ram_percent,
@@ -254,6 +269,10 @@ async function renderDashboard(){
       </div>
     </section>
     <section>
+      <h2>🕸️ Local Cluster</h2>
+      <div id="cluster-area"><p class="cluster-na">Loading cluster data…</p></div>
+    </section>
+    <section>
       <h2>Chats by Self-Destruct Timer</h2>
       <div id="timer-breakdown">${renderTimerBreakdown(stats.rooms_by_destruct)}</div>
     </section>
@@ -273,6 +292,7 @@ async function renderDashboard(){
     </section>
     <section>
       <h2>Live Logs</h2>
+      <div id="log-src-label" style="font-size:.78rem;color:var(--dim);margin-bottom:.4rem">📋 Live logs (this instance)</div>
       <div id="log-box"></div>
     </section>
     <section>
@@ -568,6 +588,10 @@ async function renderDashboard(){
 
   startLogStream();
 
+  // Refresh cluster stats on load and every 10 seconds.
+  refreshCluster();
+  setInterval(refreshCluster,10000);
+
   // Refresh stats every 5s (system metrics need faster refresh for live monitoring)
   setInterval(async()=>{
     const s=await fetchStats();
@@ -601,10 +625,145 @@ function renderTimerBreakdown(obj){
       <strong>${k}</strong>: ${v}</div>`).join('');
 }
 
+/** Render the Local Cluster section from the cluster-stats API response. */
+function renderCluster(data){
+  if(!data){
+    return '<p class="cluster-na">Could not reach local mesh hub.</p>';
+  }
+  if(data.error&&(!data.instances||!data.instances.length)){
+    return `<p class="cluster-na">ℹ️ ${data.error}</p>`;
+  }
+  if(!data.instances||!data.instances.length){
+    return '<p class="cluster-na">No instances registered with the hub yet.</p>';
+  }
+  let rows='';
+  data.instances.forEach(inst=>{
+    const status=inst.ok
+      ?`<span class="cluster-ok">● online</span>`
+      :`<span class="cluster-err">● offline${inst.error?' ('+inst.error+')':''}</span>`;
+    const cpu=inst.sys_cpu_percent!=null?inst.sys_cpu_percent+'%':'—';
+    const ram=inst.sys_ram_percent!=null?inst.sys_ram_percent+'%':'—';
+    const rooms=inst.open_rooms!=null?inst.open_rooms:'—';
+    const files=inst.open_file_transfers!=null?inst.open_file_transfers:'—';
+    const inboxMsgs=inst.inbox_msgs_received_total!=null?inst.inbox_msgs_received_total:'—';
+    const mainBadge=inst.is_main?`<span title="Main server — admin panel redirects here" style="color:#f59e0b;font-weight:700;margin-left:.35rem">⭐ Main</span>`:'';
+    const displayUrl=(inst.server_name&&inst.server_name.trim())
+      ?`${inst.url||inst.instance_id} | <strong>${_esc(inst.server_name)}</strong>${mainBadge}`
+      :`${inst.url||inst.instance_id}${mainBadge}`;
+    const iid=_esc(inst.instance_id||'');
+    const lockBtn=inst.ok
+      ?`<button onclick="clusterLockdown('${iid}')" style="padding:.25rem .6rem;background:#b91c1c;border:none;border-radius:5px;color:#fff;font-size:.72rem;cursor:pointer;font-family:var(--font)">🔴 Lockdown</button>`
+      :'';
+    const logsBtn=inst.ok&&inst.url
+      ?`<button onclick="loadInstanceLogs('${_esc(inst.url)}')" style="padding:.25rem .6rem;background:#1a3a5c;border:none;border-radius:5px;color:#ccc;font-size:.72rem;cursor:pointer;font-family:var(--font);margin-left:.3rem">📋 Logs</button>`
+      :'';
+    rows+=`<tr>
+      <td><code style="font-size:.78rem">${displayUrl}</code></td>
+      <td>${status}</td>
+      <td>${cpu}</td>
+      <td>${ram}</td>
+      <td>${rooms}</td>
+      <td>${files}</td>
+      <td>${inboxMsgs}</td>
+      <td>${lockBtn}${logsBtn}</td>
+    </tr>`;
+  });
+  const hubInfo=data.hub_port?`Hub: 127.0.0.1:${data.hub_port}`:'';
+  const clusterMail=data.cluster_inbox_msgs_total!=null
+    ?`<span style="margin-left:1.2rem;color:var(--dim)">📬 Cluster mail total: <strong style="color:#ccc">${data.cluster_inbox_msgs_total}</strong></span>`
+    :'';
+  return `
+    <div style="display:flex;align-items:center;flex-wrap:wrap;gap:.5rem;margin-bottom:.6rem">
+      <p style="font-size:.78rem;color:var(--dim);margin:0">${hubInfo}${clusterMail}</p>
+      <button onclick="clusterLockdown('all')" style="margin-left:auto;padding:.35rem .9rem;background:#7f1d1d;border:none;border-radius:6px;color:#fff;font-size:.8rem;font-weight:700;cursor:pointer;font-family:var(--font)">🔴 Global Lockdown</button>
+    </div>
+    <table class="cluster-table">
+      <thead><tr>
+        <th>Instance URL</th><th>Status</th>
+        <th>CPU</th><th>RAM</th><th>Rooms</th><th>Files</th><th>Mail</th><th>Actions</th>
+      </tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+}
+
+function _esc(s){
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+async function clusterLockdown(instanceId){
+  const isAll=instanceId==='all';
+  const msg=isAll
+    ?'⚠️ GLOBAL CLUSTER LOCKDOWN\n\nThis will wipe ALL data and block ALL visitors on EVERY instance.\n\nContinue?'
+    :`⚠️ INSTANCE LOCKDOWN\n\nThis will wipe all data on instance: ${instanceId}\n\nContinue?`;
+  if(!confirm(msg))return;
+  try{
+    const body=isAll?{action:'activate'}:{action:'activate',instance_id:instanceId};
+    const r=await fetch(_AP+'/api/cluster-lockdown',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(body),
+    });
+    const d=await r.json();
+    const failed=d.results?d.results.filter(x=>!x.ok):[];
+    if(failed.length)alert('⚠️ Lockdown sent, but failed on: '+failed.map(x=>x.url||x.instance_id).join(', '));
+    else alert('✅ Lockdown activated.');
+    refreshCluster();
+  }catch(e){alert('Error: '+e);}
+}
+
+async function loadInstanceLogs(instanceUrl){
+  const logBox=document.getElementById('log-box');
+  const logSrc=document.getElementById('log-src-label');
+  if(!logBox)return;
+  if(logSrc)logSrc.textContent='Loading logs from '+instanceUrl+' …';
+  try{
+    const r=await fetch(_AP+'/api/cluster-logs?instance_url='+encodeURIComponent(instanceUrl)+'&n=200');
+    if(!r.ok){if(logSrc)logSrc.textContent='Error loading logs (HTTP '+r.status+')';return;}
+    const data=await r.json();
+    logBox.innerHTML='';
+    const name=(data.server_name&&data.server_name.trim())?data.server_name:instanceUrl;
+    if(logSrc)logSrc.innerHTML=`📋 Logs from: <strong>${_esc(name)}</strong>
+      <button onclick="resetToLiveLog()" style="margin-left:.7rem;padding:.2rem .6rem;background:#1e3a1e;border:none;border-radius:5px;color:#ccc;font-size:.72rem;cursor:pointer;font-family:var(--font)">↩ Live logs</button>`;
+    (data.lines||[]).forEach(t=>{
+      const line=document.createElement('div');
+      line.className='log-line '+_logClass(t);
+      line.textContent=t;
+      logBox.appendChild(line);
+    });
+    logBox.scrollTop=logBox.scrollHeight;
+  }catch(e){if(logSrc)logSrc.textContent='Error: '+e;}
+}
+
+function resetToLiveLog(){
+  const logSrc=document.getElementById('log-src-label');
+  if(logSrc)logSrc.innerHTML='📋 Live logs (this instance)';
+  const logBox=document.getElementById('log-box');
+  if(logBox)logBox.innerHTML='';
+  startLogStream();
+}
+
+async function refreshCluster(){
+  const area=document.getElementById('cluster-area');
+  if(!area)return;
+  try{
+    const r=await fetch(_AP+'/api/cluster-stats');
+    if(!r.ok){area.innerHTML='<p class="cluster-na">Cluster stats unavailable.</p>';return;}
+    const data=await r.json();
+    area.innerHTML=renderCluster(data);
+  }catch(_){
+    area.innerHTML='<p class="cluster-na">Could not reach local mesh hub.</p>';
+  }
+}
+
+let _liveLogEs=null;
+
 function startLogStream(){
   const box=document.getElementById('log-box');
   if(!box)return;
+  // Close any previously open SSE stream (e.g. after resetToLiveLog).
+  if(_liveLogEs){try{_liveLogEs.close();}catch(_){}_liveLogEs=null;}
   const es=new EventSource(_AP+'/api/logs');
+  _liveLogEs=es;
   es.addEventListener('log',e=>{
     const line=document.createElement('div');
     const t=e.data||'';
@@ -615,7 +774,15 @@ function startLogStream(){
     // Keep last 500 lines
     while(box.children.length>500)box.removeChild(box.firstChild);
   });
-  es.onerror=()=>{es.close();setTimeout(startLogStream,3000);};
+  es.onerror=()=>{
+    es.close();
+    _liveLogEs=null;
+    setTimeout(()=>{
+      // Only restart if we're still in live-log mode (not viewing instance logs).
+      const logSrc=document.getElementById('log-src-label');
+      if(logSrc&&logSrc.textContent.startsWith('📋 Live'))startLogStream();
+    },3000);
+  };
 }
 
 /**

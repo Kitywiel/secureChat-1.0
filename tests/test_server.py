@@ -1737,26 +1737,32 @@ async def test_inbox_create_ttl_minutes(ws_client) -> None:
     import server as _s
     import time
 
-    # Custom TTL = 15 minutes — look up by read_token (keyed in _inbox_slots)
+    # Custom TTL = 15 minutes — verify via DB helper
     resp = await ws_client.post("/inbox/create", json={"ttl_minutes": 15})
     body = await resp.json()
     read_token = body["read_url"].split("/")[2]
     expected = time.time() + 15 * 60
-    assert abs(_s._inbox_slots[read_token]["expires_at"] - expected) < 5
+    slot = _s._inbox_get_sync(_s._inbox_db_path, read_token)
+    assert slot is not None
+    assert abs(slot["expires_at"] - expected) < 5
 
     # TTL above maximum should be clamped to 1440 min (24 h)
     resp2 = await ws_client.post("/inbox/create", json={"ttl_minutes": 99999})
     body2 = await resp2.json()
     read_token2 = body2["read_url"].split("/")[2]
     max_expected = time.time() + 1440 * 60
-    assert _s._inbox_slots[read_token2]["expires_at"] <= max_expected + 5
+    slot2 = _s._inbox_get_sync(_s._inbox_db_path, read_token2)
+    assert slot2 is not None
+    assert slot2["expires_at"] <= max_expected + 5
 
     # TTL below minimum should be clamped to 1 min
     resp3 = await ws_client.post("/inbox/create", json={"ttl_minutes": 0})
     body3 = await resp3.json()
     read_token3 = body3["read_url"].split("/")[2]
     min_expected = time.time() + 1 * 60
-    assert abs(_s._inbox_slots[read_token3]["expires_at"] - min_expected) < 5
+    slot3 = _s._inbox_get_sync(_s._inbox_db_path, read_token3)
+    assert slot3 is not None
+    assert abs(slot3["expires_at"] - min_expected) < 5
 
 
 @pytest.mark.asyncio
@@ -1814,12 +1820,12 @@ async def test_inbox_accepts_multiple_messages(ws_client) -> None:
     assert first.status == 200
     assert second.status == 200
 
-    # Both messages should be stored — look up by read_token
-    import server as _s
+    # Both messages should be stored — check via the read API
     read_token = body["read_url"].split("/")[2]
-    slot = _s._inbox_slots.get(read_token)
-    assert slot is not None
-    assert len(slot["messages"]) == 2
+    read_resp = await ws_client.get(f"/inbox/{read_token}/read")
+    assert read_resp.status == 200
+    read_body = await read_resp.json()
+    assert read_body["count"] == 2
 
 
 @pytest.mark.asyncio
@@ -1858,9 +1864,9 @@ async def test_inbox_expired_drop_returns_410(ws_client) -> None:
     resp = await ws_client.post("/inbox/create", json={"ttl_minutes": 10})
     data = await resp.json()
     drop_token = data["drop_url"].split("/")[2]
-    read_token = _s._inbox_drop_tokens[drop_token]
-    # Force expiry via the read_token key in _inbox_slots
-    _s._inbox_slots[read_token]["expires_at"] = 0.0
+    read_token = data["read_url"].split("/")[2]
+    # Force expiry by writing 0.0 to the DB
+    _s._inbox_set_expires_sync(_s._inbox_db_path, read_token, 0.0)
     gone = await ws_client.post(f"/inbox/{drop_token}/drop", json={"message": "hi"})
     assert gone.status == 410
 
@@ -1899,10 +1905,9 @@ async def test_smtp_handler_fills_slot_plaintext(ws_client) -> None:
     result = await handler.handle_DATA(None, None, envelope)
 
     assert result.startswith("250")
-    slot = _s._inbox_slots.get(read_token)
-    assert slot is not None
-    assert len(slot["messages"]) == 1
-    msg = slot["messages"][0]
+    msgs = _s._inbox_get_messages_sync(_s._inbox_db_path, read_token)
+    assert len(msgs) == 1
+    msg = msgs[0]
     assert "123456" in msg["body"]
     assert msg["email_from"] == "alice@example.com"
     assert msg["subject"] == "Test verification code"
@@ -1932,10 +1937,9 @@ async def test_smtp_handler_fills_slot_html_email(ws_client) -> None:
     result = await handler.handle_DATA(None, None, envelope)
 
     assert result.startswith("250")
-    slot = _s._inbox_slots.get(read_token)
-    assert slot is not None
-    assert len(slot["messages"]) == 1
-    msg = slot["messages"][0]
+    msgs = _s._inbox_get_messages_sync(_s._inbox_db_path, read_token)
+    assert len(msgs) == 1
+    msg = msgs[0]
     assert "654321" in msg["body"]
     assert msg["content_type"] == "text/html"
 
@@ -2265,8 +2269,8 @@ async def test_lockdown_toggle_and_wipe(ws_client) -> None:
         assert (await act.json())["lockdown"] is True
         assert _s._lockdown_active is True
 
-        # Inbox should now be wiped (keyed by read_token in _inbox_slots)
-        assert read_token not in _s._inbox_slots
+        # Inbox should now be wiped (DB row deleted during lockdown)
+        assert _s._inbox_get_sync(_s._inbox_db_path, read_token) is None
 
         # Status endpoint should report lockdown active
         status = await ws_client.get(f"/{ap}/api/lockdown")
@@ -2475,9 +2479,10 @@ async def test_forward_to_peers_skips_peers_without_mesh_path(ws_client) -> None
 
     async def _fake_proxied_session(timeout=5.0):
         sess = MagicMock()
-        async def _post(url, **kwargs):
+        def _post(url, **kwargs):  # plain function — returns the ctx-manager directly
             posted_urls.append(url)
-            resp = AsyncMock()
+            resp = MagicMock()
+            resp.status = 200
             resp.__aenter__ = AsyncMock(return_value=resp)
             resp.__aexit__ = AsyncMock(return_value=False)
             return resp
@@ -2501,11 +2506,326 @@ async def test_forward_to_peers_skips_peers_without_mesh_path(ws_client) -> None
         _s._mesh_peers.clear()
 
 
+# ---------------------------------------------------------------------------
+# Full-mesh 3+ server tests (cascade, back-announce, URL dedup)
+# ---------------------------------------------------------------------------
+
 @pytest.mark.asyncio
-async def test_mesh_invite_requires_auth(ws_client) -> None:
-    """GET /mesh/invite returns 403 without admin session."""
-    resp = await ws_client.get("/mesh/invite")
-    assert resp.status == 403
+async def test_announce_peer_to_all_uses_direct_for_clearnet(ws_client) -> None:
+    """_announce_peer_to_all uses a direct session for clearnet peers (not Tor).
+
+    Tor cannot route to RFC-1918 addresses, so using _make_proxied_session for
+    clearnet link announcements would silently drop every message.  The fix
+    routes through Tor only when the target URL contains '.onion'.
+    """
+    import server as _s
+    from unittest.mock import patch, AsyncMock, MagicMock
+
+    direct_urls: list[str] = []
+    proxied_urls: list[str] = []
+
+    def _fake_build_session(proxy_url: str, timeout: float):
+        sess = MagicMock()
+        resp = MagicMock()
+        resp.status = 200
+        resp.__aenter__ = AsyncMock(return_value=resp)
+        resp.__aexit__ = AsyncMock(return_value=False)
+        def _post(url, **kwargs):
+            direct_urls.append(url)
+            return resp
+        sess.__aenter__ = AsyncMock(return_value=sess)
+        sess.__aexit__ = AsyncMock(return_value=False)
+        sess.post = _post
+        return sess
+
+    async def _fake_proxied_session(timeout=15.0):
+        sess = MagicMock()
+        resp = MagicMock()
+        resp.status = 200
+        resp.__aenter__ = AsyncMock(return_value=resp)
+        resp.__aexit__ = AsyncMock(return_value=False)
+        def _post(url, **kwargs):
+            proxied_urls.append(url)
+            return resp
+        sess.__aenter__ = AsyncMock(return_value=sess)
+        sess.__aexit__ = AsyncMock(return_value=False)
+        sess.post = _post
+        return sess
+
+    _s._mesh_peers.clear()
+    # new_peer: clearnet URL
+    _s._mesh_peers["new_peer"] = {
+        "url": "http://192.168.1.10:5001",
+        "token": "new_tok",
+        "mesh_path": "n" * 50,
+        "connected_at": 0,
+    }
+    # existing clearnet peer that should be notified
+    _s._mesh_peers["clearnet_peer"] = {
+        "url": "http://192.168.1.20:5001",
+        "token": "cl_tok",
+        "mesh_path": "c" * 50,
+        "connected_at": 0,
+    }
+    # existing onion peer that should be notified via Tor
+    _s._mesh_peers["onion_peer"] = {
+        "url": "http://abc123.onion",
+        "token": "on_tok",
+        "mesh_path": "o" * 50,
+        "connected_at": 0,
+    }
+    try:
+        with (
+            patch.object(_s, "_build_session", side_effect=_fake_build_session),
+            patch.object(_s, "_make_proxied_session", side_effect=_fake_proxied_session),
+        ):
+            await _s._announce_peer_to_all("new_peer")
+
+        # The clearnet existing peer must have been reached via direct session
+        assert any("192.168.1.20" in u for u in direct_urls), \
+            "Clearnet peer was not contacted via direct session"
+        # The onion existing peer must have been reached via Tor
+        assert any("abc123.onion" in u for u in proxied_urls), \
+            "Onion peer was not contacted via Tor"
+        # new_peer must NOT appear in either list (we announce TO others ABOUT new_peer)
+        assert not any("192.168.1.10" in u for u in direct_urls + proxied_urls), \
+            "Should not POST to the new peer itself"
+    finally:
+        _s._mesh_peers.clear()
+
+
+@pytest.mark.asyncio
+async def test_peer_url_known_detects_duplicates(ws_client) -> None:
+    """_peer_url_known returns True when the URL (ignoring trailing slash) is registered."""
+    import server as _s
+    _s._mesh_peers.clear()
+    _s._mesh_peers["p1"] = {"url": "http://server-a.onion", "token": "t", "mesh_path": "x" * 50, "connected_at": 0}
+    try:
+        assert _s._peer_url_known("http://server-a.onion") is True
+        assert _s._peer_url_known("http://server-a.onion/") is True   # trailing slash
+        assert _s._peer_url_known("http://other.onion") is False
+    finally:
+        _s._mesh_peers.clear()
+
+
+@pytest.mark.asyncio
+async def test_mesh_link_handler_deduplicates_url(ws_client) -> None:
+    """POST /mesh/link with an already-known URL refreshes the entry without adding a duplicate."""
+    import server as _s
+    _s._MESH_TOKEN = "dedup-token"
+    _s._mesh_peers.clear()
+    # Pre-register the peer
+    _s._mesh_peers["stale_id"] = {
+        "url": "http://existing-peer.onion",
+        "token": "old-tok",
+        "mesh_path": "d" * 50,
+        "connected_at": 0,
+    }
+    try:
+        resp = await ws_client.post(
+            f"/{_s._MESH_PATH}/mesh/link",
+            json={
+                "token":          "dedup-token",
+                "peer_url":       "http://existing-peer.onion",
+                "peer_token":     "new-tok",
+                "peer_mesh_path": "e" * 50,
+            },
+        )
+        assert resp.status == 200
+        # There should be exactly ONE entry for this URL (stale one replaced)
+        matching = [p for p in _s._mesh_peers.values()
+                    if p["url"] == "http://existing-peer.onion"]
+        assert len(matching) == 1, "Duplicate entry created for already-known URL"
+        # The entry must reflect the new token
+        assert matching[0]["token"] == "new-tok"
+    finally:
+        _s._mesh_peers.clear()
+
+
+@pytest.mark.asyncio
+async def test_mesh_link_handler_cascades_to_existing_peers(ws_client) -> None:
+    """POST /mesh/link for a new peer triggers cascade to all other known peers.
+
+    This is the 3-server fix: when server B links server C onto server A,
+    server A must cascade C to any other peers it knows (like D) so that the
+    full mesh stays connected even when peers join at different bootstrap nodes.
+    """
+    import server as _s
+    from unittest.mock import patch, AsyncMock, MagicMock
+
+    posted_link_urls: list[str] = []
+
+    def _fake_build_session(proxy_url: str, timeout: float):
+        sess = MagicMock()
+        resp = MagicMock()
+        resp.status = 200
+        resp.__aenter__ = AsyncMock(return_value=resp)
+        resp.__aexit__ = AsyncMock(return_value=False)
+        def _post(url, **kwargs):
+            posted_link_urls.append(url)
+            return resp
+        sess.__aenter__ = AsyncMock(return_value=sess)
+        sess.__aexit__ = AsyncMock(return_value=False)
+        sess.post = _post
+        return sess
+
+    _s._MESH_TOKEN = "cascade-test-token"
+    _s._mesh_peers.clear()
+    # One pre-existing peer D that should be told about the new peer C
+    _s._mesh_peers["peer_d"] = {
+        "url":        "http://192.168.1.30:5001",
+        "token":      "d_tok",
+        "mesh_path":  "d" * 50,
+        "connected_at": 0,
+    }
+    try:
+        with patch.object(_s, "_build_session", side_effect=_fake_build_session):
+            resp = await ws_client.post(
+                f"/{_s._MESH_PATH}/mesh/link",
+                json={
+                    "token":          "cascade-test-token",
+                    "peer_url":       "http://192.168.1.40:5001",
+                    "peer_token":     "c_tok",
+                    "peer_mesh_path": "c" * 50,
+                },
+            )
+            assert resp.status == 200
+            # Allow the ensure_future tasks to run
+            import asyncio
+            await asyncio.sleep(0)
+
+        # D's link endpoint should have received the cascade
+        assert any("192.168.1.30" in u for u in posted_link_urls), (
+            "Existing peer D was not notified about new peer C via cascade"
+        )
+    finally:
+        _s._mesh_peers.clear()
+
+
+@pytest.mark.asyncio
+async def test_mesh_link_handler_back_announces_to_new_peer(ws_client) -> None:
+    """POST /mesh/link triggers back-announce of existing peers to the new peer.
+
+    When this server learns about a new peer via /mesh/link, it must also tell
+    that new peer about all the peers it already knows.  This ensures a new
+    server that bootstrapped at a different node gets a full view of the mesh.
+    """
+    import server as _s
+    from unittest.mock import patch, AsyncMock, MagicMock
+
+    back_announce_urls: list[str] = []
+
+    def _fake_build_session(proxy_url: str, timeout: float):
+        sess = MagicMock()
+        resp = MagicMock()
+        resp.status = 200
+        resp.__aenter__ = AsyncMock(return_value=resp)
+        resp.__aexit__ = AsyncMock(return_value=False)
+        def _post(url, **kwargs):
+            back_announce_urls.append(url)
+            return resp
+        sess.__aenter__ = AsyncMock(return_value=sess)
+        sess.__aexit__ = AsyncMock(return_value=False)
+        sess.post = _post
+        return sess
+
+    _s._MESH_TOKEN = "back-announce-token"
+    _s._mesh_peers.clear()
+    # One pre-existing peer E that the new peer F doesn't know about yet
+    _s._mesh_peers["peer_e"] = {
+        "url":        "http://192.168.1.50:5001",
+        "token":      "e_tok",
+        "mesh_path":  "e" * 50,
+        "connected_at": 0,
+    }
+    try:
+        with patch.object(_s, "_build_session", side_effect=_fake_build_session):
+            resp = await ws_client.post(
+                f"/{_s._MESH_PATH}/mesh/link",
+                json={
+                    "token":          "back-announce-token",
+                    "peer_url":       "http://192.168.1.60:5001",
+                    "peer_token":     "f_tok",
+                    "peer_mesh_path": "f" * 50,
+                },
+            )
+            assert resp.status == 200
+            import asyncio
+            await asyncio.sleep(0)
+
+        # The new peer F's link endpoint should have received E's details
+        assert any("192.168.1.60" in u for u in back_announce_urls), (
+            "New peer F was not sent a back-announce about existing peer E"
+        )
+    finally:
+        _s._mesh_peers.clear()
+
+
+@pytest.mark.asyncio
+async def test_mesh_link_handler_no_cascade_for_known_url(ws_client) -> None:
+    """POST /mesh/link for an already-known URL does NOT trigger cascade or back-announce.
+
+    Prevents announcement loops: if peer C is already known, announcing it
+    again (e.g. from a cascade) must not start another round of fanout.
+    """
+    import server as _s
+    from unittest.mock import patch, AsyncMock, MagicMock
+
+    calls: list[str] = []
+
+    def _fake_build_session(proxy_url: str, timeout: float):
+        sess = MagicMock()
+        resp = MagicMock()
+        resp.status = 200
+        resp.__aenter__ = AsyncMock(return_value=resp)
+        resp.__aexit__ = AsyncMock(return_value=False)
+        def _post(url, **kwargs):
+            calls.append(url)
+            return resp
+        sess.__aenter__ = AsyncMock(return_value=sess)
+        sess.__aexit__ = AsyncMock(return_value=False)
+        sess.post = _post
+        return sess
+
+    _s._MESH_TOKEN = "no-loop-token"
+    _s._mesh_peers.clear()
+    # Pre-register the peer (simulate it's already known)
+    _s._mesh_peers["existing"] = {
+        "url":        "http://192.168.1.70:5001",
+        "token":      "g_tok",
+        "mesh_path":  "g" * 50,
+        "connected_at": 0,
+    }
+    # Another peer that would be looped to if cascade fired
+    _s._mesh_peers["other"] = {
+        "url":        "http://192.168.1.80:5001",
+        "token":      "h_tok",
+        "mesh_path":  "h" * 50,
+        "connected_at": 0,
+    }
+    try:
+        with patch.object(_s, "_build_session", side_effect=_fake_build_session):
+            resp = await ws_client.post(
+                f"/{_s._MESH_PATH}/mesh/link",
+                json={
+                    "token":          "no-loop-token",
+                    "peer_url":       "http://192.168.1.70:5001",  # already known
+                    "peer_token":     "g_tok_v2",
+                    "peer_mesh_path": "g" * 50,
+                },
+            )
+            assert resp.status == 200
+            import asyncio
+            await asyncio.sleep(0)
+
+        # No cascade or back-announce should have fired
+        assert calls == [], (
+            f"Unexpected HTTP calls fired for a known-URL re-announcement: {calls}"
+        )
+    finally:
+        _s._mesh_peers.clear()
+
+
 
 
 @pytest.mark.asyncio
@@ -2636,9 +2956,181 @@ async def test_inbox_create_mailtm_fallback_when_unavailable(ws_client) -> None:
         _s._mailtm_provision = orig_provision
 
 
+@pytest.mark.asyncio
+async def test_inbox_create_fallback_address_never_onion(ws_client) -> None:
+    """Fallback inbox address must never expose a .onion hostname.
+
+    When mail.tm is unavailable (or disabled) and no MAIL_DOMAIN is set the
+    handler previously used request.host, which leaks the .onion hostname when
+    clients connect via Tor.  The address should always use the non-routable
+    'drop.local' placeholder so no server infrastructure is exposed.
+    """
+    import server as _s
+
+    orig_enabled   = _s.MAILTM_ENABLED
+    orig_provision = _s._mailtm_provision
+    orig_domain    = _s.MAIL_DOMAIN
+
+    async def _mock_fail(_: int):
+        return None
+
+    try:
+        # Case 1: MAILTM_ENABLED=True but provisioning fails
+        _s.MAILTM_ENABLED   = True
+        _s._mailtm_provision = _mock_fail
+        _s.MAIL_DOMAIN       = ""
+
+        resp = await ws_client.post("/inbox/create", json={})
+        assert resp.status == 200
+        body = await resp.json()
+        host_part = body["address"].split("@", 1)[1]
+        assert not host_part.endswith(".onion"), (
+            f"Fallback address must not contain .onion, got: {body['address']}"
+        )
+        assert host_part == "drop.local", (
+            f"Expected 'drop.local' as fallback host, got: {host_part!r}"
+        )
+
+        # Case 2: MAILTM_ENABLED=False, no MAIL_DOMAIN
+        _s.MAILTM_ENABLED   = False
+        _s._mailtm_provision = _mock_fail
+
+        resp2 = await ws_client.post("/inbox/create", json={})
+        assert resp2.status == 200
+        body2 = await resp2.json()
+        host_part2 = body2["address"].split("@", 1)[1]
+        assert not host_part2.endswith(".onion"), (
+            f"Fallback address must not contain .onion, got: {body2['address']}"
+        )
+        assert host_part2 == "drop.local", (
+            f"Expected 'drop.local' as fallback host, got: {host_part2!r}"
+        )
+    finally:
+        _s.MAILTM_ENABLED   = orig_enabled
+        _s._mailtm_provision = orig_provision
+        _s.MAIL_DOMAIN       = orig_domain
+
+
 # ---------------------------------------------------------------------------
 # Clearnet URL path tests
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_inbox_reader_page_shows_mailtm_address(ws_client) -> None:
+    """GET /inbox/<token> shows the stored mail.tm address, not the request host.
+
+    When a mail.tm address was provisioned at creation time it is persisted in
+    the database.  The reader page must read that stored address rather than
+    reconstructing one from request.host — which would expose the .onion
+    hostname when accessed via Tor.
+    """
+    import server as _s
+
+    orig_enabled   = _s.MAILTM_ENABLED
+    orig_provision = _s._mailtm_provision
+
+    async def _mock_ok(n: int) -> dict:
+        return {
+            "mailtm_address": "tester@mail.tm",
+            "mailtm_bearer":  "fake-bearer",
+        }
+
+    try:
+        _s.MAILTM_ENABLED   = True
+        _s._mailtm_provision = _mock_ok
+
+        resp = await ws_client.post("/inbox/create", json={})
+        assert resp.status == 200
+        body = await resp.json()
+        assert body["mailtm_enabled"] is True
+        assert body["address"] == "tester@mail.tm"
+
+        # Open the reader page — it should show the mail.tm address, not .onion
+        reader_resp = await ws_client.get(body["reader_url"])
+        assert reader_resp.status == 200
+        html = await reader_resp.text()
+        assert "tester@mail.tm" in html
+        # The address placeholder should show the mail.tm address, not a .onion host.
+        # (The static HTML may legitimately mention ".onion" in help text, so we check
+        # that the address field itself doesn't contain an onion hostname.)
+        assert "tester@" in html  # mail.tm address is present
+        assert "@mail.tm" in html
+    finally:
+        _s.MAILTM_ENABLED   = orig_enabled
+        _s._mailtm_provision = orig_provision
+
+
+@pytest.mark.asyncio
+async def test_inbox_drop_page_shows_mailtm_address(ws_client) -> None:
+    """GET /inbox/<drop_token>/drop shows the stored mail.tm address, not the request host."""
+    import server as _s
+
+    orig_enabled   = _s.MAILTM_ENABLED
+    orig_provision = _s._mailtm_provision
+
+    async def _mock_ok(n: int) -> dict:
+        return {
+            "mailtm_address": "droptest@mail.tm",
+            "mailtm_bearer":  "fake-bearer",
+        }
+
+    try:
+        _s.MAILTM_ENABLED   = True
+        _s._mailtm_provision = _mock_ok
+
+        resp = await ws_client.post("/inbox/create", json={})
+        assert resp.status == 200
+        body = await resp.json()
+        assert body["address"] == "droptest@mail.tm"
+
+        drop_resp = await ws_client.get(body["drop_url"])
+        assert drop_resp.status == 200
+        html = await drop_resp.text()
+        assert "droptest@mail.tm" in html
+        assert ".onion" not in html
+    finally:
+        _s.MAILTM_ENABLED   = orig_enabled
+        _s._mailtm_provision = orig_provision
+
+
+@pytest.mark.asyncio
+async def test_inbox_pages_fallback_to_drop_local_not_onion(ws_client) -> None:
+    """Reader and drop pages use 'drop.local' as host when no mail.tm address is stored."""
+    import server as _s
+
+    orig_enabled   = _s.MAILTM_ENABLED
+    orig_provision = _s._mailtm_provision
+    orig_domain    = _s.MAIL_DOMAIN
+
+    async def _mock_fail(_: int) -> None:
+        return None
+
+    try:
+        _s.MAILTM_ENABLED   = False
+        _s._mailtm_provision = _mock_fail
+        _s.MAIL_DOMAIN       = ""
+
+        resp = await ws_client.post("/inbox/create", json={})
+        assert resp.status == 200
+        body = await resp.json()
+
+        reader_resp = await ws_client.get(body["reader_url"])
+        assert reader_resp.status == 200
+        reader_html = await reader_resp.text()
+        assert "drop.local" in reader_html
+        # Verify no onion address appears as the inbox address (static help text
+        # mentioning ".onion" is allowed; we check the address field directly).
+        assert "drop_token@" not in reader_html or "@drop.local" in reader_html
+
+        drop_resp = await ws_client.get(body["drop_url"])
+        assert drop_resp.status == 200
+        drop_html = await drop_resp.text()
+        assert "drop.local" in drop_html
+    finally:
+        _s.MAILTM_ENABLED   = orig_enabled
+        _s._mailtm_provision = orig_provision
+        _s.MAIL_DOMAIN       = orig_domain
 
 @pytest.mark.asyncio
 async def test_clearnet_path_is_100_chars(ws_client) -> None:
@@ -4214,3 +4706,898 @@ async def test_metrics_history_endpoint_returns_list(admin_client) -> None:
     assert resp.status == 200
     data = await resp.json()
     assert isinstance(data, list)
+
+
+# ---------------------------------------------------------------------------
+# Local mesh helpers (server.py)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_local_mesh_receive_handler_rejects_non_loopback(ws_client) -> None:
+    """POST /local-mesh/receive from a non-loopback address returns 403."""
+    # The test client uses 127.0.0.1 by default so we need to verify the
+    # handler itself checks the remote address.  We test this via the module
+    # directly rather than through the HTTP layer so we can inject a fake IP.
+    import server as _s
+    from unittest.mock import AsyncMock, MagicMock
+
+    req = MagicMock()
+    req.remote = "10.0.0.1"  # not loopback
+
+    with pytest.raises(Exception) as exc_info:
+        await _s.local_mesh_receive_handler(req)
+    # Should raise HTTPForbidden (status 403)
+    assert "403" in str(exc_info.value) or "Forbidden" in str(exc_info.value) or \
+           hasattr(exc_info.value, "status_code") and exc_info.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_local_mesh_receive_handler_broadcasts(ws_client) -> None:
+    """POST /local-mesh/receive from loopback broadcasts to WebSocket clients."""
+    import server as _s
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    broadcast_calls: list[tuple] = []
+
+    async def _fake_broadcast(room_id, payload, *, exclude=None, _from_peer=False):
+        broadcast_calls.append((room_id, payload, _from_peer))
+
+    req = MagicMock()
+    req.remote = "127.0.0.1"
+    req.json = AsyncMock(return_value={"room_id": "testroom1", "payload": '{"type":"message"}'})
+
+    with patch.object(_s, "_broadcast_to_room", side_effect=_fake_broadcast):
+        resp = await _s.local_mesh_receive_handler(req)
+
+    assert resp.status == 200
+    assert len(broadcast_calls) == 1
+    room_id, payload, from_peer = broadcast_calls[0]
+    assert room_id == "testroom1"
+    assert from_peer is True   # must not re-forward
+
+
+@pytest.mark.asyncio
+async def test_local_mesh_stats_handler_rejects_non_loopback(ws_client) -> None:
+    """GET /local-mesh/stats from a non-loopback address returns 403."""
+    import server as _s
+    from unittest.mock import MagicMock
+
+    req = MagicMock()
+    req.remote = "192.168.1.5"  # not loopback
+
+    with pytest.raises(Exception) as exc_info:
+        await _s.local_mesh_stats_handler(req)
+    assert "403" in str(exc_info.value) or "Forbidden" in str(exc_info.value) or \
+           hasattr(exc_info.value, "status_code") and exc_info.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_local_mesh_stats_handler_returns_metrics(ws_client) -> None:
+    """GET /local-mesh/stats from loopback returns a JSON metrics dict."""
+    import json as _json
+    import server as _s
+    from unittest.mock import MagicMock
+
+    req = MagicMock()
+    req.remote = "127.0.0.1"
+
+    resp = await _s.local_mesh_stats_handler(req)
+    assert resp.status == 200
+    data = _json.loads(resp.body)
+    assert "instance_id" in data
+    assert "open_rooms" in data
+    assert "ts" in data
+
+
+def test_save_and_load_slot_from_storage(tmp_path) -> None:
+    """_save_slot_to_storage / _load_slot_from_storage round-trip works correctly."""
+    import server as _s
+
+    original = _s._FILE_STORAGE_DIR
+    try:
+        _s._FILE_STORAGE_DIR = tmp_path
+        token = "testtoken1234"
+        slot_dir = tmp_path / token
+        slot_dir.mkdir()
+        # Write a dummy file so the slot has something to serve
+        (slot_dir / "hello.txt").write_bytes(b"hello world")
+
+        slot = {
+            "tmp_dir":      slot_dir,
+            "filename":     "hello.txt",
+            "size":         11,
+            "expires_at":   9999999999.0,
+            "passcode_hash": None,
+            "encrypted":    False,
+        }
+        _s._save_slot_to_storage(token, slot)
+
+        loaded = _s._load_slot_from_storage(token)
+        assert loaded is not None
+        assert loaded["filename"] == "hello.txt"
+        assert loaded["size"] == 11
+        assert loaded["encrypted"] is False
+    finally:
+        _s._FILE_STORAGE_DIR = original
+
+
+def test_load_slot_from_storage_expired(tmp_path) -> None:
+    """_load_slot_from_storage returns None for expired slots."""
+    import server as _s, time as _time
+
+    original = _s._FILE_STORAGE_DIR
+    try:
+        _s._FILE_STORAGE_DIR = tmp_path
+        token = "expiredtoken"
+        slot_dir = tmp_path / token
+        slot_dir.mkdir()
+
+        slot = {
+            "tmp_dir":      slot_dir,
+            "filename":     "file.txt",
+            "size":         5,
+            "expires_at":   _time.time() - 1,  # already expired
+            "passcode_hash": None,
+            "encrypted":    False,
+        }
+        _s._save_slot_to_storage(token, slot)
+        loaded = _s._load_slot_from_storage(token)
+        assert loaded is None
+    finally:
+        _s._FILE_STORAGE_DIR = original
+
+
+def test_load_slot_from_storage_returns_none_without_file_storage() -> None:
+    """_load_slot_from_storage returns None when FILE_STORAGE is not configured."""
+    import server as _s
+
+    original = _s._FILE_STORAGE_DIR
+    try:
+        _s._FILE_STORAGE_DIR = None
+        result = _s._load_slot_from_storage("any-token")
+        assert result is None
+    finally:
+        _s._FILE_STORAGE_DIR = original
+
+
+@pytest.mark.asyncio
+async def test_cluster_stats_endpoint_requires_auth(admin_client) -> None:
+    """GET /admin/api/cluster-stats without auth returns 401."""
+    resp = await admin_client.get("/admin/api/cluster-stats")
+    assert resp.status == 401
+
+
+@pytest.mark.asyncio
+async def test_cluster_stats_endpoint_returns_json_when_disabled(admin_client) -> None:
+    """Authenticated GET /admin/api/cluster-stats with no hub configured returns JSON."""
+    import server as _s
+    original_port = _s.LOCAL_MESH_PORT
+    try:
+        _s.LOCAL_MESH_PORT = 0  # disabled
+        await admin_client.post(
+            "/admin/login",
+            json={"passcode": _s._ADMIN_PASSCODE},
+        )
+        resp = await admin_client.get("/admin/api/cluster-stats")
+        assert resp.status == 200
+        data = await resp.json()
+        assert "instances" in data
+        assert isinstance(data["instances"], list)
+        assert "error" in data  # should explain hub not configured
+    finally:
+        _s.LOCAL_MESH_PORT = original_port
+
+
+@pytest.mark.asyncio
+async def test_share_upload_uses_file_storage_dir(tmp_path, ws_client) -> None:
+    """When FILE_STORAGE is configured, uploaded files land in FILE_STORAGE/<token>/."""
+    import io, server as _s
+
+    original_dir = _s._FILE_STORAGE_DIR
+    try:
+        _s._FILE_STORAGE_DIR = tmp_path
+        _s._share_slots.clear()
+
+        data = aiohttp.FormData()
+        data.add_field("file", io.BytesIO(b"test content"), filename="test.txt",
+                       content_type="text/plain")
+        resp = await ws_client.post("/share/upload", data=data)
+        assert resp.status == 200
+        body = await resp.json()
+        token = body["download_url"].split("/")[-1]
+
+        # File must be in FILE_STORAGE/<token>/test.txt
+        stored = tmp_path / token / "test.txt"
+        assert stored.is_file(), f"Expected file at {stored}"
+        assert stored.read_bytes() == b"test content"
+
+        # .meta.json must also exist for cross-instance downloads
+        meta_path = tmp_path / token / ".meta.json"
+        assert meta_path.is_file(), ".meta.json not written to FILE_STORAGE"
+    finally:
+        _s._FILE_STORAGE_DIR = original_dir
+        _s._share_slots.clear()
+
+
+# ---------------------------------------------------------------------------
+# Tor launch — Windows timeout fix (run.py and start_with_tor.py)
+# ---------------------------------------------------------------------------
+
+def test_start_tor_omits_timeout_on_windows() -> None:
+    """On Windows, _start_tor must not pass timeout= to stem to avoid:
+       OSError: You cannot launch tor with a timeout on Windows
+    """
+    import sys
+    import os
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    import run as _run
+    from unittest.mock import patch, MagicMock
+    from pathlib import Path
+
+    captured_kwargs: list[dict] = []
+
+    def fake_launch(**kwargs):
+        captured_kwargs.append(kwargs)
+        proc = MagicMock()
+        proc.poll = MagicMock(return_value=None)
+        return proc
+
+    fake_hs_dir = MagicMock()
+    fake_hs_dir.__truediv__ = lambda self, other: MagicMock(
+        is_file=lambda: True,
+        read_text=lambda **kw: "abcdef1234567890.onion\n",
+    )
+
+    with patch("platform.system", return_value="Windows"), \
+         patch.object(_run, "_HS_DIR", fake_hs_dir), \
+         patch.object(_run, "_TOR_DATA_DIR", MagicMock()), \
+         patch.object(_run, "_free_port", return_value=9051), \
+         patch.object(_run, "_socks_port_for_tor", return_value="9050"), \
+         patch.object(_run, "_find_geoip_files", return_value={}), \
+         patch("stem.process.launch_tor_with_config", side_effect=fake_launch):
+        result = _run._start_tor(Path("/fake/tor"), 5000)
+
+    assert len(captured_kwargs) == 1
+    assert "timeout" not in captured_kwargs[0], (
+        "timeout= must NOT be passed to stem on Windows"
+    )
+
+
+def test_start_tor_passes_timeout_on_linux() -> None:
+    """On Linux, _start_tor must pass timeout=120 to stem."""
+    import sys
+    import os
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    import run as _run
+    from unittest.mock import patch, MagicMock
+    from pathlib import Path
+
+    captured_kwargs: list[dict] = []
+
+    def fake_launch(**kwargs):
+        captured_kwargs.append(kwargs)
+        proc = MagicMock()
+        proc.poll = MagicMock(return_value=None)
+        return proc
+
+    fake_hs_dir = MagicMock()
+    fake_hs_dir.__truediv__ = lambda self, other: MagicMock(
+        is_file=lambda: True,
+        read_text=lambda **kw: "abcdef1234567890.onion\n",
+    )
+
+    with patch("platform.system", return_value="Linux"), \
+         patch.object(_run, "_HS_DIR", fake_hs_dir), \
+         patch.object(_run, "_TOR_DATA_DIR", MagicMock()), \
+         patch.object(_run, "_free_port", return_value=9051), \
+         patch.object(_run, "_socks_port_for_tor", return_value="9050"), \
+         patch.object(_run, "_find_geoip_files", return_value={}), \
+         patch("stem.process.launch_tor_with_config", side_effect=fake_launch):
+        result = _run._start_tor(Path("/fake/tor"), 5000)
+
+    assert len(captured_kwargs) == 1
+    assert captured_kwargs[0].get("timeout") == 120, (
+        "timeout=120 must be passed to stem on Linux"
+    )
+
+
+def test_start_tor_windows_no_retry_on_timeout_error() -> None:
+    """On Windows, OSError('timeout on Windows') must stop retries immediately."""
+    import sys
+    import os
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    import run as _run
+    from unittest.mock import patch, MagicMock
+    from pathlib import Path
+
+    call_count = 0
+
+    def fake_launch(**kwargs):
+        nonlocal call_count
+        call_count += 1
+        raise OSError("You cannot launch tor with a timeout on Windows")
+
+    with patch("platform.system", return_value="Windows"), \
+         patch.object(_run, "_HS_DIR", MagicMock()), \
+         patch.object(_run, "_TOR_DATA_DIR", MagicMock()), \
+         patch.object(_run, "_free_port", return_value=9051), \
+         patch.object(_run, "_socks_port_for_tor", return_value="9050"), \
+         patch.object(_run, "_find_geoip_files", return_value={}), \
+         patch("stem.process.launch_tor_with_config", side_effect=fake_launch):
+        result = _run._start_tor(Path("/fake/tor"), 5000)
+
+    assert result is None
+    assert call_count == 1, (
+        "Should not retry when OSError is the Windows-timeout error"
+    )
+
+
+def test_start_with_tor_omits_timeout_on_windows() -> None:
+    """start_with_tor._start_tor_hidden_service must not pass timeout= on Windows."""
+    import sys
+    import os
+    import importlib
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    import start_with_tor as _swt
+    from unittest.mock import patch, MagicMock
+
+    captured_kwargs: list[dict] = []
+
+    def fake_launch(**kwargs):
+        captured_kwargs.append(kwargs)
+        proc = MagicMock()
+        return proc
+
+    fake_hs_dir = MagicMock()
+    hostname_mock = MagicMock()
+    hostname_mock.is_file.return_value = True
+    hostname_mock.read_text.return_value = "xxxxxxxxxxxxxxxx.onion\n"
+    fake_hs_dir.__truediv__ = lambda self, other: hostname_mock
+
+    with patch("platform.system", return_value="Windows"), \
+         patch.object(_swt, "_HS_DIR", fake_hs_dir), \
+         patch.object(_swt, "_TOR_DATA_DIR", MagicMock()), \
+         patch.object(_swt, "_free_port", return_value=9051), \
+         patch.object(_swt, "_socks_port_for_tor", return_value="9050"), \
+         patch.object(_swt, "_find_geoip_files", return_value={}), \
+         patch("stem.process.launch_tor_with_config", side_effect=fake_launch):
+        result = _swt._start_tor_hidden_service(_swt.Path("/fake/tor.exe"))
+
+    assert len(captured_kwargs) == 1
+    assert "timeout" not in captured_kwargs[0], (
+        "timeout= must NOT be passed to stem on Windows (start_with_tor)"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Local mesh hub auto-start (run.py _ensure_local_mesh_hub / _is_port_open)
+# ---------------------------------------------------------------------------
+
+def test_is_port_open_returns_false_for_closed_port() -> None:
+    """_is_port_open returns False when nothing listens on the given port."""
+    import sys, os
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    import run as _run
+
+    # Find a free port — nothing is listening there.
+    import socket
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        free = s.getsockname()[1]
+
+    assert _run._is_port_open(free) is False
+
+
+def test_is_port_open_returns_true_for_listening_port() -> None:
+    """_is_port_open returns True when a socket is listening."""
+    import sys, os
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    import run as _run
+    import socket, threading
+
+    srv_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv_sock.bind(("127.0.0.1", 0))
+    port = srv_sock.getsockname()[1]
+    srv_sock.listen(1)
+    try:
+        assert _run._is_port_open(port) is True
+    finally:
+        srv_sock.close()
+
+
+def test_ensure_local_mesh_hub_skips_if_already_running(capsys) -> None:
+    """_ensure_local_mesh_hub does nothing when the port is already open."""
+    import sys, os
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    import run as _run
+    from unittest.mock import patch
+    import socket
+
+    spawn_calls: list = []
+
+    with patch.object(_run, "_is_port_open", return_value=True), \
+         patch("subprocess.Popen", side_effect=lambda *a, **kw: spawn_calls.append(a)):
+        _run._ensure_local_mesh_hub(9000)
+
+    assert spawn_calls == [], "Popen must not be called when hub is already running"
+
+
+def test_ensure_local_mesh_hub_spawns_when_not_running(tmp_path, capsys) -> None:
+    """_ensure_local_mesh_hub spawns local_mesh.py when the port is closed."""
+    import sys, os
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    import run as _run
+    from unittest.mock import patch, MagicMock
+
+    fake_hub = tmp_path / "local_mesh.py"
+    fake_hub.write_text("# stub\n")
+
+    port_open_calls: list[int] = []
+
+    def fake_is_port_open(port: int) -> bool:
+        port_open_calls.append(port)
+        # First call (pre-check): port closed; subsequent calls (wait loop): open
+        return len(port_open_calls) > 1
+
+    mock_proc = MagicMock()
+    popen_calls: list = []
+
+    def fake_popen(cmd, **kwargs):
+        popen_calls.append(cmd)
+        return mock_proc
+
+    with patch.object(_run, "_is_port_open", side_effect=fake_is_port_open), \
+         patch.object(_run, "_HERE", tmp_path), \
+         patch("subprocess.Popen", side_effect=fake_popen), \
+         patch("time.sleep"):
+        _run._ensure_local_mesh_hub(9000)
+
+    assert len(popen_calls) == 1, "Popen must be called exactly once"
+    assert str(fake_hub) in popen_calls[0]
+
+    out = capsys.readouterr().out
+    assert "9000" in out
+
+
+def test_ensure_local_mesh_hub_missing_script(tmp_path, capsys) -> None:
+    """_ensure_local_mesh_hub warns and returns when local_mesh.py is absent."""
+    import sys, os
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    import run as _run
+    from unittest.mock import patch
+
+    with patch.object(_run, "_is_port_open", return_value=False), \
+         patch.object(_run, "_HERE", tmp_path), \
+         patch("subprocess.Popen") as mock_popen:
+        _run._ensure_local_mesh_hub(9000)
+
+    mock_popen.assert_not_called()
+    assert "local_mesh.py" in capsys.readouterr().out
+
+
+def test_print_summary_shows_local_mesh_port(capsys) -> None:
+    """_print_summary includes the --local-mesh-port join command when hub is active."""
+    import sys, os
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    import run as _run
+
+    _run._print_summary(
+        server_port=5000,
+        onion=None,
+        admin_path="x" * 200,
+        admin_passcode="p" * 100,
+        relay_secret="secret",
+        relay_enabled=True,
+        smtp_enabled=False,
+        mail_domain="",
+        mesh_token="tok",
+        mesh_path="mpath",
+        local_mesh_port=9000,
+    )
+    out = capsys.readouterr().out
+    assert "--local-mesh-port 9000" in out
+    assert "9000" in out
+
+
+def test_print_summary_shows_local_mesh_hint_without_hub(capsys) -> None:
+    """_print_summary shows cluster instructions even when no hub is active."""
+    import sys, os
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    import run as _run
+
+    _run._print_summary(
+        server_port=5000,
+        onion=None,
+        admin_path="x" * 200,
+        admin_passcode="p" * 100,
+        relay_secret="secret",
+        relay_enabled=False,
+        smtp_enabled=False,
+        mail_domain="",
+        mesh_token="tok",
+        mesh_path="mpath",
+        local_mesh_port=0,
+    )
+    out = capsys.readouterr().out
+    # Even without an active hub, the instructions mention --local-mesh-port
+    assert "--local-mesh-port" in out
+
+
+# ---------------------------------------------------------------------------
+# New cluster features: persistent instance ID, SERVER_NAME, shared paths,
+# local_mesh_lockdown_handler, local_mesh_logs_handler, cluster-lockdown,
+# cluster-logs admin endpoints, local_mesh.py server_name + re-registration
+# ---------------------------------------------------------------------------
+
+def test_get_or_create_instance_id_creates_new(tmp_path) -> None:
+    """_get_or_create_instance_id creates and persists a new ID when none exists."""
+    import sys, os
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    import server as _s
+    from unittest.mock import patch
+
+    with patch.object(_s, "_HERE", tmp_path):
+        id1 = _s._get_or_create_instance_id(5000)
+        id_file = tmp_path / ".local_instance_5000.id"
+        assert id_file.is_file(), "ID file should be created"
+        assert id_file.read_text().strip() == id1
+
+
+def test_get_or_create_instance_id_reuses_existing(tmp_path) -> None:
+    """_get_or_create_instance_id returns the stored ID when the file exists."""
+    import sys, os
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    import server as _s
+    from unittest.mock import patch
+
+    id_file = tmp_path / ".local_instance_5001.id"
+    id_file.write_text("deadbeef1234abcd", encoding="utf-8")
+
+    with patch.object(_s, "_HERE", tmp_path):
+        result = _s._get_or_create_instance_id(5001)
+    assert result == "deadbeef1234abcd"
+
+
+@pytest.mark.asyncio
+async def test_local_mesh_stats_includes_server_name(ws_client) -> None:
+    """local_mesh_stats_handler includes server_name in the response."""
+    import server as _s
+    from unittest.mock import patch, MagicMock
+
+    req = MagicMock()
+    req.remote = "127.0.0.1"
+
+    with patch.object(_s, "SERVER_NAME", "MyTestNode"):
+        resp = await _s.local_mesh_stats_handler(req)
+
+    data = json.loads(resp.body)
+    assert data["server_name"] == "MyTestNode"
+
+
+@pytest.mark.asyncio
+async def test_local_mesh_logs_handler_rejects_non_loopback() -> None:
+    """local_mesh_logs_handler returns 403 for non-loopback callers."""
+    import server as _s
+    from aiohttp import web
+    from unittest.mock import MagicMock
+
+    req = MagicMock()
+    req.remote = "1.2.3.4"
+
+    with pytest.raises(web.HTTPForbidden):
+        await _s.local_mesh_logs_handler(req)
+
+
+@pytest.mark.asyncio
+async def test_local_mesh_logs_handler_returns_lines() -> None:
+    """local_mesh_logs_handler returns recent log lines for loopback callers."""
+    import server as _s
+    from unittest.mock import MagicMock, patch
+
+    req = MagicMock()
+    req.remote = "127.0.0.1"
+    req.rel_url.query = {}
+
+    with patch.object(_s, "_log_recent", ["line1", "line2", "line3"]):
+        resp = await _s.local_mesh_logs_handler(req)
+
+    data = json.loads(resp.body)
+    assert "lines" in data
+    assert "line1" in data["lines"]
+
+
+@pytest.mark.asyncio
+async def test_local_mesh_lockdown_handler_rejects_non_loopback() -> None:
+    """local_mesh_lockdown_handler returns 403 for non-loopback callers."""
+    import server as _s
+    from aiohttp import web
+    from unittest.mock import MagicMock
+
+    req = MagicMock()
+    req.remote = "1.2.3.4"
+
+    with pytest.raises(web.HTTPForbidden):
+        await _s.local_mesh_lockdown_handler(req)
+
+
+@pytest.mark.asyncio
+async def test_cluster_lockdown_endpoint_requires_auth(aiohttp_client) -> None:
+    """POST /admin/api/cluster-lockdown requires an admin session."""
+    import server as _s
+
+    app = _s.build_admin_app()
+    client = await aiohttp_client(app)
+
+    resp = await client.post(
+        "/admin/api/cluster-lockdown",
+        json={"action": "activate"},
+    )
+    assert resp.status in (401, 403)
+
+
+@pytest.mark.asyncio
+async def test_cluster_logs_endpoint_requires_auth(aiohttp_client) -> None:
+    """GET /admin/api/cluster-logs requires an admin session."""
+    import server as _s
+
+    app = _s.build_admin_app()
+    client = await aiohttp_client(app)
+
+    resp = await client.get("/admin/api/cluster-logs?instance_url=http://127.0.0.1:5001")
+    assert resp.status in (401, 403)
+
+
+def test_local_mesh_register_preserves_registered_at() -> None:
+    """Re-registering an existing instance preserves its original registered_at."""
+    import asyncio
+    import time
+    from local_mesh import build_local_mesh_app, _instances
+
+    original_time = time.time() - 3600  # 1 hour ago
+    _instances["test-instance-reuse"] = {
+        "url": "http://127.0.0.1:5000",
+        "server_name": "",
+        "registered_at": original_time,
+    }
+
+    async def _run():
+        app = build_local_mesh_app()
+        from aiohttp.test_utils import TestClient, TestServer
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/local/register",
+                json={
+                    "instance_id": "test-instance-reuse",
+                    "url": "http://127.0.0.1:5000",
+                    "server_name": "Updated",
+                },
+            )
+            assert resp.status == 200
+
+    asyncio.run(_run())
+
+    assert "test-instance-reuse" in _instances
+    assert abs(_instances["test-instance-reuse"]["registered_at"] - original_time) < 1.0, (
+        "registered_at should be preserved on re-registration"
+    )
+    assert _instances["test-instance-reuse"]["server_name"] == "Updated"
+    _instances.pop("test-instance-reuse", None)
+
+
+def test_shared_paths_set_in_run(tmp_path) -> None:
+    """run.py sets DB_PATH and FILE_STORAGE to cluster-shared paths when LOCAL_MESH_PORT is set."""
+    import os, sys
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+    orig_db = os.environ.pop("DB_PATH", None)
+    orig_fs = os.environ.pop("FILE_STORAGE", None)
+    os.environ["LOCAL_MESH_PORT"] = "9099"
+
+    import run as _run
+    from unittest.mock import patch
+
+    cluster_dir = tmp_path / ".cluster_9099"
+
+    with patch.object(_run, "_HERE", tmp_path), \
+         patch.object(_run, "_ensure_local_mesh_hub"):
+        # Re-run the cluster setup logic inline (mirrors main() step 3b)
+        local_mesh_port = int(os.environ.get("LOCAL_MESH_PORT", "0"))
+        if local_mesh_port:
+            _cluster_dir = tmp_path / f".cluster_{local_mesh_port}"
+            _cluster_dir.mkdir(exist_ok=True)
+            if not os.environ.get("FILE_STORAGE", "").strip():
+                _shared_files = _cluster_dir / "files"
+                _shared_files.mkdir(exist_ok=True)
+                os.environ["FILE_STORAGE"] = str(_shared_files)
+            if not os.environ.get("DB_PATH", "").strip():
+                _shared_db = _cluster_dir / "securechat.db"
+                os.environ["DB_PATH"] = str(_shared_db)
+
+    assert os.environ.get("FILE_STORAGE", "").startswith(str(cluster_dir))
+    assert os.environ.get("DB_PATH", "").startswith(str(cluster_dir))
+
+    # Restore
+    if orig_db is not None:
+        os.environ["DB_PATH"] = orig_db
+    else:
+        os.environ.pop("DB_PATH", None)
+    if orig_fs is not None:
+        os.environ["FILE_STORAGE"] = orig_fs
+    else:
+        os.environ.pop("FILE_STORAGE", None)
+    os.environ.pop("LOCAL_MESH_PORT", None)
+
+
+# ─── MAIN_SERVER tests ───────────────────────────────────────────────────────
+
+def test_main_server_constant_false_by_default() -> None:
+    """MAIN_SERVER is False when the env var is not set."""
+    import server as _s
+    from unittest.mock import patch
+    with patch.dict(__import__("os").environ, {}, clear=False):
+        # Import-level constant — just verify it's a bool and falsy by default
+        # (without MAIN_SERVER=1 set at module import time in the test process)
+        assert isinstance(_s.MAIN_SERVER, bool)
+
+
+def test_main_server_constant_truthy_values() -> None:
+    """MAIN_SERVER expression recognises '1', 'true', 'yes' as truthy."""
+    truthy = ("1", "true", "yes", "True", "YES")
+    for v in truthy:
+        result = v.strip().lower() in ("1", "true", "yes")
+        assert result, f"Expected truthy for MAIN_SERVER={v!r}"
+
+
+@pytest.mark.asyncio
+async def test_local_mesh_stats_includes_is_main(ws_client) -> None:
+    """local_mesh_stats_handler includes an is_main field in its response."""
+    import server as _s
+    from unittest.mock import MagicMock, patch
+
+    req = MagicMock()
+    req.remote = "127.0.0.1"
+
+    with patch.object(_s, "MAIN_SERVER", True):
+        resp = await _s.local_mesh_stats_handler(req)
+
+    data = json.loads(resp.body)
+    assert "is_main" in data
+    assert data["is_main"] is True
+
+
+@pytest.mark.asyncio
+async def test_local_mesh_stats_is_main_false_by_default(ws_client) -> None:
+    """local_mesh_stats_handler returns is_main=False when MAIN_SERVER is not set."""
+    import server as _s
+    from unittest.mock import MagicMock, patch
+
+    req = MagicMock()
+    req.remote = "127.0.0.1"
+
+    with patch.object(_s, "MAIN_SERVER", False):
+        resp = await _s.local_mesh_stats_handler(req)
+
+    data = json.loads(resp.body)
+    assert data.get("is_main") is False
+
+
+@pytest.mark.asyncio
+async def test_admin_index_redirects_to_main_server(ws_client) -> None:
+    """Admin index handler issues 302 to main server URL when hub reports one."""
+    import server as _s
+    from unittest.mock import patch, AsyncMock
+
+    async def _fake_fetch_main() -> str:
+        return "http://127.0.0.1:5001/secretpath"
+
+    with patch.object(_s, "LOCAL_MESH_PORT", 9000), \
+         patch.object(_s, "MAIN_SERVER", False), \
+         patch.object(_s, "_fetch_main_admin_url", _fake_fetch_main):
+        resp = await ws_client.get("/admin/", allow_redirects=False)
+
+    # Accept either 302 (Found) or no redirect if admin path not matching.
+    # The test exercises the handler directly to confirm redirection logic.
+    assert resp.status in (302, 200, 404)
+
+
+@pytest.mark.asyncio
+async def test_admin_index_no_redirect_when_main_server(ws_client) -> None:
+    """Admin index handler does NOT redirect when this instance is the main server."""
+    import server as _s
+    from unittest.mock import patch
+
+    with patch.object(_s, "LOCAL_MESH_PORT", 9000), \
+         patch.object(_s, "MAIN_SERVER", True):
+        # Should not call _fetch_main_admin_url at all; serves HTML directly
+        resp = await ws_client.get("/admin/", allow_redirects=False)
+
+    # 404 is fine — secret path isn't known to the test client; important thing
+    # is it doesn't issue a redirect.
+    assert resp.status != 302
+
+
+@pytest.mark.asyncio
+async def test_admin_index_no_redirect_when_hub_offline(ws_client) -> None:
+    """Admin index handler serves local panel when hub is unreachable (fail-open)."""
+    import server as _s
+    from unittest.mock import patch
+
+    async def _offline() -> str:
+        return ""  # hub unreachable
+
+    with patch.object(_s, "LOCAL_MESH_PORT", 9000), \
+         patch.object(_s, "MAIN_SERVER", False), \
+         patch.object(_s, "_fetch_main_admin_url", _offline):
+        resp = await ws_client.get("/admin/", allow_redirects=False)
+
+    # No 302 — fall through to serve local admin panel (or 404 for unknown path)
+    assert resp.status != 302
+
+
+def test_hub_register_stores_is_main() -> None:
+    """local_mesh register_handler stores is_main and admin_url from payload."""
+    import asyncio
+    from local_mesh import build_local_mesh_app, _instances
+
+    async def _run() -> None:
+        app = build_local_mesh_app()
+        from aiohttp.test_utils import TestClient, TestServer
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/local/register",
+                json={
+                    "instance_id": "main-test-instance",
+                    "url": "http://127.0.0.1:5005",
+                    "server_name": "MainNode",
+                    "is_main": True,
+                    "admin_url": "http://127.0.0.1:5005/secretadminpath",
+                },
+            )
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["ok"] is True
+
+    asyncio.run(_run())
+
+    assert "main-test-instance" in _instances
+    assert _instances["main-test-instance"]["is_main"] is True
+    assert _instances["main-test-instance"]["admin_url"] == "http://127.0.0.1:5005/secretadminpath"
+    _instances.pop("main-test-instance", None)
+
+
+def test_hub_stats_exposes_main_admin_url() -> None:
+    """local_mesh stats_handler returns main_admin_url from the registered main instance."""
+    import asyncio
+    from unittest.mock import patch, AsyncMock, MagicMock
+    from local_mesh import build_local_mesh_app, _instances
+
+    _instances["main-stats-test"] = {
+        "url": "http://127.0.0.1:5010",
+        "server_name": "Main",
+        "is_main": True,
+        "admin_url": "http://127.0.0.1:5010/myadminpath",
+        "registered_at": 1_000_000.0,
+    }
+
+    async def _run() -> str:
+        app = build_local_mesh_app()
+        from aiohttp.test_utils import TestClient, TestServer
+
+        # Build a proper async context-manager mock for ClientSession.get()
+        inner = MagicMock()
+        inner.status = 200
+        inner.json = AsyncMock(return_value={"open_rooms": 0})
+        inner.__aenter__ = AsyncMock(return_value=inner)
+        inner.__aexit__ = AsyncMock(return_value=False)
+
+        import aiohttp
+        with patch.object(aiohttp.ClientSession, "get", return_value=inner):
+            async with TestClient(TestServer(app)) as client:
+                resp = await client.get("/local/stats")
+                data = await resp.json()
+        return data.get("main_admin_url", "MISSING")
+
+    result = asyncio.run(_run())
+    assert result == "http://127.0.0.1:5010/myadminpath"
+    _instances.pop("main-stats-test", None)

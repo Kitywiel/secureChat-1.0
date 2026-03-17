@@ -18,6 +18,7 @@ Tor hidden-service support — your messages never leave your control.
 | **Rooms with invite links** | Create a room with a generated invite link, optional room passcode, self-destruct timer (30 min – 24 h), and incoming webhook notifications. |
 | **Admin panel** | Hidden behind a randomly-generated **200-character URL path** and a **100-character passcode** (both printed to the console at startup). Runs on the same port as the chat. Includes live server stats, a live log stream (SSE), incoming webhook support, and an emergency shutdown button. Hardened with rate-limiting, constant-time comparisons, strict CSP, and no-store cache headers. |
 | **Tor hidden service** | One-click setup on Windows (`start_server.bat`) or Linux/macOS (`start_with_tor.py`) — auto-downloads Tor if needed and creates a stable `.onion` address. |
+| **Local cluster / multi-instance** | Run multiple instances on the same machine via `local_mesh.py`. Chat messages sync over loopback in real time; uploads go to a shared `FILE_STORAGE` directory so any instance can serve any download. The admin panel's "🕸️ Local Cluster" section shows live CPU/RAM/room/file load for every registered instance. |
 | **No tracking, no analytics** | Access log is disabled; the server only routes encrypted payloads. |
 
 ---
@@ -217,6 +218,7 @@ pytest tests/
 ```
 secureChat-1.0/
 ├── server.py            # aiohttp HTTP + WebSocket relay server
+├── local_mesh.py        # local-cluster hub (loopback chat sync + cluster stats)
 ├── start_with_tor.py    # finds/downloads Tor, starts hidden service + server
 ├── start_server.bat     # Windows one-click launcher (calls start_with_tor.py)
 ├── requirements.txt     # Python dependencies
@@ -226,7 +228,8 @@ secureChat-1.0/
 │   ├── admin.html       # Admin panel UI (served at the secret path)
 │   └── style.css        # Dark theme
 └── tests/
-    └── test_server.py   # pytest test suite
+    ├── test_server.py   # pytest test suite (server)
+    └── test_local_mesh.py  # pytest test suite (local mesh hub)
 ```
 
 Runtime directories created automatically (not committed):

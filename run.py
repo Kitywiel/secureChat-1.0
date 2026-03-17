@@ -27,6 +27,10 @@ Environment overrides (all optional — every default works out-of-the-box)
     SMTP_PORT      SMTP listen port               (default: 25)
     MESH_JOIN      URL of a remote peer to auto-join at startup (optional)
     MESH_TOKEN     MESH_TOKEN of the remote peer  (required when MESH_JOIN is set)
+    LOCAL_MESH_PORT  Port for the local mesh hub (default: disabled).  When set, the hub
+                   (local_mesh.py) is started automatically if not already running, and
+                   this instance registers with it.  Run multiple instances on the same
+                   machine with the same LOCAL_MESH_PORT to form a local cluster.
     NO_TOR         Set to '1' to skip Tor even if installed (optional)
     TOR_PATH       Override path to the tor binary (optional)
 
@@ -102,7 +106,52 @@ _load_dotenv()
 
 
 # ---------------------------------------------------------------------------
-# Step 0 — Auto-update: git pull (opt-in via AUTO_UPDATE=1 in .env)
+# Config-file key removal helper
+# ---------------------------------------------------------------------------
+
+def _remove_keys_from_config(keys: set[str]) -> None:
+    """Remove ``KEY=...`` lines from ``.env`` and ``SET KEY=...`` from ``.bat``.
+
+    Used by ``--new-mesh-url`` and ``--new-onion-url`` to clear persisted
+    secrets so fresh values are generated on the next (current) startup.
+    """
+    keys_upper = {k.upper() for k in keys}
+
+    # ── .env ──────────────────────────────────────────────────────────────
+    if _DOTENV.is_file():
+        try:
+            lines = _DOTENV.read_text(encoding="utf-8").splitlines(keepends=True)
+            new_lines = []
+            for line in lines:
+                stripped = line.strip()
+                if stripped and not stripped.startswith("#") and "=" in stripped:
+                    k, _, _ = stripped.partition("=")
+                    k_upper = k.strip().upper()
+                    if k_upper in keys_upper:
+                        continue  # drop this key
+                new_lines.append(line)
+            _DOTENV.write_text("".join(new_lines), encoding="utf-8")
+        except OSError:
+            pass
+
+    # ── start_server.bat ──────────────────────────────────────────────────
+    bat = _HERE / "start_server.bat"
+    if bat.is_file():
+        try:
+            lines = bat.read_text(encoding="utf-8").splitlines(keepends=True)
+            new_lines = []
+            for line in lines:
+                stripped = line.strip()
+                if stripped.upper().startswith("SET ") and "=" in stripped:
+                    key = stripped[4:].partition("=")[0].strip().upper()
+                    if key in keys_upper:
+                        continue  # drop this key
+                new_lines.append(line)
+            bat.write_text("".join(new_lines), encoding="utf-8")
+        except OSError:
+            pass
+
+
 # ---------------------------------------------------------------------------
 
 def _auto_update() -> None:
@@ -485,19 +534,28 @@ def _start_tor(tor_exe: Path, server_port: int) -> tuple[str, object] | None:
     _HS_DIR.mkdir(parents=True, exist_ok=True)
     _TOR_DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-    print("\n  Starting Tor …  (may take up to 90 s on first run)")
+    print("\n  Starting Tor …  (may take up to 2 min on first run)")
 
     config: dict = {
-        "SocksPort":        _socks_port_for_tor(),
-        "ControlPort":      str(_free_port()),
-        "DataDirectory":    str(_TOR_DATA_DIR),
-        "HiddenServiceDir": str(_HS_DIR),
-        "HiddenServicePort": f"80 127.0.0.1:{server_port}",
+        "SocksPort":               _socks_port_for_tor(),
+        "ControlPort":             str(_free_port()),
+        "DataDirectory":           str(_TOR_DATA_DIR),
+        "HiddenServiceDir":        str(_HS_DIR),
+        "HiddenServicePort":       f"80 127.0.0.1:{server_port}",
+        # Prevent the common "stuck at 95%" bootstrap stall.
+        # Tor builds 3-hop circuits to complete bootstrap; if the first guard
+        # it tries is slow the default adaptive timeout can freeze for many
+        # minutes.  This value is used as the initial estimate; Tor's adaptive
+        # algorithm then refines it upward.  Even with learning enabled, the
+        # 10-second starting point causes rapid guard rotation early in the
+        # session when circuits are most likely to stall.
+        "CircuitBuildTimeout": "10",
     }
     config.update(_find_geoip_files(tor_exe))
 
     tor_process = None
     _tmp_data_dir: str | None = None
+    last_exc: Exception | None = None
     for attempt in range(3):
         if attempt > 0:
             config["ControlPort"] = str(_free_port())
@@ -509,21 +567,33 @@ def _start_tor(tor_exe: Path, server_port: int) -> tuple[str, object] | None:
                 _tmp_data_dir = tempfile.mkdtemp(prefix="sc_tor_data_")
             config["DataDirectory"] = _tmp_data_dir
         try:
-            tor_process = stem.process.launch_tor_with_config(
-                tor_cmd=str(tor_exe),
-                config=config,
-                timeout=90,
-                init_msg_handler=_tor_log,
-            )
+            launch_kwargs: dict = {
+                "tor_cmd": str(tor_exe),
+                "config": config,
+                "init_msg_handler": _tor_log,
+            }
+            # stem uses signal.alarm() to implement the timeout, which is not
+            # available on Windows.  Passing timeout= on Windows raises:
+            #   OSError: You cannot launch tor with a timeout on Windows
+            if platform.system() != "Windows":
+                launch_kwargs["timeout"] = 120
+            tor_process = stem.process.launch_tor_with_config(**launch_kwargs)
             break
-        except OSError:
+        except OSError as exc:
+            last_exc = exc
+            # The Windows-timeout error is permanent; retrying is pointless.
+            if "timeout on Windows" in str(exc):
+                break
             continue
         except Exception as exc:  # noqa: BLE001
             print(f"  Tor error: {exc}")
             return None
 
     if tor_process is None:
-        print("  Tor failed to start.")
+        if last_exc:
+            print(f"  Tor failed to start: {last_exc}")
+        else:
+            print("  Tor failed to start.")
         return None
 
     hostname_file = _HS_DIR / "hostname"
@@ -553,6 +623,81 @@ def _lan_ip() -> str:
 
 
 # ---------------------------------------------------------------------------
+# Step 3b — Local mesh hub auto-start
+# ---------------------------------------------------------------------------
+
+def _is_port_open(port: int) -> bool:
+    """Return True if something is already listening on 127.0.0.1:*port*.
+
+    Uses a 0.5-second connect timeout which is long enough to detect a local
+    listener reliably while short enough not to slow down startup noticeably.
+    """
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(0.5)
+            return s.connect_ex(("127.0.0.1", port)) == 0
+    except OSError:
+        return False
+
+
+_HUB_START_TIMEOUT_SEC: float = 3.0     # max seconds to wait for hub to start
+_HUB_START_POLL_INTERVAL: float = 0.1   # polling interval while waiting
+
+
+def _ensure_local_mesh_hub(port: int) -> None:
+    """Start the local mesh hub (local_mesh.py) in the background if not already running.
+
+    Called automatically when ``LOCAL_MESH_PORT`` is set so operators only
+    need to run ``python run.py --local-mesh-port <port>`` on each instance —
+    no separate ``python local_mesh.py`` invocation is required.
+
+    If the hub port is already occupied (another instance started it, or the
+    user started it manually) this function returns immediately without
+    spawning a second hub.
+    """
+    if _is_port_open(port):
+        return  # hub already running — nothing to do
+
+    hub_script = _HERE / "local_mesh.py"
+    if not hub_script.is_file():
+        print(f"  ⚠️  local_mesh.py not found next to run.py — skipping hub start.")
+        return
+
+    env = os.environ.copy()
+    env["LOCAL_MESH_PORT"] = str(port)
+
+    # Spawn the hub as a detached background process.  We use DETACHED_PROCESS
+    # on Windows and start_new_session on POSIX so the hub survives the parent.
+    kwargs: dict = {
+        "env": env,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+    }
+    if sys.platform == "win32":
+        kwargs["creationflags"] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        kwargs["start_new_session"] = True
+
+    try:
+        subprocess.Popen([sys.executable, str(hub_script)], **kwargs)
+    except OSError as exc:
+        print(f"  ⚠️  Could not start local mesh hub: {exc}")
+        return
+
+    # Wait up to _HUB_START_TIMEOUT_SEC for the hub to begin accepting connections.
+    _max_polls = int(_HUB_START_TIMEOUT_SEC / _HUB_START_POLL_INTERVAL)
+    for _ in range(_max_polls):
+        if _is_port_open(port):
+            break
+        time.sleep(_HUB_START_POLL_INTERVAL)
+    else:
+        print(f"  ⚠️  Local mesh hub on port {port} did not start in time.")
+        return
+
+    print(f"  🕸️   Local mesh hub started on port {port}.")
+
+
+# ---------------------------------------------------------------------------
 # Step 4 — Print startup summary
 # ---------------------------------------------------------------------------
 
@@ -568,6 +713,7 @@ def _print_summary(
     mail_domain: str,
     mesh_token: str,
     mesh_path: str,
+    local_mesh_port: int = 0,
 ) -> None:
     lan = _lan_ip()
     sep = "=" * 66
@@ -613,7 +759,24 @@ def _print_summary(
 
     print()
     print("  🕸️   Mesh / multi-device federation:")
-    print("        Run another instance anywhere in the world, then link them:")
+    if local_mesh_port:
+        print("        Local cluster (same machine) — hub is running on port "
+              f"{local_mesh_port}.")
+        print("        To add another instance on this machine:")
+        print()
+        print(f"        python run.py --port <other_port> --local-mesh-port {local_mesh_port}")
+        print()
+        print("        Remote mesh — link instances anywhere in the world:")
+    else:
+        print("        Run another instance anywhere in the world, then link them:")
+        print()
+        print("        Same-machine cluster (instant, no Tor needed):")
+        print()
+        print(f"        python run.py --port <other_port> --local-mesh-port 9000")
+        print()
+        print("          (first instance auto-starts the hub; others just join it)")
+        print()
+        print("        Remote mesh:")
     print()
     connect_url = f"{base_url}/{mesh_path}/mesh/connect"
     print(f"        python run.py --mesh-join {connect_url} --mesh-token {mesh_token}")
@@ -854,11 +1017,37 @@ def main() -> None:
     parser.add_argument("--history-limit", type=int, metavar="N", default=None)
     # mail.tm integration
     parser.add_argument("--mailtm-enabled", type=int, metavar="0|1", default=None)
+    # Local mesh (multi-instance on same machine)
+    parser.add_argument("--local-mesh-port", type=int, metavar="PORT", default=None)
+    parser.add_argument("--file-storage", metavar="PATH", default=None)
     # .env helper
     parser.add_argument(
         "--example",
         action="store_true",
         help="Copy .env.example to .env and exit. See info-files/env-vars.md for documentation.",
+    )
+    # URL reset helpers — clear persisted values so fresh ones are generated
+    parser.add_argument(
+        "--new-mesh-url",
+        action="store_true",
+        default=False,
+        help=(
+            "Generate a new random mesh URL for this installation. "
+            "Clears MESH_PATH and MESH_LOCK from .env / start_server.bat so a "
+            "fresh path is created on this startup. "
+            "Existing mesh peers will need to reconnect using the new URL."
+        ),
+    )
+    parser.add_argument(
+        "--new-onion-url",
+        action="store_true",
+        default=False,
+        help=(
+            "Generate a new .onion address and clearnet URL. "
+            "Deletes the Tor hidden-service key directory (tor_hs/) so Tor "
+            "creates a brand-new .onion address, and clears CLEARNET_PATH "
+            "from .env / start_server.bat so a fresh path is also generated."
+        ),
     )
     args = parser.parse_args()
 
@@ -878,6 +1067,29 @@ def main() -> None:
             print("  Edit .env, uncomment the lines you want, then run:  python run.py")
         print("  Documentation:  info-files/env-vars.md")
         sys.exit(0)
+
+    # Handle --new-mesh-url: remove stored mesh path so a new one is generated.
+    if args.new_mesh_url:
+        _remove_keys_from_config({"MESH_PATH", "MESH_LOCK"})
+        os.environ.pop("MESH_PATH", None)
+        os.environ.pop("MESH_LOCK", None)
+        print("  ✅  Mesh URL cleared — a new URL will be generated on this startup.")
+
+    # Handle --new-onion-url: delete Tor hidden-service key + clear clearnet path.
+    if args.new_onion_url:
+        _remove_keys_from_config({"CLEARNET_PATH"})
+        os.environ.pop("CLEARNET_PATH", None)
+        if _HS_DIR.is_dir():
+            try:
+                shutil.rmtree(_HS_DIR)
+                print(
+                    "  ✅  Tor hidden-service directory deleted — "
+                    "a new .onion address will be created when Tor starts."
+                )
+            except OSError as _e:
+                print(f"  ⚠️  Could not delete {_HS_DIR}: {_e}")
+        else:
+            print("  ✅  Clearnet URL cleared — a new URL will be generated on this startup.")
 
     # Save our own persisted MESH_TOKEN BEFORE _flag_env runs — the --mesh-token
     # flag writes the REMOTE server's token into os.environ["MESH_TOKEN"], which
@@ -914,6 +1126,8 @@ def main() -> None:
         (args.spam_mail_window,              "SPAM_MAIL_WINDOW"),
         (args.history_limit,                 "HISTORY_LIMIT"),
         (args.mailtm_enabled,                "MAILTM_ENABLED"),
+        (args.local_mesh_port,               "LOCAL_MESH_PORT"),
+        (args.file_storage,                  "FILE_STORAGE"),
     ]
     for val, key in _flag_env:
         if val is not None:
@@ -983,6 +1197,28 @@ def main() -> None:
         # No Tor — bind to all interfaces so LAN devices can connect
         os.environ.setdefault("HOST", "0.0.0.0")
 
+    # ── 3b. Local mesh hub ────────────────────────────────────────────
+    local_mesh_port: int = int(os.environ.get("LOCAL_MESH_PORT", "0"))
+    if local_mesh_port:
+        _ensure_local_mesh_hub(local_mesh_port)
+
+        # Auto-create a shared storage directory for this cluster so all
+        # instances running on the same machine can share files and chat
+        # history without any extra configuration.
+        _cluster_dir = _HERE / f".cluster_{local_mesh_port}"
+        _cluster_dir.mkdir(exist_ok=True)
+
+        if not os.environ.get("FILE_STORAGE", "").strip():
+            _shared_files = _cluster_dir / "files"
+            _shared_files.mkdir(exist_ok=True)
+            os.environ["FILE_STORAGE"] = str(_shared_files)
+            print(f"  🗂️   Shared file storage : {_shared_files}")
+
+        if not os.environ.get("DB_PATH", "").strip():
+            _shared_db = _cluster_dir / "securechat.db"
+            os.environ["DB_PATH"] = str(_shared_db)
+            print(f"  🗄️   Shared chat history  : {_shared_db}")
+
     # ── 4. Import server (now dependencies are guaranteed to be present) ──
     # We must import AFTER pip-installing, and AFTER setting env vars.
     try:
@@ -1004,6 +1240,12 @@ def main() -> None:
     # overwrite MESH_TOKEN with the remote server's token).  Generate a
     # fresh one only on the very first run when nothing is persisted yet.
     srv._MESH_TOKEN = _own_persisted_mesh_token or _secrets.token_urlsafe(32)
+
+    # Assign a stable instance ID for the local cluster hub.  The ID is
+    # persisted to a per-port file so a restarted instance re-uses its
+    # original ID instead of appearing as a brand-new entry in the hub.
+    if local_mesh_port:
+        srv._LOCAL_MESH_INSTANCE_ID = srv._get_or_create_instance_id(server_port)
     srv._MESH_PATH  = srv._init_mesh_path()
     srv._CLEARNET_PATH = srv._init_clearnet_path()
 
@@ -1013,16 +1255,21 @@ def main() -> None:
     # file is absent) the secrets fall back to the .env file.
     # Admin path and passcode are intentionally NOT persisted — they are
     # regenerated on every startup so credentials never stay the same.
+    # MESH_LOCK ties the stored MESH_PATH to this installation folder; it is
+    # always overwritten so a copied .env / .bat gets its lock corrected on
+    # the very next run and triggers path regeneration for the new folder.
     _secrets_to_persist = {
         "CLEARNET_PATH":       srv._CLEARNET_PATH,
         "ADMIN_WEBHOOK_TOKEN": srv._ADMIN_WEBHOOK_TOKEN,
         "MESH_TOKEN":          srv._MESH_TOKEN,
         "MESH_PATH":           srv._MESH_PATH,
+        "MESH_LOCK":           srv._folder_lock(),
     }
-    wrote_bat = srv._persist_vars_to_bat(_secrets_to_persist)
+    _mesh_overwrite = frozenset({"MESH_PATH", "MESH_LOCK"})
+    wrote_bat = srv._persist_vars_to_bat(_secrets_to_persist, overwrite_keys=_mesh_overwrite)
     if not wrote_bat:
         # Fallback: write to .env for non-Windows or missing bat file.
-        srv._persist_new_env_vars(_secrets_to_persist)
+        srv._persist_new_env_vars(_secrets_to_persist, overwrite_keys=_mesh_overwrite)
 
     mail_domain: str = srv.MAIL_DOMAIN
     smtp_enabled: bool = bool(mail_domain)
@@ -1039,6 +1286,7 @@ def main() -> None:
         mail_domain=mail_domain,
         mesh_token=srv._MESH_TOKEN,
         mesh_path=srv._MESH_PATH,
+        local_mesh_port=local_mesh_port,
     )
 
     # ── 7. Run the server ─────────────────────────────────────────────

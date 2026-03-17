@@ -39,6 +39,7 @@ import io
 import json
 import logging
 import os
+import platform
 import re
 import secrets
 import shutil
@@ -194,6 +195,32 @@ MAX_CHAT_FILENAME_LEN = 200          # characters in an in-chat attachment filen
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024 * 1024  # 10 GB per file
 MAX_FILENAME_LEN = 200                       # characters in the sanitised filename
 _SHARE_TOKEN_BYTES = 32                      # 256-bit token → 43-char URL-safe base64
+
+# Shared file storage — when FILE_STORAGE is set, uploaded files are written to
+# a persistent directory instead of a per-process tempdir.  Multiple server
+# instances sharing the same directory can serve each other's uploads so
+# downloads work across URLs.
+_FILE_STORAGE_DIR: Path | None = (
+    Path(os.environ.get("FILE_STORAGE", "")).resolve()
+    if os.environ.get("FILE_STORAGE", "").strip()
+    else None
+)
+
+# Local mesh hub — when LOCAL_MESH_PORT is set, this instance registers with
+# the local_mesh.py hub running on 127.0.0.1:LOCAL_MESH_PORT.  Chat messages
+# are fanned out to all other registered instances over the loopback interface
+# so that conversations are in sync regardless of which URL the client used.
+LOCAL_MESH_PORT: int = int(os.environ.get("LOCAL_MESH_PORT", "0"))  # 0 = disabled
+
+# Optional human-readable display name for this server instance.  Shown in
+# the cluster admin table as "{url} | {SERVER_NAME}" when set.
+SERVER_NAME: str = os.environ.get("SERVER_NAME", "").strip()
+
+# When True, this instance is the designated "main" server in a local cluster.
+# Other instances that have LOCAL_MESH_PORT set will redirect their admin panel
+# to this instance so the whole cluster can be managed from one place.
+# Set via:  MAIN_SERVER=1  (or "true" / "yes")
+MAIN_SERVER: bool = os.environ.get("MAIN_SERVER", "").strip().lower() in ("1", "true", "yes")
 
 # Inbox constants
 _INBOX_TOKEN_BYTES = 16                      # 128-bit token → ~22-char URL-safe base64 local part
@@ -377,18 +404,11 @@ _room_meta: dict[str, dict] = {}
 # token → {"tmp_dir": Path, "filename": str, "size": int, "expires_at": float}
 _share_slots: dict[str, dict] = {}
 
-# Inbox registry
-# read_token → {
-#   "messages":   list[{body, email_from, subject, content_type, received_at}],
-#   "expires_at": float,   # Unix timestamp — inbox is destroyed at this time
-# }
-# Inboxes accept unlimited messages and allow unlimited reads until the TTL expires.
-_inbox_slots: dict[str, dict] = {}
-# Separate sender tokens — drop_token → read_token.
-# Senders are only given the drop_token so they cannot derive the read URL.
-_inbox_drop_tokens: dict[str, str] = {}
-# Tracks which inbox read_tokens have already emitted their first-read log line.
-_inbox_logged_tokens: set[str] = set()
+# Inbox slots are persisted to the SQLite database (inbox_slots +
+# inbox_messages tables).  The module-level path is set by build_app()'s
+# on_startup hook so that the InboxSmtpHandler thread can call the sync
+# helpers without access to the aiohttp event-loop.
+_inbox_db_path: Path | None = None
 
 # Lockdown state — set True by admin panel; cleared by admin panel deactivate.
 # While active, all non-admin HTTP/WS requests are redirected to the lockdown page.
@@ -788,9 +808,292 @@ def _init_db_sync(path: Path) -> None:
         ]:
             if col not in existing_cols:
                 con.execute(f"ALTER TABLE metrics_history ADD COLUMN {col} {ddl}")
+
+        # ── Inbox tables ──────────────────────────────────────────────────────
+        # inbox_slots: one row per allocated inbox.
+        #   mailtm_seen is a JSON array of already-fetched mail.tm message IDs
+        #   so re-delivery is avoided across server restarts.
+        #   first_read tracks whether the "inbox read" log line has been emitted.
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS inbox_slots (
+                read_token     TEXT    PRIMARY KEY,
+                drop_token     TEXT    NOT NULL UNIQUE,
+                expires_at     REAL    NOT NULL,
+                mailtm_address TEXT,
+                mailtm_bearer  TEXT,
+                mailtm_seen    TEXT    NOT NULL DEFAULT '[]',
+                first_read     INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+        con.execute(
+            "CREATE INDEX IF NOT EXISTS idx_inbox_slots_drop    ON inbox_slots(drop_token)"
+        )
+        con.execute(
+            "CREATE INDEX IF NOT EXISTS idx_inbox_slots_expires ON inbox_slots(expires_at)"
+        )
+        # inbox_messages: individual messages deposited into an inbox.
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS inbox_messages (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                read_token   TEXT    NOT NULL,
+                body         TEXT    NOT NULL DEFAULT '',
+                email_from   TEXT,
+                subject      TEXT,
+                content_type TEXT    NOT NULL DEFAULT 'text/plain',
+                received_at  REAL    NOT NULL
+            )
+            """
+        )
+        con.execute(
+            "CREATE INDEX IF NOT EXISTS idx_inbox_msg_token ON inbox_messages(read_token)"
+        )
+
         con.commit()
     finally:
         con.close()
+
+
+# ---------------------------------------------------------------------------
+# Inbox DB helpers — synchronous; called via asyncio.to_thread or directly
+# from the InboxSmtpHandler thread.
+# ---------------------------------------------------------------------------
+
+
+def _inbox_create_sync(
+    path: Path,
+    read_token: str,
+    drop_token: str,
+    expires_at: float,
+) -> None:
+    """Insert a new inbox slot row."""
+    con = sqlite3.connect(path)
+    try:
+        con.execute(
+            "INSERT INTO inbox_slots (read_token, drop_token, expires_at) VALUES (?, ?, ?)",
+            (read_token, drop_token, expires_at),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def _inbox_update_mailtm_sync(
+    path: Path,
+    read_token: str,
+    mailtm_address: str,
+    mailtm_bearer: str,
+) -> None:
+    """Persist mail.tm credentials onto an existing slot."""
+    con = sqlite3.connect(path)
+    try:
+        con.execute(
+            "UPDATE inbox_slots SET mailtm_address=?, mailtm_bearer=? WHERE read_token=?",
+            (mailtm_address, mailtm_bearer, read_token),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def _inbox_get_sync(path: Path, read_token: str) -> dict | None:
+    """Return the slot metadata dict for *read_token*, or ``None`` if absent."""
+    con = sqlite3.connect(path)
+    con.row_factory = sqlite3.Row
+    try:
+        row = con.execute(
+            "SELECT * FROM inbox_slots WHERE read_token=?", (read_token,)
+        ).fetchone()
+    finally:
+        con.close()
+    if row is None:
+        return None
+    return dict(row)
+
+
+def _inbox_get_by_drop_sync(path: Path, drop_token: str) -> tuple[str, dict] | None:
+    """Look up a slot by its drop token.  Returns ``(read_token, slot)`` or ``None``."""
+    con = sqlite3.connect(path)
+    con.row_factory = sqlite3.Row
+    try:
+        row = con.execute(
+            "SELECT * FROM inbox_slots WHERE drop_token=?", (drop_token,)
+        ).fetchone()
+    finally:
+        con.close()
+    if row is None:
+        return None
+    d = dict(row)
+    return d["read_token"], d
+
+
+def _inbox_add_message_sync(
+    path: Path,
+    read_token: str,
+    body: str,
+    email_from: str | None,
+    subject: str | None,
+    content_type: str,
+    received_at: float,
+) -> None:
+    """Append one message to an inbox."""
+    con = sqlite3.connect(path)
+    try:
+        con.execute(
+            """
+            INSERT INTO inbox_messages (read_token, body, email_from, subject,
+                                        content_type, received_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (read_token, body, email_from, subject, content_type, received_at),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def _inbox_get_messages_sync(path: Path, read_token: str) -> list[dict]:
+    """Return all messages for an inbox in receipt order."""
+    con = sqlite3.connect(path)
+    con.row_factory = sqlite3.Row
+    try:
+        rows = con.execute(
+            """
+            SELECT body, email_from, subject, content_type, received_at
+              FROM inbox_messages
+             WHERE read_token=?
+             ORDER BY id ASC
+            """,
+            (read_token,),
+        ).fetchall()
+    finally:
+        con.close()
+    return [dict(r) for r in rows]
+
+
+def _inbox_mark_first_read_sync(path: Path, read_token: str) -> bool:
+    """Atomically set first_read=1; returns True if this was the first call."""
+    con = sqlite3.connect(path)
+    try:
+        cur = con.execute(
+            "SELECT first_read FROM inbox_slots WHERE read_token=?", (read_token,)
+        )
+        row = cur.fetchone()
+        if row is None or row[0]:
+            con.close()
+            return False
+        con.execute(
+            "UPDATE inbox_slots SET first_read=1 WHERE read_token=?", (read_token,)
+        )
+        con.commit()
+    finally:
+        con.close()
+    return True
+
+
+def _inbox_count_sync(path: Path) -> int:
+    """Count inbox slots that have not yet expired."""
+    now = time.time()
+    con = sqlite3.connect(path)
+    try:
+        row = con.execute(
+            "SELECT COUNT(*) FROM inbox_slots WHERE expires_at > ?", (now,)
+        ).fetchone()
+        return row[0] if row else 0
+    finally:
+        con.close()
+
+
+def _inbox_cleanup_expired_sync(path: Path) -> list[str]:
+    """Delete all expired inbox slots and their messages.
+
+    Returns the list of deleted ``read_token`` values.
+    """
+    now = time.time()
+    con = sqlite3.connect(path)
+    try:
+        rows = con.execute(
+            "SELECT read_token FROM inbox_slots WHERE expires_at <= ?", (now,)
+        ).fetchall()
+        expired = [r[0] for r in rows]
+        if expired:
+            placeholders = ",".join("?" * len(expired))
+            con.execute(
+                f"DELETE FROM inbox_messages WHERE read_token IN ({placeholders})",
+                expired,
+            )
+            con.execute(
+                f"DELETE FROM inbox_slots WHERE read_token IN ({placeholders})",
+                expired,
+            )
+            con.commit()
+    finally:
+        con.close()
+    return expired
+
+
+def _inbox_wipe_all_sync(path: Path) -> None:
+    """Delete every inbox slot and message (called during lockdown)."""
+    con = sqlite3.connect(path)
+    try:
+        con.execute("DELETE FROM inbox_messages")
+        con.execute("DELETE FROM inbox_slots")
+        con.commit()
+    finally:
+        con.close()
+
+
+def _inbox_set_expires_sync(path: Path, read_token: str, expires_at: float) -> None:
+    """Update the TTL of an existing slot (used by tests to force expiry)."""
+    con = sqlite3.connect(path)
+    try:
+        con.execute(
+            "UPDATE inbox_slots SET expires_at=? WHERE read_token=?",
+            (expires_at, read_token),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def _inbox_get_mailtm_slots_sync(path: Path) -> list[dict]:
+    """Return all active (non-expired) slots that have a mailtm_bearer set."""
+    now = time.time()
+    con = sqlite3.connect(path)
+    con.row_factory = sqlite3.Row
+    try:
+        rows = con.execute(
+            """
+            SELECT read_token, expires_at, mailtm_bearer, mailtm_seen
+              FROM inbox_slots
+             WHERE expires_at > ? AND mailtm_bearer IS NOT NULL
+            """,
+            (now,),
+        ).fetchall()
+    finally:
+        con.close()
+    return [dict(r) for r in rows]
+
+
+def _inbox_update_mailtm_seen_sync(path: Path, read_token: str, seen_json: str) -> None:
+    """Persist the updated set of seen mail.tm message IDs."""
+    con = sqlite3.connect(path)
+    try:
+        con.execute(
+            "UPDATE inbox_slots SET mailtm_seen=? WHERE read_token=?",
+            (seen_json, read_token),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def _inbox_drop_token_get_sync(path: Path, drop_token: str) -> str | None:
+    """Return the read_token for *drop_token*, or ``None``."""
+    result = _inbox_get_by_drop_sync(path, drop_token)
+    return result[0] if result else None
 
 
 def _save_message_sync(
@@ -867,10 +1170,12 @@ def _delete_room_history_sync(path: Path, room_id: str) -> None:
 
 
 def _wipe_all_data_sync(path: Path) -> None:
-    """Delete every message in the DB.  Called during lockdown activation."""
+    """Delete every message and inbox row in the DB.  Called during lockdown activation."""
     con = sqlite3.connect(path)
     try:
         con.execute("DELETE FROM messages")
+        con.execute("DELETE FROM inbox_messages")
+        con.execute("DELETE FROM inbox_slots")
         con.commit()
     finally:
         con.close()
@@ -1141,6 +1446,11 @@ async def _broadcast_to_room(
     # to avoid infinite forwarding loops)
     if not _from_peer and _mesh_peers:
         asyncio.ensure_future(_forward_to_peers(room_id, payload))
+    # Forward to local mesh hub so sibling instances on the same machine also
+    # receive the message (loopback, near-zero latency).  _from_peer=True
+    # prevents the receiving instances from re-forwarding.
+    if not _from_peer and LOCAL_MESH_PORT:
+        asyncio.ensure_future(_forward_to_local_mesh(room_id, payload))
 
 
 # ---------------------------------------------------------------------------
@@ -1202,7 +1512,16 @@ async def share_upload_handler(request: web.Request) -> web.Response:
         raise web.HTTPBadRequest(reason="Expected multipart/form-data")
 
     reader = await request.multipart()
-    tmp_dir = Path(tempfile.mkdtemp(prefix="sc_share_"))
+    # Generate the token first so we can use it as the storage directory name
+    # when FILE_STORAGE is configured.  This makes the slot directory name
+    # predictable and enables cross-instance downloads via the shared directory.
+    token = secrets.token_urlsafe(_SHARE_TOKEN_BYTES)
+    if _FILE_STORAGE_DIR is not None:
+        _FILE_STORAGE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp_dir = _FILE_STORAGE_DIR / token
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        tmp_dir = Path(tempfile.mkdtemp(prefix="sc_share_"))
     try:
         # Find the "file" part
         file_part = await reader.next()
@@ -1234,11 +1553,10 @@ async def share_upload_handler(request: web.Request) -> web.Response:
         except Exception:  # noqa: BLE001
             pass
 
-        token = secrets.token_urlsafe(_SHARE_TOKEN_BYTES)
         expires_at = time.time() + ttl_hours * 3600
         # Mark the slot as E2EE-encrypted if the uploader set the "e=1" query param.
         encrypted = request.query.get("e", "0") == "1"
-        _share_slots[token] = {
+        slot: dict = {
             "tmp_dir": tmp_dir,
             "filename": filename,
             "size": total,
@@ -1246,6 +1564,9 @@ async def share_upload_handler(request: web.Request) -> web.Response:
             "passcode_hash": _hash_passcode(passcode) if passcode else None,
             "encrypted": encrypted,
         }
+        _share_slots[token] = slot
+        # Persist metadata to FILE_STORAGE so sibling instances can serve downloads.
+        _save_slot_to_storage(token, slot)
         _stats["files_uploaded_count"] += 1
         _stats["files_uploaded_bytes"] += total
         logger.info("share upload  file=%s  size=%d  ttl=%dh  passcode=%s",
@@ -1276,9 +1597,17 @@ async def share_download_handler(request: web.Request) -> web.StreamResponse:
     For unencrypted slots:
       * If the slot requires a passcode, an HTML gate page is returned.
       * Otherwise, the file is streamed immediately (one-time).
+
+    Cross-instance fallback
+    -----------------------
+    When FILE_STORAGE is configured, a token uploaded by a sibling instance on
+    the same machine may not be present in this instance's ``_share_slots``.
+    In that case the handler falls back to ``_load_slot_from_storage`` which
+    reads the persisted metadata from the shared directory so downloads always
+    succeed regardless of which server URL the client uses.
     """
     token = request.match_info["token"]
-    slot = _share_slots.get(token)
+    slot = _share_slots.get(token) or _load_slot_from_storage(token)
 
     if slot is None:
         raise web.HTTPNotFound(reason="Link not found or already used")
@@ -1317,7 +1646,7 @@ async def share_download_handler(request: web.Request) -> web.StreamResponse:
 async def share_download_post_handler(request: web.Request) -> web.StreamResponse:
     """POST /share/download/{token} — verify passcode and deliver the file once."""
     token = request.match_info["token"]
-    slot = _share_slots.get(token)
+    slot = _share_slots.get(token) or _load_slot_from_storage(token)
 
     if slot is None:
         raise web.HTTPNotFound(reason="Link not found or already used")
@@ -1690,44 +2019,69 @@ async def _mailtm_poll_all_inboxes() -> None:
     """Background task: poll mail.tm for new messages every 30 seconds."""
     while True:
         await asyncio.sleep(30)
-        for slot in list(_inbox_slots.values()):
-            bearer = slot.get("mailtm_bearer")
-            if not bearer:
-                continue
-            if time.time() > slot.get("expires_at", 0):
-                continue
-            seen: set = slot.setdefault("mailtm_seen", set())
+        if _inbox_db_path is None:
+            continue
+        db = _inbox_db_path
+        slots = await asyncio.to_thread(_inbox_get_mailtm_slots_sync, db)
+        for slot_row in slots:
+            bearer = slot_row["mailtm_bearer"]
+            read_token = slot_row["read_token"]
+            try:
+                seen: set = set(json.loads(slot_row.get("mailtm_seen") or "[]"))
+            except Exception:  # noqa: BLE001
+                seen = set()
             new_msgs = await _mailtm_fetch_messages(bearer, seen)
             for msg in new_msgs:
-                slot["messages"].append(msg)
+                await asyncio.to_thread(
+                    _inbox_add_message_sync,
+                    db,
+                    read_token,
+                    msg.get("body", ""),
+                    msg.get("email_from"),
+                    msg.get("subject"),
+                    msg.get("content_type", "text/plain"),
+                    msg.get("received_at", time.time()),
+                )
+                _stats["inbox_msgs_received_total"] += 1
                 logger.info(
                     "mail.tm message received  from=%.40s  subject=%r",
                     msg.get("email_from") or "",
                     (msg.get("subject") or "")[:60],
                 )
+            if new_msgs:
+                await asyncio.to_thread(
+                    _inbox_update_mailtm_seen_sync,
+                    db,
+                    read_token,
+                    json.dumps(list(seen)),
+                )
 
 
 class InboxSmtpHandler:
-    """aiosmtpd message handler — receives inbound SMTP and stores messages in inbox slots.
+    """aiosmtpd message handler — receives inbound SMTP and persists messages to SQLite.
 
     This handler runs in the aiosmtpd Controller's own thread/event-loop.
-    Appending to ``slot["messages"]`` is GIL-protected in CPython and safe for
-    concurrent access from the SMTP thread and the aiohttp event-loop thread.
+    All inbox state is now on disk; access goes through the synchronous DB
+    helpers using the module-level ``_inbox_db_path``.
     """
 
     async def handle_RCPT(
         self, server, session, envelope, address: str, rcpt_options
     ) -> str:
         """Accept mail only for tokens that map to an active inbox slot."""
+        if _inbox_db_path is None:
+            return "550 5.1.1 Inbox service unavailable"
         local = address.split("@")[0]
-        slot = _inbox_slots.get(local)
+        slot = _inbox_get_sync(_inbox_db_path, local)
         if slot is None or time.time() > slot["expires_at"]:
             return "550 5.1.1 User unknown or inbox unavailable"
         envelope.rcpt_tos.append(address)
         return "250 OK"
 
     async def handle_DATA(self, server, session, envelope) -> str:
-        """Parse the raw email and append its body to the matching inbox slot(s)."""
+        """Parse the raw email and persist its body to the matching inbox slot(s)."""
+        if _inbox_db_path is None:
+            return "550 5.1.1 Inbox service unavailable"
         raw = envelope.content
         if isinstance(raw, bytes):
             msg = _email_lib.message_from_bytes(raw, policy=_email_policy.default)
@@ -1781,19 +2135,23 @@ class InboxSmtpHandler:
                     )
 
         body = body_html or body_text or "(empty message)"
+        content_type = "text/html" if body_html else "text/plain"
+        now = time.time()
 
         for rcpt in envelope.rcpt_tos:
             local = rcpt.split("@")[0]
-            slot = _inbox_slots.get(local)
-            if slot is None or time.time() > slot["expires_at"]:
+            slot = _inbox_get_sync(_inbox_db_path, local)
+            if slot is None or now > slot["expires_at"]:
                 continue
-            slot["messages"].append({
-                "body":         body,
-                "email_from":   from_addr,
-                "subject":      subject,
-                "content_type": "text/html" if body_html else "text/plain",
-                "received_at":  time.time(),
-            })
+            _inbox_add_message_sync(
+                _inbox_db_path,
+                local,
+                body,
+                from_addr,
+                subject,
+                content_type,
+                now,
+            )
             _stats["inbox_msgs_received_total"] += 1
             logger.info(
                 "inbox email received  token=…%s  from=%.40s  subject=%r",
@@ -1829,6 +2187,7 @@ async def inbox_create_handler(request: web.Request) -> web.Response:
           "mailtm_enabled": true|false,
         }
     """
+    db: Path = request.app["db_path"]
     try:
         body = await request.json()
     except Exception:
@@ -1839,12 +2198,8 @@ async def inbox_create_handler(request: web.Request) -> web.Response:
     read_token = secrets.token_urlsafe(_INBOX_TOKEN_BYTES)
     drop_token = secrets.token_urlsafe(_INBOX_TOKEN_BYTES)
     expires_at = time.time() + ttl_seconds
-    slot: dict = {
-        "messages":   [],
-        "expires_at": expires_at,
-    }
-    _inbox_slots[read_token] = slot
-    _inbox_drop_tokens[drop_token] = read_token
+
+    await asyncio.to_thread(_inbox_create_sync, db, read_token, drop_token, expires_at)
     _stats["inbox_created_total"] += 1
 
     # ── Determine the real email address ──────────────────────────────────
@@ -1858,18 +2213,28 @@ async def inbox_create_handler(request: web.Request) -> web.Response:
         # Auto-provision a free mail.tm mailbox so any server can deliver here
         mailtm_extras = await _mailtm_provision(_INBOX_TOKEN_BYTES)
         if mailtm_extras:
-            slot.update(mailtm_extras)
+            await asyncio.to_thread(
+                _inbox_update_mailtm_sync,
+                db,
+                read_token,
+                mailtm_extras["mailtm_address"],
+                mailtm_extras["mailtm_bearer"],
+            )
             address = mailtm_extras["mailtm_address"]
             mailtm_enabled = True
             logger.info("mail.tm inbox provisioned  address=%s  ttl=%dm", address, ttl_minutes)
         else:
-            # mail.tm unavailable — fall back to request host
-            mail_host = request.host or "localhost"
-            address = f"{read_token}@{mail_host}"
+            # mail.tm unavailable — use a non-routable placeholder so the
+            # displayed address never leaks the .onion hostname or any other
+            # internal server detail.  This inbox is HTTP-drop only.
+            address = f"{read_token}@drop.local"
             logger.warning("mail.tm provisioning failed — inbox will be HTTP-drop only")
     else:
-        mail_host = request.host or "localhost"
-        address = f"{read_token}@{mail_host}"
+        # Neither MAIL_DOMAIN nor MAILTM_ENABLED — HTTP-drop only.
+        # Use a non-routable placeholder; request.host is intentionally NOT
+        # used here because it may be a .onion address or a bare IP that
+        # would be misleading and expose server infrastructure.
+        address = f"{read_token}@drop.local"
 
     if not mailtm_enabled:
         logger.info("inbox created  address=%.6s@…  ttl=%dm", read_token, ttl_minutes)
@@ -1888,14 +2253,13 @@ async def inbox_create_handler(request: web.Request) -> web.Response:
 
 async def inbox_drop_handler(request: web.Request) -> web.Response:
     """POST /inbox/{token}/drop — sender deposits a message (unlimited deposits allowed)."""
+    db: Path = request.app["db_path"]
     drop_token = request.match_info["token"]
-    read_token = _inbox_drop_tokens.get(drop_token)
-    slot = _inbox_slots.get(read_token) if read_token is not None else None
-    if slot is None:
+    result = await asyncio.to_thread(_inbox_get_by_drop_sync, db, drop_token)
+    if result is None:
         raise web.HTTPNotFound(reason="Inbox not found")
+    read_token, slot = result
     if time.time() > slot["expires_at"]:
-        _inbox_slots.pop(read_token, None)
-        _inbox_drop_tokens.pop(drop_token, None)
         raise web.HTTPGone(reason="Inbox has expired")
     try:
         body = await request.json()
@@ -1909,13 +2273,10 @@ async def inbox_drop_handler(request: web.Request) -> web.Response:
             max_size=MAX_INBOX_MESSAGE_LEN,
             actual_size=len(message),
         )
-    slot["messages"].append({
-        "body":         message,
-        "email_from":   None,
-        "subject":      None,
-        "content_type": "text/plain",
-        "received_at":  time.time(),
-    })
+    await asyncio.to_thread(
+        _inbox_add_message_sync,
+        db, read_token, message, None, None, "text/plain", time.time(),
+    )
     _stats["inbox_msgs_received_total"] += 1
     logger.info("inbox filled  token=…%s", drop_token[-6:])
     return web.json_response({"ok": True})
@@ -1937,32 +2298,37 @@ async def inbox_read_handler(request: web.Request) -> web.Response:
           "count": <int>
         }
     """
+    db: Path = request.app["db_path"]
     token = request.match_info["token"]
-    slot = _inbox_slots.get(token)
+    slot = await asyncio.to_thread(_inbox_get_sync, db, token)
     if slot is None:
         raise web.HTTPGone(reason="Inbox not found or expired")
     if time.time() > slot["expires_at"]:
-        _inbox_slots.pop(token, None)
         raise web.HTTPGone(reason="Inbox has expired")
-    if token not in _inbox_logged_tokens:
-        _inbox_logged_tokens.add(token)
-        logger.info("inbox read  token=…%s  count=%d", token[-6:], len(slot["messages"]))
+    msgs = await asyncio.to_thread(_inbox_get_messages_sync, db, token)
+    is_first = await asyncio.to_thread(_inbox_mark_first_read_sync, db, token)
+    if is_first:
+        logger.info("inbox read  token=…%s  count=%d", token[-6:], len(msgs))
     return web.json_response({
-        "messages":   slot["messages"],
+        "messages":   msgs,
         "expires_at": slot["expires_at"],
-        "count":      len(slot["messages"]),
+        "count":      len(msgs),
     })
 
 
 async def inbox_read_page_handler(request: web.Request) -> web.Response:
     """GET /inbox/{token} — serve the full HTML mail-reader page."""
+    db: Path = request.app["db_path"]
     token = request.match_info["token"]
-    slot = _inbox_slots.get(token)
+    slot = await asyncio.to_thread(_inbox_get_sync, db, token)
     if slot is None or time.time() > slot["expires_at"]:
-        _inbox_slots.pop(token, None)
         raise web.HTTPGone(reason="Inbox not found or expired")
-    mail_host = MAIL_DOMAIN or request.host or "localhost"
-    address = f"{token}@{mail_host}"
+    if MAIL_DOMAIN:
+        address = f"{token}@{MAIL_DOMAIN}"
+    elif slot.get("mailtm_address"):
+        address = slot["mailtm_address"]
+    else:
+        address = f"{token}@drop.local"
     html = (STATIC_DIR / "mail_read.html").read_text(encoding="utf-8")
     html = html.replace("__INBOX_TOKEN__", token)
     html = html.replace("__INBOX_ADDRESS__", address)
@@ -1972,16 +2338,20 @@ async def inbox_read_page_handler(request: web.Request) -> web.Response:
 
 async def inbox_drop_page_handler(request: web.Request) -> web.Response:
     """GET /inbox/{token}/drop — serve the sender HTML page."""
+    db: Path = request.app["db_path"]
     drop_token = request.match_info["token"]
-    read_token = _inbox_drop_tokens.get(drop_token)
-    slot = _inbox_slots.get(read_token) if read_token else None
-    if slot is None or time.time() > slot["expires_at"]:
-        if read_token:
-            _inbox_slots.pop(read_token, None)
-        _inbox_drop_tokens.pop(drop_token, None)
+    result = await asyncio.to_thread(_inbox_get_by_drop_sync, db, drop_token)
+    if result is None:
         raise web.HTTPGone(reason="Inbox not found or expired")
-    host = MAIL_DOMAIN or request.host or "localhost"
-    address = f"{read_token}@{host}"
+    read_token, slot = result
+    if time.time() > slot["expires_at"]:
+        raise web.HTTPGone(reason="Inbox not found or expired")
+    if MAIL_DOMAIN:
+        address = f"{read_token}@{MAIL_DOMAIN}"
+    elif slot.get("mailtm_address"):
+        address = slot["mailtm_address"]
+    else:
+        address = f"{read_token}@drop.local"
     html = (STATIC_DIR / "inbox.html").read_text(encoding="utf-8")
     html = html.replace("__INBOX_TOKEN__", drop_token)
     html = html.replace("__INBOX_ADDRESS__", address)
@@ -2036,6 +2406,8 @@ async def inbox_relay_handler(request: web.Request) -> web.Response:
     """
     if not RELAY_SECRET:
         raise web.HTTPNotFound()  # endpoint doesn't exist unless configured
+
+    db: Path = request.app["db_path"]
 
     # ── Authenticate ────────────────────────────────────────────────────────
     # Accept the secret via header, query-string, or body field.
@@ -2105,22 +2477,25 @@ async def inbox_relay_handler(request: web.Request) -> web.Response:
         raise web.HTTPBadRequest(reason="Missing inbox token (recipient/to/token field)")
 
     # ── Deposit into inbox ───────────────────────────────────────────────────
-    slot = _inbox_slots.get(token)
+    slot = await asyncio.to_thread(_inbox_get_sync, db, token)
     if slot is None or time.time() > slot["expires_at"]:
-        _inbox_slots.pop(token, None)
         raise web.HTTPNotFound(reason="Inbox not found or expired")
 
     body = body_html or body_text or "(empty message)"
     if len(body) > MAX_INBOX_MESSAGE_LEN:
         body = body[:MAX_INBOX_MESSAGE_LEN]
 
-    slot["messages"].append({
-        "body":         body,
-        "email_from":   from_addr or None,
-        "subject":      subject or None,
-        "content_type": "text/html" if body_html else "text/plain",
-        "received_at":  time.time(),
-    })
+    await asyncio.to_thread(
+        _inbox_add_message_sync,
+        db,
+        token,
+        body,
+        from_addr or None,
+        subject or None,
+        "text/html" if body_html else "text/plain",
+        time.time(),
+    )
+    _stats["inbox_msgs_received_total"] += 1
     logger.info(
         "inbox relay received  token=…%s  from=%.40s  subject=%r",
         token[-6:],
@@ -2131,18 +2506,12 @@ async def inbox_relay_handler(request: web.Request) -> web.Response:
 
 
 async def _cleanup_expired_inbox_slots() -> None:
-    """Background task: sweep expired inbox slots every 5 minutes."""
+    """Background task: sweep expired inbox slots from the DB every 5 minutes."""
     while True:
         await asyncio.sleep(300)
-        now = time.time()
-        expired = [t for t, s in list(_inbox_slots.items()) if now > s["expires_at"]]
-        for t in expired:
-            _inbox_slots.pop(t, None)
-            _inbox_logged_tokens.discard(t)
-        # Also remove any drop tokens that point to a now-removed read token
-        stale_drops = [dt for dt, rt in list(_inbox_drop_tokens.items()) if rt not in _inbox_slots]
-        for dt in stale_drops:
-            _inbox_drop_tokens.pop(dt, None)
+        if _inbox_db_path is None:
+            continue
+        expired = await asyncio.to_thread(_inbox_cleanup_expired_sync, _inbox_db_path)
         if expired:
             logger.info("cleaned up %d expired inbox slot(s)", len(expired))
 
@@ -2462,7 +2831,21 @@ async def _admin_login_handler(request: web.Request) -> web.Response:
 
 
 async def _admin_index_handler(request: web.Request) -> web.Response:
-    """GET /{path}/ — return admin panel HTML with the admin path injected."""
+    """GET /{path}/ — return admin panel HTML with the admin path injected.
+
+    When ``LOCAL_MESH_PORT`` is configured and another instance has registered
+    with ``MAIN_SERVER=1``, this handler redirects the browser to that
+    instance's admin panel so the whole cluster can be managed from one place.
+    If the hub is unreachable or no main server is registered the local admin
+    panel is served normally (fail-open, no redirect).
+    """
+    # Redirect to the designated main server admin panel when this is a
+    # non-main cluster instance and the hub can tell us where the main is.
+    if LOCAL_MESH_PORT and not MAIN_SERVER:
+        main_url = await _fetch_main_admin_url()
+        if main_url:
+            raise web.HTTPFound(location=main_url)
+
     html = (STATIC_DIR / "admin.html").read_text(encoding="utf-8")
     # Inject the admin path as a JS constant so all fetch() calls use the right URLs.
     # The placeholder __ADMIN_PATH__ is replaced once at serve time.
@@ -2507,6 +2890,17 @@ def _get_sys_metrics() -> dict:
             metrics["sys_disk_percent"] = du.percent
             metrics["sys_disk_total"]   = du.total
             metrics["sys_disk_used"]    = du.used
+            # Processor identification — available on all OS.
+            cpu_model = platform.processor() or platform.machine() or ""
+            metrics["sys_cpu_model"]         = cpu_model
+            metrics["sys_cpu_physical"]      = _psutil.cpu_count(logical=False) or cpu_count
+            metrics["sys_cpu_logical"]       = cpu_count
+            try:
+                freq = _psutil.cpu_freq()
+                if freq:
+                    metrics["sys_cpu_freq_mhz"] = round(freq.current, 0)
+            except Exception:  # noqa: BLE001
+                pass
         except Exception:  # pragma: no cover  # noqa: BLE001
             pass
 
@@ -2581,7 +2975,9 @@ async def _admin_stats_handler(request: web.Request) -> web.Response:
         "inactive_rooms": len(inactive_rooms),
         "invite_rooms": len(meta_rooms),
         "open_file_transfers": len(_share_slots),
-        "open_inbox_slots": len(_inbox_slots),
+        "open_inbox_slots": await asyncio.to_thread(
+            _inbox_count_sync, request.app["db_path"]
+        ),
         "rooms_by_destruct": by_destruct,
         **_get_sys_metrics(),
     })
@@ -2758,36 +3154,68 @@ async def _admin_incoming_webhook_handler(request: web.Request) -> web.Response:
 def _persist_new_env_vars(
     pairs: dict[str, str],
     dotenv_path: Path | None = None,
+    *,
+    overwrite_keys: frozenset[str] = frozenset(),
 ) -> None:
     """Append *new* key=value entries to the .env file next to server.py.
 
-    Only writes keys that are **not already present** in the file.  Existing
-    entries — including user-set values and comments — are never modified.
-    Creates the file (with a header comment) if it does not yet exist.
+    Keys not yet present in the file are appended.  Keys listed in
+    ``overwrite_keys`` are updated in-place even if they already exist —
+    this is used to refresh values such as ``MESH_LOCK`` when a copied
+    installation is detected at startup.
 
-    This lets auto-generated secrets (admin path, clearnet path, …) survive
-    server restarts without any manual configuration.  Users who prefer a
-    custom value can simply set it in ``.env`` before the first run, or
-    overwrite the auto-generated line afterwards.
+    All other existing entries — including user-set values and comments —
+    are never modified.  Creates the file (with a header comment) if it
+    does not yet exist.
 
     Args:
-        pairs:        Mapping of ``ENV_VAR_NAME`` → ``value`` to persist.
-        dotenv_path:  Path to the ``.env`` file.  Defaults to ``.env`` next
-                      to *this* file (``server.py``).
+        pairs:          Mapping of ``ENV_VAR_NAME`` → ``value`` to persist.
+        dotenv_path:    Path to the ``.env`` file.  Defaults to ``.env`` next
+                        to *this* file (``server.py``).
+        overwrite_keys: Keys whose existing values should be updated in-place.
     """
     target = dotenv_path if dotenv_path is not None else (_HERE / ".env")
 
-    # Collect keys already present so we never duplicate them.
     existing_keys: set[str] = set()
     if target.is_file():
         try:
-            for raw in target.read_text(encoding="utf-8").splitlines():
+            raw_text = target.read_text(encoding="utf-8")
+        except OSError:
+            return  # can't read — bail out silently
+
+        # Pass 1 — update in-place for overwrite_keys.
+        if overwrite_keys:
+            lines = raw_text.splitlines(keepends=True)
+            changed = False
+            for i, line in enumerate(lines):
+                stripped = line.strip()
+                if stripped and not stripped.startswith("#") and "=" in stripped:
+                    k, _, _ = stripped.partition("=")
+                    key_name = k.strip()
+                    if key_name in overwrite_keys and key_name in pairs:
+                        lines[i] = f"{key_name}={pairs[key_name]}\n"
+                        changed = True
+                    existing_keys.add(key_name)
+            if changed:
+                try:
+                    target.write_text("".join(lines), encoding="utf-8")
+                    raw_text = "".join(lines)
+                except OSError:
+                    pass
+            # Collect remaining existing keys (in case write failed).
+            if not changed:
+                for raw in raw_text.splitlines():
+                    line = raw.strip()
+                    if line and not line.startswith("#") and "=" in line:
+                        key, _, _ = line.partition("=")
+                        existing_keys.add(key.strip())
+        else:
+            # No overwrite needed — just collect existing keys.
+            for raw in raw_text.splitlines():
                 line = raw.strip()
                 if line and not line.startswith("#") and "=" in line:
                     key, _, _ = line.partition("=")
                     existing_keys.add(key.strip())
-        except OSError:
-            return  # can't read — bail out silently
 
     new_lines = [
         f"{k}={v}\n"
@@ -2811,22 +3239,31 @@ def _persist_new_env_vars(
 def _persist_vars_to_bat(
     pairs: dict[str, str],
     bat_path: Path | None = None,
+    *,
+    overwrite_keys: frozenset[str] = frozenset(),
 ) -> bool:
-    """Write new ``SET KEY=VALUE`` entries into the Windows ``.bat`` launcher.
+    """Write ``SET KEY=VALUE`` entries into the Windows ``.bat`` launcher.
 
-    Only writes keys that are **not already present** as ``SET`` commands in
-    the file.  Existing ``SET`` lines — including user-edited ones — are never
-    modified.  New lines are inserted right before the ``python run.py`` call
-    so they are active as environment variables when the server starts next
-    time via double-click.
+    Keys not yet present in the file are inserted right before the
+    ``python run.py`` invocation line.  Keys listed in ``overwrite_keys``
+    are updated in-place even when they already exist — this is used to
+    refresh values such as ``MESH_LOCK`` when a copied installation is
+    detected at startup.
+
+    All other existing ``SET`` lines — including user-edited ones — are
+    never modified.  New lines are inserted right before the ``python
+    run.py`` call so they are active next time the server starts via
+    double-click.
 
     Args:
-        pairs:    Mapping of ``ENV_VAR_NAME`` → value to persist.
-        bat_path: Path to the ``.bat`` file.  Defaults to ``start_server.bat``
-                  next to *this* file (``server.py``).
+        pairs:          Mapping of ``ENV_VAR_NAME`` → value to persist.
+        bat_path:       Path to the ``.bat`` file.  Defaults to
+                        ``start_server.bat`` next to *this* file.
+        overwrite_keys: Keys whose existing SET lines should be updated
+                        in-place rather than left unchanged.
 
     Returns:
-        ``True`` if the file was written (or no new keys were needed),
+        ``True`` if the file was written (or no changes were needed),
         ``False`` if the bat file does not exist or could not be read/written.
     """
     target = bat_path if bat_path is not None else (_HERE / "start_server.bat")
@@ -2838,50 +3275,132 @@ def _persist_vars_to_bat(
     except OSError:
         return False
 
-    # Collect keys already present as SET commands (case-insensitive).
-    existing_keys: set[str] = set()
-    for line in content.splitlines():
-        stripped = line.strip()
-        upper = stripped.upper()
-        if upper.startswith("SET ") and "=" in stripped:
-            key = stripped[4:].partition("=")[0].strip().upper()
-            existing_keys.add(key)
+    lines = content.splitlines(keepends=True)
 
+    # Pass 1 — update existing SET lines for overwrite_keys.
+    existing_keys: set[str] = set()
+    overwrite_upper = {k.upper() for k in overwrite_keys}
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.upper().startswith("SET ") and "=" in stripped:
+            key = stripped[4:].partition("=")[0].strip()
+            key_upper = key.upper()
+            existing_keys.add(key_upper)
+            if key_upper in overwrite_upper:
+                # Find the matching key from pairs (case-insensitive).
+                match = next((k for k in pairs if k.upper() == key_upper), None)
+                if match is not None:
+                    lines[i] = f"SET {key}={pairs[match]}\n"
+
+    # Pass 2 — collect any remaining new keys not yet in the file.
     new_lines = [
         f"SET {k}={v}\n"
         for k, v in pairs.items()
         if k.upper() not in existing_keys
     ]
-    if not new_lines:
-        return True  # nothing to add, already up-to-date
 
-    header = (
-        "\n"
-        ":: Auto-generated secrets — kept so URLs/tokens survive restarts.\n"
-        ":: To use a custom value, update the SET line below and restart.\n"
-    )
-    block = header + "".join(new_lines)
+    if not new_lines and overwrite_upper.isdisjoint(existing_keys):
+        # Nothing to add and no in-place updates were needed.
+        return True
 
-    # Insert right before the 'python run.py' invocation line.
-    lines = content.splitlines(keepends=True)
-    insert_idx: int | None = None
-    for i, line in enumerate(lines):
-        if "run.py" in line and line.strip().lower().startswith("python"):
-            insert_idx = i
-            break
+    if new_lines:
+        header = (
+            "\n"
+            ":: Auto-generated secrets — kept so URLs/tokens survive restarts.\n"
+            ":: To use a custom value, update the SET line below and restart.\n"
+        )
+        block = header + "".join(new_lines)
 
-    if insert_idx is not None:
-        lines.insert(insert_idx, block)
-        new_content = "".join(lines)
-    else:
-        # Fallback: append at the end of the file.
-        new_content = content.rstrip("\n") + "\n" + block
+        # Insert right before the 'python run.py' invocation line.
+        insert_idx: int | None = None
+        for i, line in enumerate(lines):
+            if "run.py" in line and line.strip().lower().startswith("python"):
+                insert_idx = i
+                break
+
+        if insert_idx is not None:
+            lines.insert(insert_idx, block)
+        else:
+            lines.append("\n" + block)
 
     try:
-        target.write_text(new_content, encoding="utf-8")
+        target.write_text("".join(lines), encoding="utf-8")
         return True
     except OSError:
         return False
+
+
+def _remove_keys_from_env(
+    keys: frozenset[str],
+    dotenv_path: Path | None = None,
+) -> None:
+    """Remove ``KEY=...`` lines for *keys* from the ``.env`` file.
+
+    Used when the operator wants to force regeneration of a secret (e.g.
+    ``MESH_PATH``) by clearing the persisted value so a fresh one is
+    created on the next startup.  Lines whose key is not in *keys* and all
+    comment lines are preserved unchanged.
+
+    Args:
+        keys:         Set of environment variable names to remove.
+        dotenv_path:  Path to the ``.env`` file.  Defaults to ``.env``
+                      next to *this* file (``server.py``).
+    """
+    target = dotenv_path if dotenv_path is not None else (_HERE / ".env")
+    if not target.is_file():
+        return
+    try:
+        lines = target.read_text(encoding="utf-8").splitlines(keepends=True)
+    except OSError:
+        return
+    new_lines = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#") and "=" in stripped:
+            k, _, _ = stripped.partition("=")
+            if k.strip() in keys:
+                continue  # drop this key
+        new_lines.append(line)
+    try:
+        target.write_text("".join(new_lines), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _remove_keys_from_bat(
+    keys: frozenset[str],
+    bat_path: Path | None = None,
+) -> None:
+    """Remove ``SET KEY=...`` lines for *keys* from the ``.bat`` launcher.
+
+    Companion to :func:`_remove_keys_from_env` for Windows installations
+    that use ``start_server.bat`` as the primary launcher.
+
+    Args:
+        keys:     Set of environment variable names to remove (case-insensitive).
+        bat_path: Path to the ``.bat`` file.  Defaults to ``start_server.bat``
+                  next to *this* file (``server.py``).
+    """
+    target = bat_path if bat_path is not None else (_HERE / "start_server.bat")
+    if not target.is_file():
+        return
+    try:
+        lines = target.read_text(encoding="utf-8").splitlines(keepends=True)
+    except OSError:
+        return
+    keys_upper = {k.upper() for k in keys}
+    new_lines = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped.upper().startswith("SET ") and "=" in stripped:
+            key = stripped[4:].partition("=")[0].strip().upper()
+            if key in keys_upper:
+                continue  # drop this key
+        new_lines.append(line)
+    try:
+        target.write_text("".join(new_lines), encoding="utf-8")
+    except OSError:
+        pass
 
 
 def _init_admin_credentials() -> tuple[str, str]:
@@ -2950,21 +3469,68 @@ def _init_clearnet_path() -> str:
     return path
 
 
-def _init_mesh_path() -> str:
-    """Generate (or read from env) the 50-character mesh URL path segment.
+def _folder_lock() -> str:
+    """Return a 16-char hex digest of this installation's absolute directory.
 
-    All mesh endpoints (connect, forward, link) are mounted under this secret
-    path so they are not publicly discoverable.  Set MESH_PATH in the
-    environment to pin a specific path across restarts (recommended so that
-    saved connect URLs remain valid after a server restart).
+    16 hex chars = 64 bits of the SHA-256 digest — more than enough entropy
+    to distinguish any two folder paths on the same machine while keeping the
+    stored value short.
+
+    Written to ``.env`` / ``.bat`` alongside ``MESH_PATH`` so that a copied
+    installation can be detected on the next startup: if ``MESH_LOCK`` is
+    present but does not match the current directory's digest, the stored
+    mesh path is discarded and a fresh one is generated for *this* folder.
+    """
+    return hashlib.sha256(str(_HERE).encode()).hexdigest()[:16]
+
+
+def _init_mesh_path() -> str:
+    """Return a stable, folder-unique 50-char mesh URL path segment.
+
+    Each installation folder gets its own distinct mesh path so that two
+    copies of secureChat on the same machine (or two copies of the same
+    ``.env`` / ``.bat``) do not share a URL.
+
+    Startup logic
+    -------------
+    1. ``MESH_LOCK`` present and **matches** this folder's digest
+       → the stored ``MESH_PATH`` is legitimate for this folder; return it.
+    2. ``MESH_LOCK`` present but **mis-matches** (folder was copied/moved)
+       → discard ``MESH_PATH`` and ``MESH_LOCK`` from the environment so the
+         caller can persist fresh values with :func:`_persist_new_env_vars`
+         / :func:`_persist_vars_to_bat` (using ``overwrite_keys``).
+    3. ``MESH_LOCK`` absent (first run, or legacy install without a lock)
+       → use ``MESH_PATH`` if already set (backward-compat), otherwise
+         generate a new random path.
+
+    In all cases the chosen path and the current lock are written back into
+    ``os.environ`` so the caller can persist both with a single dict.
 
     Returns:
-        The 50-character URL-safe path string (no leading/trailing slashes).
+        A 50-character URL-safe path string (no leading/trailing slashes).
     """
+    current_lock = _folder_lock()
+    stored_lock  = os.environ.get("MESH_LOCK", "").strip()
+
+    if stored_lock and stored_lock != current_lock:
+        # The .env / .bat was copied from a different folder — discard the
+        # stale path so a fresh one is generated below.
+        logger.warning(
+            "mesh URL reset: installation folder mismatch "
+            "(stored lock %s != current %s) — generating new MESH_PATH",
+            stored_lock,
+            current_lock,
+        )
+        os.environ.pop("MESH_PATH", None)
+        os.environ.pop("MESH_LOCK", None)
+
     path = os.environ.get("MESH_PATH", "").strip()
     if not path:
-        # secrets.token_urlsafe(37) returns 50 URL-safe base64 characters.
         path = secrets.token_urlsafe(37)[:50]
+
+    # Record both values so the caller can persist them in one pass.
+    os.environ["MESH_PATH"] = path
+    os.environ["MESH_LOCK"] = current_lock
     return path
 
 
@@ -3160,7 +3726,7 @@ async def _metrics_collector_task(db_path: Path) -> None:
                 m.get("sys_disk_percent"),
                 len(rooms),
                 len(_share_slots),
-                len(_inbox_slots),
+                _inbox_count_sync(db_path),
                 len(_mesh_peers),
             )
             if now - last_prune >= _PRUNE_EVERY:
@@ -3194,6 +3760,167 @@ async def _admin_metrics_history_handler(request: web.Request) -> web.Response:
     return resp
 
 
+async def _admin_cluster_stats_handler(request: web.Request) -> web.Response:
+    """GET /{admin}/api/cluster-stats — return live stats from all local mesh instances.
+
+    Queries the local mesh hub at ``127.0.0.1:LOCAL_MESH_PORT/local/stats``,
+    which in turn polls every registered server instance.  The result is a list
+    of per-instance metrics dicts that the admin panel's "Local Cluster" section
+    uses to render per-instance load cards.
+
+    Returns ``{"instances": [], "error": "…"}`` when the local mesh hub is not
+    configured or unreachable, so the admin panel can display a helpful message
+    instead of failing silently.
+    """
+    if not _valid_admin_session(request):
+        raise web.HTTPUnauthorized()
+    if not LOCAL_MESH_PORT:
+        data: dict = {
+            "instances": [],
+            "hub_port": 0,
+            "error": "LOCAL_MESH_PORT not configured — start local_mesh.py first",
+        }
+    else:
+        try:
+            async with _build_session("", 5.0) as sess:
+                async with sess.get(
+                    f"http://127.0.0.1:{LOCAL_MESH_PORT}/local/stats"
+                ) as hub_resp:
+                    data = await hub_resp.json(content_type=None)
+        except Exception as exc:  # noqa: BLE001
+            data = {
+                "instances": [],
+                "hub_port": LOCAL_MESH_PORT,
+                "error": str(exc),
+            }
+    resp = web.json_response(data)
+    _add_admin_security_headers(resp)
+    return resp
+
+
+async def _admin_cluster_lockdown_handler(request: web.Request) -> web.Response:
+    """POST /{admin}/api/cluster-lockdown — activate/deactivate lockdown on all cluster instances.
+
+    Body: ``{"action": "activate" | "deactivate", "instance_id": "<id>"}``
+
+    When ``instance_id`` is omitted or ``"all"``, the action is sent to every
+    registered instance (global cluster lockdown).  When a specific
+    ``instance_id`` is provided, only that instance is affected.
+
+    Requires an active admin session cookie.
+    """
+    if not _valid_admin_session(request):
+        raise web.HTTPForbidden(reason="Not authenticated")
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    action = str(body.get("action", "")).strip().lower()
+    target_id = str(body.get("instance_id", "all")).strip()
+    if action not in ("activate", "deactivate"):
+        raise web.HTTPBadRequest(reason="action must be 'activate' or 'deactivate'")
+
+    if not LOCAL_MESH_PORT:
+        raise web.HTTPBadRequest(reason="LOCAL_MESH_PORT not configured")
+
+    # Fetch the current instance list from the hub.
+    try:
+        async with _build_session("", 5.0) as sess:
+            async with sess.get(
+                f"http://127.0.0.1:{LOCAL_MESH_PORT}/local/stats"
+            ) as hub_resp:
+                hub_data = await hub_resp.json(content_type=None)
+    except Exception as exc:  # noqa: BLE001
+        raise web.HTTPBadGateway(reason=f"Cannot reach hub: {exc}") from exc
+
+    results: list[dict] = []
+    instances = hub_data.get("instances", [])
+    for inst in instances:
+        iid = inst.get("instance_id", "")
+        iurl = inst.get("url", "")
+        if not iurl:
+            continue
+        if target_id not in ("all", "") and iid != target_id:
+            continue
+        try:
+            async with _build_session("", 5.0) as sess:
+                async with sess.post(
+                    f"{iurl}/local-mesh/lockdown",
+                    json={"action": action},
+                ) as resp:
+                    results.append({
+                        "instance_id": iid,
+                        "url": iurl,
+                        "ok": resp.status == 200,
+                    })
+        except Exception as exc:  # noqa: BLE001
+            results.append({"instance_id": iid, "url": iurl, "ok": False, "error": str(exc)})
+
+    resp = web.json_response({"action": action, "results": results})
+    _add_admin_security_headers(resp)
+    return resp
+
+
+async def _admin_cluster_logs_handler(request: web.Request) -> web.Response:
+    """GET /{admin}/api/cluster-logs?instance_url=<url>&n=<lines> — fetch log lines from a cluster instance.
+
+    Proxies ``GET /local-mesh/logs`` on the target instance through the admin
+    panel so operators can view logs from any instance without leaving the panel.
+    ``instance_url`` must be one of the URLs returned by ``/api/cluster-stats``.
+
+    Requires an active admin session cookie.
+    """
+    if not _valid_admin_session(request):
+        raise web.HTTPForbidden(reason="Not authenticated")
+
+    instance_url = request.rel_url.query.get("instance_url", "").strip().rstrip("/")
+    if not instance_url:
+        raise web.HTTPBadRequest(reason="instance_url required")
+
+    # Defence-in-depth: only allow loopback HTTP URLs so this endpoint cannot
+    # be used as an SSRF proxy even if the hub is somehow compromised.
+    import urllib.parse as _urlparse  # noqa: PLC0415
+    _parsed = _urlparse.urlparse(instance_url)
+    if _parsed.scheme != "http" or _parsed.hostname not in ("127.0.0.1", "localhost", "::1"):
+        raise web.HTTPForbidden(reason="instance_url must be a loopback http:// URL")
+
+    # Validate the URL is a registered cluster instance (security: prevent
+    # the admin panel from being used as an open SSRF proxy).
+    if not LOCAL_MESH_PORT:
+        raise web.HTTPBadRequest(reason="LOCAL_MESH_PORT not configured")
+    try:
+        async with _build_session("", 5.0) as sess:
+            async with sess.get(
+                f"http://127.0.0.1:{LOCAL_MESH_PORT}/local/stats"
+            ) as hub_resp:
+                hub_data = await hub_resp.json(content_type=None)
+    except Exception as exc:  # noqa: BLE001
+        raise web.HTTPBadGateway(reason=f"Cannot reach hub: {exc}") from exc
+
+    known_urls = {inst.get("url", "").rstrip("/") for inst in hub_data.get("instances", [])}
+    if instance_url not in known_urls:
+        raise web.HTTPForbidden(reason="instance_url is not a registered cluster instance")
+
+    try:
+        n = int(request.rel_url.query.get("n", "200"))
+        n = max(1, min(n, 500))
+    except (ValueError, TypeError):
+        n = 200
+
+    try:
+        async with _build_session("", 5.0) as sess:
+            async with sess.get(f"{instance_url}/local-mesh/logs?n={n}") as logs_resp:
+                data = await logs_resp.json(content_type=None)
+    except Exception as exc:  # noqa: BLE001
+        raise web.HTTPBadGateway(reason=f"Cannot reach instance: {exc}") from exc
+
+    resp = web.json_response(data)
+    _add_admin_security_headers(resp)
+    return resp
+
+
 def _register_admin_routes(app: web.Application) -> None:
     """Add admin-panel routes to *app* under the secret path prefix."""
     p = _ADMIN_PATH
@@ -3211,6 +3938,9 @@ def _register_admin_routes(app: web.Application) -> None:
     app.router.add_post(f"/{p}/api/ddos-unban", _admin_ddos_unban_handler)
     app.router.add_post(f"/{p}/api/slow-mode", _admin_slow_mode_handler)
     app.router.add_get(f"/{p}/api/metrics-history", _admin_metrics_history_handler)
+    app.router.add_get(f"/{p}/api/cluster-stats", _admin_cluster_stats_handler)
+    app.router.add_post(f"/{p}/api/cluster-lockdown", _admin_cluster_lockdown_handler)
+    app.router.add_get(f"/{p}/api/cluster-logs", _admin_cluster_logs_handler)
 
 
 # ---------------------------------------------------------------------------
@@ -3250,10 +3980,7 @@ async def _admin_lockdown_handler(request: web.Request) -> web.Response:
                 except Exception:  # noqa: BLE001
                     pass
 
-        # 3. Wipe in-memory data stores
-        _inbox_slots.clear()
-        _inbox_drop_tokens.clear()
-        _inbox_logged_tokens.clear()
+        # 3. Wipe in-memory data stores and DB inbox rows
         _share_slots.clear()
         _room_meta.clear()
         # Also clear login failure tracking so the admin can log back in after lockdown
@@ -3329,7 +4056,7 @@ def build_admin_app(db_path: Path | None = None) -> web.Application:
     app = web.Application()
 
     async def on_startup(app: web.Application) -> None:
-        global _admin_event_loop  # noqa: PLW0603
+        global _admin_event_loop, _inbox_db_path  # noqa: PLW0603
         _admin_event_loop = asyncio.get_running_loop()
         handler = _SseLogHandler()
         handler.setFormatter(logging.Formatter(
@@ -3348,6 +4075,7 @@ def build_admin_app(db_path: Path | None = None) -> web.Application:
             resolved = Path(_tmp)
         await init_db(resolved)
         app["db_path"] = resolved
+        _inbox_db_path = resolved
         logger.info("admin panel ready  (credentials printed to console at startup)")
 
     app.on_startup.append(on_startup)
@@ -3368,6 +4096,11 @@ def build_admin_app(db_path: Path | None = None) -> web.Application:
     app.router.add_post("/admin/api/ddos-unban", _admin_ddos_unban_handler)
     app.router.add_post("/admin/api/slow-mode", _admin_slow_mode_handler)
     app.router.add_get("/admin/api/metrics-history", _admin_metrics_history_handler)
+    app.router.add_get("/admin/api/cluster-stats", _admin_cluster_stats_handler)
+    app.router.add_post("/admin/api/cluster-lockdown", _admin_cluster_lockdown_handler)
+    app.router.add_get("/admin/api/cluster-logs", _admin_cluster_logs_handler)
+    app.router.add_post("/local-mesh/lockdown", local_mesh_lockdown_handler)
+    app.router.add_get("/local-mesh/logs", local_mesh_logs_handler)
     return app
 
 
@@ -3392,6 +4125,364 @@ def build_admin_app(db_path: Path | None = None) -> web.Application:
 _MESH_TOKEN: str = ""        # Set at startup; printed to console / shown by run.py
 _MESH_PATH: str = ""         # 50-char random URL segment hiding the mesh endpoints
 _mesh_peers: dict[str, dict] = {}   # peer_id → {url, token, mesh_path, connected_at}
+
+# Local mesh state — unique ID for this process instance so the hub can
+# distinguish it from sibling instances running on the same machine.
+# The ID is persisted to a per-port file so a restarting instance always
+# re-uses the same ID and the hub keeps it at its original slot instead of
+# showing a stale offline entry alongside a brand-new entry.
+_LOCAL_MESH_INSTANCE_ID: str = secrets.token_hex(8)
+
+
+def _get_or_create_instance_id(port: int) -> str:
+    """Load the persisted instance ID for *port* or create and save a new one.
+
+    The ID is stored in ``_HERE/.local_instance_<port>.id`` next to
+    server.py.  This ensures that a restarted instance re-registers with the
+    same ID so the hub doesn't accumulate stale duplicate entries.
+    """
+    id_file = _HERE / f".local_instance_{port}.id"
+    try:
+        if id_file.is_file():
+            existing = id_file.read_text(encoding="utf-8").strip()
+            if existing:
+                return existing
+    except OSError:
+        pass
+    new_id = secrets.token_hex(8)
+    try:
+        id_file.write_text(new_id, encoding="utf-8")
+    except OSError:
+        pass
+    return new_id
+
+
+# ---------------------------------------------------------------------------
+# Local mesh helpers — loopback-only inter-instance communication
+# ---------------------------------------------------------------------------
+
+# Cache for the main server's admin URL, refreshed every 30 s.
+# Tuple of (url, timestamp) or None when not yet fetched.
+_main_admin_url_cache: tuple[str, float] | None = None
+_MAIN_ADMIN_CACHE_TTL: float = 30.0
+
+
+def _local_mesh_base() -> str:
+    """Return the base URL of the local mesh hub, or empty string when disabled."""
+    return f"http://127.0.0.1:{LOCAL_MESH_PORT}" if LOCAL_MESH_PORT else ""
+
+
+async def _fetch_main_admin_url() -> str:
+    """Return the main server's admin URL from the hub, cached for 30 s.
+
+    Returns an empty string when:
+      - LOCAL_MESH_PORT is not set
+      - The hub is unreachable
+      - No instance has registered with ``is_main=True``
+    """
+    global _main_admin_url_cache  # noqa: PLW0603
+    now = time.time()
+    if _main_admin_url_cache is not None:
+        cached_url, cached_ts = _main_admin_url_cache
+        if now - cached_ts < _MAIN_ADMIN_CACHE_TTL:
+            return cached_url
+    base = _local_mesh_base()
+    if not base:
+        return ""
+    try:
+        async with _build_session("", 3.0) as sess:
+            async with sess.get(f"{base}/local/stats") as resp:
+                if resp.status == 200:
+                    data = await resp.json(content_type=None)
+                    url = str(data.get("main_admin_url") or "")
+                    _main_admin_url_cache = (url, now)
+                    return url
+    except Exception:  # noqa: BLE001
+        pass
+    # On failure: cache empty result briefly to avoid hammering the hub.
+    _main_admin_url_cache = ("", now)
+    return ""
+
+
+async def _local_mesh_register(local_url: str) -> None:
+    """Register this instance with the local mesh hub (called on startup)."""
+    base = _local_mesh_base()
+    if not base:
+        return
+    # Include the admin URL only for the main server so the hub can broadcast
+    # it to sibling instances that want to redirect their admin visitors there.
+    # _ADMIN_PATH has no leading slash; local_url has no trailing slash.
+    admin_url = f"{local_url.rstrip('/')}/{_ADMIN_PATH}" if MAIN_SERVER else ""
+    try:
+        async with _build_session("", 5.0) as sess:
+            async with sess.post(
+                f"{base}/local/register",
+                json={
+                    "instance_id": _LOCAL_MESH_INSTANCE_ID,
+                    "url": local_url,
+                    "server_name": SERVER_NAME,
+                    "is_main": MAIN_SERVER,
+                    "admin_url": admin_url,
+                },
+            ) as resp:
+                if resp.status == 200:
+                    logger.info(
+                        "local mesh registered  instance=%s  hub=%s%s",
+                        _LOCAL_MESH_INSTANCE_ID,
+                        base,
+                        "  [MAIN SERVER]" if MAIN_SERVER else "",
+                    )
+                else:
+                    logger.warning(
+                        "local mesh registration failed  status=%d", resp.status
+                    )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("local mesh registration error: %s", exc)
+
+
+async def _local_mesh_unregister() -> None:
+    """Unregister this instance from the local mesh hub on clean shutdown."""
+    base = _local_mesh_base()
+    if not base:
+        return
+    try:
+        async with _build_session("", 3.0) as sess:
+            async with sess.delete(
+                f"{base}/local/register/{_LOCAL_MESH_INSTANCE_ID}",
+            ) as _resp:
+                pass
+    except Exception:  # noqa: BLE001
+        pass  # best-effort; hub may already be stopping
+
+
+async def _forward_to_local_mesh(room_id: str, payload: str) -> None:
+    """Forward a room message to the local mesh hub for fanout to all other instances.
+
+    Fire-and-forget — never raises.
+    """
+    base = _local_mesh_base()
+    if not base:
+        return
+    try:
+        async with _build_session("", 5.0) as sess:
+            async with sess.post(
+                f"{base}/local/forward",
+                json={
+                    "from_instance": _LOCAL_MESH_INSTANCE_ID,
+                    "room_id": room_id,
+                    "payload": payload,
+                },
+            ) as resp:
+                if resp.status >= 400:
+                    logger.warning(
+                        "local mesh forward failed  status=%d", resp.status
+                    )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("local mesh forward error: %s", exc)
+
+
+def _is_loopback(request: web.Request) -> bool:
+    """Return ``True`` if the request originates from the loopback address."""
+    return request.remote in ("127.0.0.1", "::1")
+
+
+async def local_mesh_receive_handler(request: web.Request) -> web.Response:
+    """POST /local-mesh/receive — receive a forwarded chat message from the hub.
+
+    This endpoint is **loopback-only**.  The local mesh hub calls it for every
+    other registered instance when any instance POSTs to ``/local/forward``.
+
+    The message is injected into the local WebSocket broadcast with
+    ``_from_peer=True`` to prevent re-forwarding it back to the external mesh
+    or to the hub again.
+    """
+    if not _is_loopback(request):
+        raise web.HTTPForbidden(reason="Local-only endpoint")
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise web.HTTPBadRequest(reason="JSON body required")
+
+    room_id = str(body.get("room_id", "")).strip()
+    payload = str(body.get("payload", "")).strip()
+
+    import re as _re  # noqa: PLC0415
+    if not _re.fullmatch(r"[A-Za-z0-9_\-]{1,64}", room_id):
+        raise web.HTTPBadRequest(reason="Invalid room_id")
+    if not payload:
+        raise web.HTTPBadRequest(reason="payload required")
+    if len(payload) > MAX_MESH_PAYLOAD_LEN:
+        raise web.HTTPBadRequest(reason="payload too large")
+
+    await _broadcast_to_room(room_id, payload, _from_peer=True)
+    return web.json_response({"ok": True})
+
+
+async def local_mesh_stats_handler(request: web.Request) -> web.Response:
+    """GET /local-mesh/stats — return this instance's live metrics (loopback-only).
+
+    Called by the local mesh hub when ``GET /local/stats`` is requested.
+    Returns a flat dict of metrics compatible with the cluster-stats admin panel.
+    """
+    if not _is_loopback(request):
+        raise web.HTTPForbidden(reason="Local-only endpoint")
+
+    return web.json_response({
+        "instance_id":         _LOCAL_MESH_INSTANCE_ID,
+        "server_name":         SERVER_NAME,
+        "is_main":             MAIN_SERVER,
+        "open_rooms":          len(rooms),
+        "open_file_transfers": len(_share_slots),
+        "open_inbox_slots":    (
+            _inbox_count_sync(_inbox_db_path) if _inbox_db_path else 0
+        ),
+        "mesh_peers":          len(_mesh_peers),
+        **_stats,
+        **_get_sys_metrics(),
+        "ts": time.time(),
+    })
+
+
+async def local_mesh_lockdown_handler(request: web.Request) -> web.Response:
+    """POST /local-mesh/lockdown — trigger or deactivate lockdown on this instance.
+
+    Loopback-only.  Called by the local mesh hub when a cluster-wide lockdown
+    is requested from the admin panel.
+
+    Body: ``{"action": "activate" | "deactivate"}``
+    """
+    if not _is_loopback(request):
+        raise web.HTTPForbidden(reason="Local-only endpoint")
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise web.HTTPBadRequest(reason="JSON body required")
+
+    action = str(body.get("action", "")).strip().lower()
+    if action not in ("activate", "deactivate"):
+        raise web.HTTPBadRequest(reason="action must be 'activate' or 'deactivate'")
+
+    # Delegate to the shared lockdown logic used by the admin handler.
+    global _lockdown_active  # noqa: PLW0603
+    if action == "activate":
+        _lockdown_active = True
+        db_path: Path = request.app["db_path"]
+        await asyncio.to_thread(_wipe_all_data_sync, db_path)
+        for slot in list(_share_slots.values()):
+            tmp_dir: Path | None = slot.get("tmp_dir")
+            if tmp_dir is not None:
+                try:
+                    shutil.rmtree(tmp_dir, ignore_errors=True)
+                except Exception:  # noqa: BLE001
+                    pass
+        _share_slots.clear()
+        _room_meta.clear()
+        _ADMIN_LOGIN_FAILURES.clear()
+        _ADMIN_LOGIN_HARD_LOCKOUT.clear()
+        for ws_set in list(rooms.values()):
+            for ws in list(ws_set):
+                try:
+                    await ws.close(message=b"lockdown")
+                except Exception:  # noqa: BLE001
+                    pass
+        rooms.clear()
+        logger.warning("🔴 LOCKDOWN ACTIVATED via cluster command")
+        _print_lockdown_console_banner()
+    else:
+        _lockdown_active = False
+        logger.info("🟢 LOCKDOWN DEACTIVATED via cluster command")
+
+    return web.json_response({"lockdown": _lockdown_active})
+
+
+async def local_mesh_logs_handler(request: web.Request) -> web.Response:
+    """GET /local-mesh/logs — return the most recent log lines (loopback-only).
+
+    Returns a JSON array of the last N log lines from the in-memory ring
+    buffer, newest first.  The admin panel uses this endpoint to let operators
+    switch between the live logs of each cluster instance without leaving the
+    admin panel.
+    """
+    if not _is_loopback(request):
+        raise web.HTTPForbidden(reason="Local-only endpoint")
+
+    try:
+        n = int(request.rel_url.query.get("n", "200"))
+        n = max(1, min(n, 500))
+    except (ValueError, TypeError):
+        n = 200
+
+    lines = list(_log_recent)[-n:]
+    return web.json_response({
+        "instance_id": _LOCAL_MESH_INSTANCE_ID,
+        "server_name": SERVER_NAME,
+        "lines": lines,
+    })
+
+
+# ---------------------------------------------------------------------------
+# File-storage helpers — cross-instance download support
+# ---------------------------------------------------------------------------
+
+def _file_storage_meta_path(token: str) -> Path | None:
+    """Return the path to the slot metadata JSON for *token*, or ``None`` if
+    FILE_STORAGE is not configured."""
+    if _FILE_STORAGE_DIR is None:
+        return None
+    return _FILE_STORAGE_DIR / token / ".meta.json"
+
+
+def _save_slot_to_storage(token: str, slot: dict) -> None:
+    """Persist share-slot metadata to FILE_STORAGE/<token>/.meta.json.
+
+    Allows other server instances sharing the same FILE_STORAGE directory to
+    reconstruct the slot and serve downloads without contacting the uploading
+    instance.
+    """
+    meta_path = _file_storage_meta_path(token)
+    if meta_path is None:
+        return
+    try:
+        meta_path.write_text(
+            json.dumps({
+                "filename":     slot["filename"],
+                "size":         slot["size"],
+                "expires_at":   slot["expires_at"],
+                "passcode_hash": slot.get("passcode_hash"),
+                "encrypted":    slot.get("encrypted", False),
+            }),
+            encoding="utf-8",
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _load_slot_from_storage(token: str) -> dict | None:
+    """Attempt to load a share slot from FILE_STORAGE/<token>/.meta.json.
+
+    Returns a slot dict compatible with the in-memory ``_share_slots`` format,
+    or ``None`` when FILE_STORAGE is not configured, the token is unknown, or
+    the slot has expired.
+    """
+    meta_path = _file_storage_meta_path(token)
+    if meta_path is None or not meta_path.is_file():
+        return None
+    try:
+        raw = json.loads(meta_path.read_text(encoding="utf-8"))
+        if time.time() > raw.get("expires_at", 0):
+            return None
+        return {
+            "tmp_dir":      meta_path.parent,
+            "filename":     raw["filename"],
+            "size":         raw["size"],
+            "expires_at":   raw["expires_at"],
+            "passcode_hash": raw.get("passcode_hash"),
+            "encrypted":    raw.get("encrypted", False),
+        }
+    except Exception:  # noqa: BLE001
+        return None
 
 
 async def mesh_peer_connect_handler(request: web.Request) -> web.Response:
@@ -3483,6 +4574,23 @@ async def mesh_peer_link_handler(request: web.Request) -> web.Response:
         }
 
     Returns ``{"ok": true, "peer_id": "…"}`` on success.
+
+    Full-mesh fanout
+    ----------------
+    When a peer arrives here that this server has *not* seen before, two
+    fire-and-forget tasks are spawned:
+
+    1. **Cascade** (``_announce_peer_to_all``) — this server tells all of its
+       other known peers about the newly-linked peer, so nodes that joined at
+       different bootstrap points still learn about each other.
+
+    2. **Back-announce** (``_back_announce_to_peer``) — this server tells the
+       newly-linked peer about all of *its* other known peers, so the new peer
+       gains a complete view of the mesh even when it bootstrapped from a node
+       that had an incomplete peer list.
+
+    URL deduplication prevents announcement loops: if the peer's base URL is
+    already registered the entry is refreshed but no further fanout occurs.
     """
     try:
         body = await request.json()
@@ -3501,6 +4609,16 @@ async def mesh_peer_link_handler(request: web.Request) -> web.Response:
     if not peer_url:
         raise web.HTTPBadRequest(reason="peer_url required")
 
+    # URL deduplication: if we already know this peer, refresh its entry but
+    # skip cascade and back-announce to prevent announcement loops.
+    is_new = not _peer_url_known(peer_url)
+    if not is_new:
+        # Remove stale entries so the record is always current.
+        stale = [pid for pid, p in _mesh_peers.items()
+                 if _normalize_peer_url(p["url"]) == peer_url]
+        for pid in stale:
+            del _mesh_peers[pid]
+
     peer_id = secrets.token_hex(16)
     _mesh_peers[peer_id] = {
         "url":          peer_url,
@@ -3508,20 +4626,38 @@ async def mesh_peer_link_handler(request: web.Request) -> web.Response:
         "mesh_path":    peer_mesh_path,
         "connected_at": time.time(),
     }
-    logger.info("mesh peer linked  peer_id=…%s  url=%s", peer_id[-6:], peer_url[:60])
+    logger.info("mesh peer linked  peer_id=…%s  url=%s  new=%s",
+                peer_id[-6:], peer_url[:60], is_new)
+
+    if is_new:
+        # Cascade: tell our other known peers about this newly-linked peer so
+        # they can build a direct link even if they didn't get this peer via
+        # the original bootstrap /connect.
+        asyncio.ensure_future(_announce_peer_to_all(peer_id))
+        # Back-announce: tell this new peer about all the peers we already
+        # know so it gains a full view of the mesh topology.
+        asyncio.ensure_future(_back_announce_to_peer(peer_id))
+
     return web.json_response({"ok": True, "peer_id": peer_id})
 
 
 async def _announce_peer_to_all(new_peer_id: str) -> None:
     """Fire-and-forget: tell every existing peer about a newly connected peer.
 
-    Called after ``mesh_peer_connect_handler`` registers a new peer.  Each
-    already-connected peer receives a POST to its ``/<mesh_path>/mesh/link``
-    endpoint with the new peer's URL, token, and mesh path so every node can
-    build a direct link without routing through this server.
+    Called after ``mesh_peer_connect_handler`` registers a new peer and from
+    ``mesh_peer_link_handler`` when a truly-new peer arrives via cascade.
+    Each already-connected peer receives a POST to its
+    ``/<mesh_path>/mesh/link`` endpoint with the new peer's details so every
+    node can build a direct link without routing through this server.
 
-    Peers that have no ``mesh_path`` stored (legacy connections) are skipped
-    because we don't know their link endpoint URL.
+    Routing
+    -------
+    * ``.onion`` peer URLs are routed through Tor.
+    * All other peer URLs use a direct connection — Tor cannot route to
+      private IP ranges so clearnet peers would never receive the link.
+
+    Peers that have no ``mesh_path`` stored are skipped because we don't
+    know their link endpoint URL.
     """
     new_peer = _mesh_peers.get(new_peer_id)
     if not new_peer:
@@ -3534,8 +4670,12 @@ async def _announce_peer_to_all(new_peer_id: str) -> None:
             continue  # can't construct link URL without the secret path
         link_url = peer["url"].rstrip("/") + f"/{peer_mesh_path}/mesh/link"
         try:
-            async with await _make_proxied_session(timeout=5.0) as sess:
-                await sess.post(
+            if ".onion" in peer["url"]:
+                sess_ctx = await _make_proxied_session(timeout=15.0)
+            else:
+                sess_ctx = _build_session("", 15.0)
+            async with sess_ctx as sess:
+                async with sess.post(
                     link_url,
                     json={
                         "token":          peer["token"],
@@ -3543,9 +4683,91 @@ async def _announce_peer_to_all(new_peer_id: str) -> None:
                         "peer_token":     new_peer["token"],
                         "peer_mesh_path": new_peer.get("mesh_path", ""),
                     },
-                )
-        except Exception:  # noqa: BLE001
-            pass
+                ) as resp:
+                    if resp.status >= 400:
+                        logger.warning(
+                            "mesh announce rejected  target_url=%s  status=%d",
+                            peer["url"][:60],
+                            resp.status,
+                        )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "mesh announce failed  target_url=%s  error=%s",
+                peer["url"][:60],
+                exc,
+            )
+
+
+def _normalize_peer_url(url: str) -> str:
+    """Return the canonical form of a peer base URL (stripped of trailing slashes).
+
+    All peer URL comparisons must go through this function so that
+    ``http://host:5000`` and ``http://host:5000/`` are treated as identical.
+    """
+    return url.rstrip("/")
+
+
+def _peer_url_known(url: str) -> bool:
+    """Return ``True`` if a peer with the given base URL is already registered.
+
+    Used to prevent duplicate registrations and announcement loops when the
+    same peer is announced via multiple paths (e.g. direct connect + cascade).
+    """
+    norm = _normalize_peer_url(url)
+    return any(_normalize_peer_url(p["url"]) == norm for p in _mesh_peers.values())
+
+
+async def _back_announce_to_peer(new_peer_id: str) -> None:
+    """Fire-and-forget: tell a newly-linked peer about all other peers we know.
+
+    When this server learns about a new peer via ``/mesh/link`` (i.e. a
+    cascaded announcement from another node), the new peer may not yet know
+    about every server in the mesh — especially if it bootstrapped from a
+    different node.  This function closes that gap by posting a ``/mesh/link``
+    message to the new peer for each other peer this server knows about.
+
+    Routing follows the same direct/Tor logic as ``_announce_peer_to_all``.
+    """
+    new_peer = _mesh_peers.get(new_peer_id)
+    if not new_peer or not new_peer.get("mesh_path"):
+        return
+    new_peer_link_url = (
+        new_peer["url"].rstrip("/") + f"/{new_peer['mesh_path']}/mesh/link"
+    )
+    for peer_id, peer in list(_mesh_peers.items()):
+        if peer_id == new_peer_id:
+            continue
+        if not peer.get("mesh_path"):
+            continue
+        try:
+            if ".onion" in new_peer["url"]:
+                sess_ctx = await _make_proxied_session(timeout=15.0)
+            else:
+                sess_ctx = _build_session("", 15.0)
+            async with sess_ctx as sess:
+                async with sess.post(
+                    new_peer_link_url,
+                    json={
+                        "token":          new_peer["token"],
+                        "peer_url":       peer["url"],
+                        "peer_token":     peer["token"],
+                        "peer_mesh_path": peer.get("mesh_path", ""),
+                    },
+                ) as resp:
+                    if resp.status >= 400:
+                        logger.warning(
+                            "mesh back-announce rejected  target=%s  peer=%s  status=%d",
+                            new_peer["url"][:60],
+                            peer["url"][:60],
+                            resp.status,
+                        )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "mesh back-announce failed  target=%s  peer=%s  error=%s",
+                new_peer["url"][:60],
+                peer["url"][:60],
+                exc,
+            )
 
 
 async def mesh_peer_forward_handler(request: web.Request) -> web.Response:
@@ -3636,8 +4858,13 @@ async def mesh_invite_handler(request: web.Request) -> web.Response:
 async def _forward_to_peers(room_id: str, payload: str) -> None:
     """Fire-and-forget: POST a message to every connected mesh peer.
 
-    Peer URLs may be .onion addresses — the proxied session routes them
-    through Tor automatically.
+    Routing strategy
+    ----------------
+    * ``.onion`` peer URLs are routed through Tor via :func:`_make_proxied_session`
+      (the standard proxy-selection logic).
+    * All other peer URLs (LAN / clearnet) use a **direct** aiohttp session —
+      Tor cannot route to private IP ranges, so using it for clearnet peers
+      would silently drop every message.
 
     Uses the per-peer ``mesh_path`` to construct the secret forward endpoint
     URL.  Peers that have no ``mesh_path`` stored are skipped because the
@@ -3651,13 +4878,28 @@ async def _forward_to_peers(room_id: str, payload: str) -> None:
             continue  # skip legacy peers without a known secret path
         fwd_url = peer["url"].rstrip("/") + f"/{peer_mesh_path}/mesh/forward"
         try:
-            async with await _make_proxied_session(timeout=5.0) as sess:
-                await sess.post(
+            # Use Tor for .onion addresses; connect directly for clearnet/LAN.
+            if ".onion" in peer["url"]:
+                sess_ctx = await _make_proxied_session(timeout=15.0)
+            else:
+                sess_ctx = _build_session("", 15.0)
+            async with sess_ctx as sess:
+                async with sess.post(
                     fwd_url,
                     json={"token": _MESH_TOKEN, "room_id": room_id, "payload": payload},
-                )
-        except Exception:  # noqa: BLE001
-            pass
+                ) as resp:
+                    if resp.status >= 400:
+                        logger.warning(
+                            "mesh forward rejected  peer_url=%s  status=%d",
+                            peer["url"][:60],
+                            resp.status,
+                        )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "mesh forward failed  peer_url=%s  error=%s",
+                peer["url"][:60],
+                exc,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -3688,7 +4930,7 @@ def build_app(db_path: Path | None = None) -> web.Application:
     app["db_path"] = resolved_db
 
     async def on_startup(app: web.Application) -> None:
-        global _admin_event_loop, _smtp_controller  # noqa: PLW0603
+        global _admin_event_loop, _smtp_controller, _inbox_db_path  # noqa: PLW0603
         _admin_event_loop = asyncio.get_running_loop()
         # Attach SSE log handler so live-log stream works
         handler = _SseLogHandler()
@@ -3699,6 +4941,7 @@ def build_app(db_path: Path | None = None) -> web.Application:
         logging.root.addHandler(handler)
 
         await init_db(app["db_path"])
+        _inbox_db_path = app["db_path"]
         logger.info("database ready  path=%s", app["db_path"])
         app["_cleanup_share_task"] = asyncio.create_task(_cleanup_expired_share_slots())
         app["_cleanup_inbox_task"] = asyncio.create_task(_cleanup_expired_inbox_slots())
@@ -3733,6 +4976,14 @@ def build_app(db_path: Path | None = None) -> web.Application:
                 "SMTP inbox disabled (set MAIL_DOMAIN env var to enable real email)"
             )
 
+        # Register with the local mesh hub so sibling instances on the same
+        # machine can sync chat messages and the cluster admin panel works.
+        if LOCAL_MESH_PORT:
+            host_for_mesh = os.environ.get("HOST", "127.0.0.1")
+            port_for_mesh = int(os.environ.get("PORT", "5000"))
+            local_url = f"http://{host_for_mesh}:{port_for_mesh}"
+            asyncio.create_task(_local_mesh_register(local_url))
+
     async def on_cleanup(app: web.Application) -> None:
         global _smtp_controller  # noqa: PLW0603
         for key in ("_cleanup_share_task", "_cleanup_inbox_task", "_cleanup_rooms_task", "_lockdown_broadcast_task", "_mailtm_poll_task", "_proxy_watchdog_task", "_metrics_collector_task"):
@@ -3747,6 +4998,9 @@ def build_app(db_path: Path | None = None) -> web.Application:
             _smtp_controller.stop()
             _smtp_controller = None
             logger.info("SMTP inbox server stopped")
+        # Deregister from local mesh hub on clean shutdown.
+        if LOCAL_MESH_PORT:
+            await _local_mesh_unregister()
 
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_cleanup)
@@ -3771,6 +5025,13 @@ def build_app(db_path: Path | None = None) -> web.Application:
     # served via _admin_index_handler which injects the secret path.
     app.router.add_get("/static/admin.html", _blocked_static_handler)
     app.router.add_static("/static", STATIC_DIR, show_index=False)
+
+    # Local mesh — loopback-only internal endpoints used by the local_mesh.py
+    # hub to deliver forwarded chat messages and collect per-instance stats.
+    app.router.add_post("/local-mesh/receive",   local_mesh_receive_handler)
+    app.router.add_get("/local-mesh/stats",      local_mesh_stats_handler)
+    app.router.add_post("/local-mesh/lockdown",  local_mesh_lockdown_handler)
+    app.router.add_get("/local-mesh/logs",       local_mesh_logs_handler)
 
     # Mesh peer federation routes — all hidden behind the 50-char secret path.
     # The forward and link endpoints are authenticated by peer token; the
@@ -3828,14 +5089,19 @@ if __name__ == "__main__":
     # Persist auto-generated secrets so they survive restarts.
     # Admin path and passcode are intentionally NOT persisted — they are
     # regenerated on every startup so credentials never stay the same.
+    # MESH_LOCK ties the stored MESH_PATH to this folder; it is always
+    # overwritten so a copied .env / .bat picks up the new lock on its
+    # first run and triggers path regeneration.
     _secrets_to_persist = {
         "CLEARNET_PATH":       _CLEARNET_PATH,
         "ADMIN_WEBHOOK_TOKEN": _ADMIN_WEBHOOK_TOKEN,
         "MESH_TOKEN":          _MESH_TOKEN,
         "MESH_PATH":           _MESH_PATH,
+        "MESH_LOCK":           _folder_lock(),
     }
-    if not _persist_vars_to_bat(_secrets_to_persist):
-        _persist_new_env_vars(_secrets_to_persist)
+    _mesh_overwrite = frozenset({"MESH_PATH", "MESH_LOCK"})
+    if not _persist_vars_to_bat(_secrets_to_persist, overwrite_keys=_mesh_overwrite):
+        _persist_new_env_vars(_secrets_to_persist, overwrite_keys=_mesh_overwrite)
 
     logger.info("secureChat starting  host=%s  port=%d", host, port)
     logger.info(

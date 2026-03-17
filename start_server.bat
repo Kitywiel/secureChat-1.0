@@ -59,6 +59,16 @@ cd /d "%~dp0"
 :: ─── mail.tm ─────────────────────────────────────────────────────────────────
 :: SET MAILTM_ENABLED=1
 
+:: ─── Local Mesh (multi-instance on the same machine) ─────────────────────────
+:: Start  python local_mesh.py  once in a separate window, then activate both
+:: lines below on every server instance that should join the local cluster.
+:: Chat messages and shared-file downloads will be synced over loopback.
+:: SET LOCAL_MESH_PORT=9000
+:: SET FILE_STORAGE=storage
+:: SET SERVER_NAME=my-node-1
+:: SET MAIN_SERVER=1
+:: SET MESH_EVICT_SEC=120
+
 :: ─────────────────────────────────────────────────────────────────────────────
 
 where python >nul 2>&1
