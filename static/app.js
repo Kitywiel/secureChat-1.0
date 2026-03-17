@@ -374,7 +374,9 @@ async function _sendLargeFileViaShare(file) {
     // encodeURIComponent is required because base64 can contain '+' which
     // URLSearchParams (used in the decrypt page) decodes as a space.
     const fragment  = `key=${encodeURIComponent(keyB64)}&iv=${encodeURIComponent(ivB64)}&name=${encodeURIComponent(file.name)}`;
-    const downloadUrl = `${location.origin}${data.download_url}#${fragment}`;
+    // Use a path-only URL so the link works regardless of which server URL
+    // (onion, LAN, clearnet path) the recipient uses to access the server.
+    const downloadUrl = `${data.download_url}#${fragment}`;
     const sizeLabel   = _fmtFileSize(file.size);
 
     // Post the download link as a regular encrypted chat message
@@ -1077,7 +1079,10 @@ function resetShareScreen() {
  */
 function _appendShareResult(data, passcode) {
   const container = document.getElementById('share-links-container');
-  const downloadUrl = new URL(data.download_url, window.location.href).href;
+  // Keep as a path-only URL so the link works from any server URL (onion, LAN, etc.).
+  // The server already returns a relative path; resolving against the current origin
+  // would make the link unusable from a different URL that also reaches this server.
+  const downloadUrl = data.download_url;
   const expiresAt = new Date(data.expires_at * 1000);
 
   const wrap = document.createElement('div');
@@ -1627,8 +1632,10 @@ function renderInboxList() {
  */
 function buildInboxCard(data, idx) {
   const base = window.location.origin;
-  const fullDrop   = base + data.drop_url;
-  const readerUrl  = base + data.reader_url;
+  // Drop link is shared externally — use a path-only URL so it works from any
+  // server URL (onion, LAN, clearnet) the sender uses to reach this server.
+  const fullDrop   = data.drop_url;
+  const readerUrl  = base + data.reader_url;  // opened locally — full URL fine
   const expiresDate = new Date(data.expires_at * 1000);
   const expiresLabel = expiresDate.toLocaleString();
 
@@ -1652,7 +1659,7 @@ function buildInboxCard(data, idx) {
       <button type="button" class="btn-copy inbox-copy-addr">Copy</button>
     </div>
 
-    <p class="share-result-label share-result-label--mt">🔗 Drop link (sender)</p>
+    <p class="share-result-label share-result-label--mt">🔗 Drop link (sender) — works from any server URL</p>
     <div class="share-link-row">
       <code class="share-link">${escHtml(fullDrop)}</code>
       <button type="button" class="btn-copy inbox-copy-drop">Copy</button>
