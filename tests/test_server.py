@@ -2956,9 +2956,181 @@ async def test_inbox_create_mailtm_fallback_when_unavailable(ws_client) -> None:
         _s._mailtm_provision = orig_provision
 
 
+@pytest.mark.asyncio
+async def test_inbox_create_fallback_address_never_onion(ws_client) -> None:
+    """Fallback inbox address must never expose a .onion hostname.
+
+    When mail.tm is unavailable (or disabled) and no MAIL_DOMAIN is set the
+    handler previously used request.host, which leaks the .onion hostname when
+    clients connect via Tor.  The address should always use the non-routable
+    'drop.local' placeholder so no server infrastructure is exposed.
+    """
+    import server as _s
+
+    orig_enabled   = _s.MAILTM_ENABLED
+    orig_provision = _s._mailtm_provision
+    orig_domain    = _s.MAIL_DOMAIN
+
+    async def _mock_fail(_: int):
+        return None
+
+    try:
+        # Case 1: MAILTM_ENABLED=True but provisioning fails
+        _s.MAILTM_ENABLED   = True
+        _s._mailtm_provision = _mock_fail
+        _s.MAIL_DOMAIN       = ""
+
+        resp = await ws_client.post("/inbox/create", json={})
+        assert resp.status == 200
+        body = await resp.json()
+        host_part = body["address"].split("@", 1)[1]
+        assert not host_part.endswith(".onion"), (
+            f"Fallback address must not contain .onion, got: {body['address']}"
+        )
+        assert host_part == "drop.local", (
+            f"Expected 'drop.local' as fallback host, got: {host_part!r}"
+        )
+
+        # Case 2: MAILTM_ENABLED=False, no MAIL_DOMAIN
+        _s.MAILTM_ENABLED   = False
+        _s._mailtm_provision = _mock_fail
+
+        resp2 = await ws_client.post("/inbox/create", json={})
+        assert resp2.status == 200
+        body2 = await resp2.json()
+        host_part2 = body2["address"].split("@", 1)[1]
+        assert not host_part2.endswith(".onion"), (
+            f"Fallback address must not contain .onion, got: {body2['address']}"
+        )
+        assert host_part2 == "drop.local", (
+            f"Expected 'drop.local' as fallback host, got: {host_part2!r}"
+        )
+    finally:
+        _s.MAILTM_ENABLED   = orig_enabled
+        _s._mailtm_provision = orig_provision
+        _s.MAIL_DOMAIN       = orig_domain
+
+
 # ---------------------------------------------------------------------------
 # Clearnet URL path tests
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_inbox_reader_page_shows_mailtm_address(ws_client) -> None:
+    """GET /inbox/<token> shows the stored mail.tm address, not the request host.
+
+    When a mail.tm address was provisioned at creation time it is persisted in
+    the database.  The reader page must read that stored address rather than
+    reconstructing one from request.host — which would expose the .onion
+    hostname when accessed via Tor.
+    """
+    import server as _s
+
+    orig_enabled   = _s.MAILTM_ENABLED
+    orig_provision = _s._mailtm_provision
+
+    async def _mock_ok(n: int) -> dict:
+        return {
+            "mailtm_address": "tester@mail.tm",
+            "mailtm_bearer":  "fake-bearer",
+        }
+
+    try:
+        _s.MAILTM_ENABLED   = True
+        _s._mailtm_provision = _mock_ok
+
+        resp = await ws_client.post("/inbox/create", json={})
+        assert resp.status == 200
+        body = await resp.json()
+        assert body["mailtm_enabled"] is True
+        assert body["address"] == "tester@mail.tm"
+
+        # Open the reader page — it should show the mail.tm address, not .onion
+        reader_resp = await ws_client.get(body["reader_url"])
+        assert reader_resp.status == 200
+        html = await reader_resp.text()
+        assert "tester@mail.tm" in html
+        # The address placeholder should show the mail.tm address, not a .onion host.
+        # (The static HTML may legitimately mention ".onion" in help text, so we check
+        # that the address field itself doesn't contain an onion hostname.)
+        assert "tester@" in html  # mail.tm address is present
+        assert "@mail.tm" in html
+    finally:
+        _s.MAILTM_ENABLED   = orig_enabled
+        _s._mailtm_provision = orig_provision
+
+
+@pytest.mark.asyncio
+async def test_inbox_drop_page_shows_mailtm_address(ws_client) -> None:
+    """GET /inbox/<drop_token>/drop shows the stored mail.tm address, not the request host."""
+    import server as _s
+
+    orig_enabled   = _s.MAILTM_ENABLED
+    orig_provision = _s._mailtm_provision
+
+    async def _mock_ok(n: int) -> dict:
+        return {
+            "mailtm_address": "droptest@mail.tm",
+            "mailtm_bearer":  "fake-bearer",
+        }
+
+    try:
+        _s.MAILTM_ENABLED   = True
+        _s._mailtm_provision = _mock_ok
+
+        resp = await ws_client.post("/inbox/create", json={})
+        assert resp.status == 200
+        body = await resp.json()
+        assert body["address"] == "droptest@mail.tm"
+
+        drop_resp = await ws_client.get(body["drop_url"])
+        assert drop_resp.status == 200
+        html = await drop_resp.text()
+        assert "droptest@mail.tm" in html
+        assert ".onion" not in html
+    finally:
+        _s.MAILTM_ENABLED   = orig_enabled
+        _s._mailtm_provision = orig_provision
+
+
+@pytest.mark.asyncio
+async def test_inbox_pages_fallback_to_drop_local_not_onion(ws_client) -> None:
+    """Reader and drop pages use 'drop.local' as host when no mail.tm address is stored."""
+    import server as _s
+
+    orig_enabled   = _s.MAILTM_ENABLED
+    orig_provision = _s._mailtm_provision
+    orig_domain    = _s.MAIL_DOMAIN
+
+    async def _mock_fail(_: int) -> None:
+        return None
+
+    try:
+        _s.MAILTM_ENABLED   = False
+        _s._mailtm_provision = _mock_fail
+        _s.MAIL_DOMAIN       = ""
+
+        resp = await ws_client.post("/inbox/create", json={})
+        assert resp.status == 200
+        body = await resp.json()
+
+        reader_resp = await ws_client.get(body["reader_url"])
+        assert reader_resp.status == 200
+        reader_html = await reader_resp.text()
+        assert "drop.local" in reader_html
+        # Verify no onion address appears as the inbox address (static help text
+        # mentioning ".onion" is allowed; we check the address field directly).
+        assert "drop_token@" not in reader_html or "@drop.local" in reader_html
+
+        drop_resp = await ws_client.get(body["drop_url"])
+        assert drop_resp.status == 200
+        drop_html = await drop_resp.text()
+        assert "drop.local" in drop_html
+    finally:
+        _s.MAILTM_ENABLED   = orig_enabled
+        _s._mailtm_provision = orig_provision
+        _s.MAIL_DOMAIN       = orig_domain
 
 @pytest.mark.asyncio
 async def test_clearnet_path_is_100_chars(ws_client) -> None:

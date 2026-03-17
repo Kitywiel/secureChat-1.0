@@ -2224,13 +2224,17 @@ async def inbox_create_handler(request: web.Request) -> web.Response:
             mailtm_enabled = True
             logger.info("mail.tm inbox provisioned  address=%s  ttl=%dm", address, ttl_minutes)
         else:
-            # mail.tm unavailable — fall back to request host
-            mail_host = request.host or "localhost"
-            address = f"{read_token}@{mail_host}"
+            # mail.tm unavailable — use a non-routable placeholder so the
+            # displayed address never leaks the .onion hostname or any other
+            # internal server detail.  This inbox is HTTP-drop only.
+            address = f"{read_token}@drop.local"
             logger.warning("mail.tm provisioning failed — inbox will be HTTP-drop only")
     else:
-        mail_host = request.host or "localhost"
-        address = f"{read_token}@{mail_host}"
+        # Neither MAIL_DOMAIN nor MAILTM_ENABLED — HTTP-drop only.
+        # Use a non-routable placeholder; request.host is intentionally NOT
+        # used here because it may be a .onion address or a bare IP that
+        # would be misleading and expose server infrastructure.
+        address = f"{read_token}@drop.local"
 
     if not mailtm_enabled:
         logger.info("inbox created  address=%.6s@…  ttl=%dm", read_token, ttl_minutes)
@@ -2319,8 +2323,12 @@ async def inbox_read_page_handler(request: web.Request) -> web.Response:
     slot = await asyncio.to_thread(_inbox_get_sync, db, token)
     if slot is None or time.time() > slot["expires_at"]:
         raise web.HTTPGone(reason="Inbox not found or expired")
-    mail_host = MAIL_DOMAIN or request.host or "localhost"
-    address = f"{token}@{mail_host}"
+    if MAIL_DOMAIN:
+        address = f"{token}@{MAIL_DOMAIN}"
+    elif slot.get("mailtm_address"):
+        address = slot["mailtm_address"]
+    else:
+        address = f"{token}@drop.local"
     html = (STATIC_DIR / "mail_read.html").read_text(encoding="utf-8")
     html = html.replace("__INBOX_TOKEN__", token)
     html = html.replace("__INBOX_ADDRESS__", address)
@@ -2338,8 +2346,12 @@ async def inbox_drop_page_handler(request: web.Request) -> web.Response:
     read_token, slot = result
     if time.time() > slot["expires_at"]:
         raise web.HTTPGone(reason="Inbox not found or expired")
-    host = MAIL_DOMAIN or request.host or "localhost"
-    address = f"{read_token}@{host}"
+    if MAIL_DOMAIN:
+        address = f"{read_token}@{MAIL_DOMAIN}"
+    elif slot.get("mailtm_address"):
+        address = slot["mailtm_address"]
+    else:
+        address = f"{read_token}@drop.local"
     html = (STATIC_DIR / "inbox.html").read_text(encoding="utf-8")
     html = html.replace("__INBOX_TOKEN__", drop_token)
     html = html.replace("__INBOX_ADDRESS__", address)
