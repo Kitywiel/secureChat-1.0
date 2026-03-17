@@ -87,6 +87,15 @@ async def register_handler(request: web.Request) -> web.Response:
     if not instance_id or not url:
         raise web.HTTPBadRequest(reason="instance_id and url required")
 
+    # URL-collision dedup: if a *different* instance_id is already registered at
+    # this URL, treat it as the same physical server re-registering with a new ID
+    # (e.g. after a forced restart that lost its persisted ID).  Adopt the old
+    # slot so the cluster table keeps the original join time.
+    for old_id, old_info in list(_instances.items()):
+        if old_id != instance_id and old_info["url"] == url:
+            _instances.pop(old_id)
+            break
+
     # Preserve registration time when the instance is re-registering
     # (e.g. after a restart) so the cluster table shows the original join time.
     existing = _instances.get(instance_id)
@@ -97,6 +106,7 @@ async def register_handler(request: web.Request) -> web.Response:
         "is_main": bool(body.get("is_main", False)),
         "admin_url": str(body.get("admin_url", "")).strip(),
         "registered_at": registered_at,
+        "last_seen": time.time(),
     }
     return web.json_response({"ok": True, "instance_id": instance_id})
 
@@ -201,6 +211,7 @@ async def stats_handler(request: web.Request) -> web.Response:
                     if resp.status == 200:
                         entry.update(await resp.json(content_type=None))
                         entry["ok"] = True
+                        _instances[iid]["last_seen"] = time.time()
                     else:
                         entry["error"] = f"HTTP {resp.status}"
             except Exception as exc:  # noqa: BLE001
@@ -232,6 +243,32 @@ async def stats_handler(request: web.Request) -> web.Response:
     })
 
 
+
+# ---------------------------------------------------------------------------
+# Background eviction task
+# ---------------------------------------------------------------------------
+
+
+async def _evict_stale_instances_task() -> None:
+    """Remove instances that have not been seen for _EVICT_AFTER_SEC seconds.
+
+    Runs every _EVICT_POLL_SEC seconds in the background.  An instance's
+    ``last_seen`` timestamp is refreshed every time ``stats_handler`` receives
+    a successful response from it.  Instances registered but never successfully
+    polled start their clock at registration time.
+    """
+    while True:
+        await asyncio.sleep(_EVICT_POLL_SEC)
+        cutoff = time.time() - _EVICT_AFTER_SEC
+        stale = [
+            iid
+            for iid, info in list(_instances.items())
+            if info.get("last_seen", info["registered_at"]) < cutoff
+        ]
+        for iid in stale:
+            _instances.pop(iid, None)
+
+
 # ---------------------------------------------------------------------------
 # App factory
 # ---------------------------------------------------------------------------
@@ -245,6 +282,19 @@ def build_local_mesh_app() -> web.Application:
     app.router.add_delete("/local/register/{instance_id}", unregister_handler)
     app.router.add_post("/local/forward", forward_handler)
     app.router.add_get("/local/stats", stats_handler)
+
+    _evict_task: asyncio.Task | None = None
+
+    async def _on_startup(app: web.Application) -> None:
+        nonlocal _evict_task
+        _evict_task = asyncio.ensure_future(_evict_stale_instances_task())
+
+    async def _on_cleanup(app: web.Application) -> None:
+        if _evict_task:
+            _evict_task.cancel()
+
+    app.on_startup.append(_on_startup)
+    app.on_cleanup.append(_on_cleanup)
 
     return app
 

@@ -39,6 +39,7 @@ import io
 import json
 import logging
 import os
+import platform
 import re
 import secrets
 import shutil
@@ -2877,6 +2878,17 @@ def _get_sys_metrics() -> dict:
             metrics["sys_disk_percent"] = du.percent
             metrics["sys_disk_total"]   = du.total
             metrics["sys_disk_used"]    = du.used
+            # Processor identification — available on all OS.
+            cpu_model = platform.processor() or platform.machine() or ""
+            metrics["sys_cpu_model"]         = cpu_model
+            metrics["sys_cpu_physical"]      = _psutil.cpu_count(logical=False) or cpu_count
+            metrics["sys_cpu_logical"]       = cpu_count
+            try:
+                freq = _psutil.cpu_freq()
+                if freq:
+                    metrics["sys_cpu_freq_mhz"] = round(freq.current, 0)
+            except Exception:  # noqa: BLE001
+                pass
         except Exception:  # pragma: no cover  # noqa: BLE001
             pass
 

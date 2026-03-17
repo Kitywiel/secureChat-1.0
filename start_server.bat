@@ -65,6 +65,8 @@ cd /d "%~dp0"
 :: Chat messages and shared-file downloads will be synced over loopback.
 :: SET LOCAL_MESH_PORT=9000
 :: SET FILE_STORAGE=storage
+:: SET SERVER_NAME=my-node-1
+:: SET MAIN_SERVER=1
 
 :: ─────────────────────────────────────────────────────────────────────────────
 

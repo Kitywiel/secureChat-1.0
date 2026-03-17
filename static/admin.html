@@ -168,7 +168,12 @@ function renderSysResources(s){
   }
   let html='<div class="res-grid">';
   if(s.sys_cpu_percent!==undefined){
-    html+=resCard('🖥️','CPU',s.sys_cpu_percent,'','');
+    const cores=s.sys_cpu_physical&&s.sys_cpu_logical
+      ?`${s.sys_cpu_physical}P / ${s.sys_cpu_logical}L cores`:'';
+    const freq=s.sys_cpu_freq_mhz?`${(s.sys_cpu_freq_mhz/1000).toFixed(2)} GHz`:'';
+    const modelLine=s.sys_cpu_model||'';
+    const sub=freq?`${modelLine?modelLine+' · ':''}${freq}`:modelLine;
+    html+=resCard('🖥️','CPU',s.sys_cpu_percent,cores,sub);
   }
   if(s.sys_ram_percent!==undefined){
     html+=resCard('🧠','RAM',s.sys_ram_percent,
