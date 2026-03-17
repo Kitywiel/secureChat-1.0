@@ -67,6 +67,7 @@ cd /d "%~dp0"
 :: SET FILE_STORAGE=storage
 :: SET SERVER_NAME=my-node-1
 :: SET MAIN_SERVER=1
+:: SET MESH_EVICT_SEC=120
 
 :: ─────────────────────────────────────────────────────────────────────────────
 

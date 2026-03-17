@@ -165,3 +165,6 @@ LOCAL_MESH_PORT=9000 FILE_STORAGE=storage PORT=5001 python run.py
 |---|---|---|
 | `LOCAL_MESH_PORT` | not set (disabled) | Port of the `local_mesh.py` hub on `127.0.0.1`. When set, this instance registers with the hub and chat messages are fanned out to all other registered instances in real time over loopback. |
 | `FILE_STORAGE` | not set (temp dirs) | Directory for shared file storage. When set, uploaded files are written here instead of a per-process temp directory, so any instance can serve the download regardless of which URL the uploader used. Set the same path on every instance. |
+| `SERVER_NAME` | not set | Human-readable display name for this instance. Shown in the admin panel cluster table next to the instance URL. |
+| `MAIN_SERVER` | not set | Set to `1` to mark this instance as the primary/head node. Non-main instances that are members of the same local cluster will redirect admin-panel visitors to this node's admin URL. |
+| `MESH_EVICT_SEC` | `120` | Seconds of silence (no successful stats poll) before the local mesh hub automatically removes a stale instance from the registry. Increase this if your instances take longer to respond under load. |
