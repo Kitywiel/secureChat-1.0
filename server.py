@@ -1726,15 +1726,20 @@ async def _stream_share_file(
 async def _cleanup_expired_share_slots() -> None:
     """Background task: sweep expired share slots every 5 minutes."""
     while True:
-        await asyncio.sleep(300)
-        now = time.time()
-        expired = [t for t, s in list(_share_slots.items()) if now > s["expires_at"]]
-        for t in expired:
-            slot = _share_slots.pop(t, None)
-            if slot:
-                await asyncio.to_thread(_rmtree, slot["tmp_dir"])
-        if expired:
-            logger.info("cleaned up %d expired share slot(s)", len(expired))
+        try:
+            await asyncio.sleep(300)
+            now = time.time()
+            expired = [t for t, s in list(_share_slots.items()) if now > s["expires_at"]]
+            for t in expired:
+                slot = _share_slots.pop(t, None)
+                if slot:
+                    await asyncio.to_thread(_rmtree, slot["tmp_dir"])
+            if expired:
+                logger.info("cleaned up %d expired share slot(s)", len(expired))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("share-slot cleanup error: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -1801,31 +1806,36 @@ async def _proxy_watchdog_task() -> None:
     global _proxy_cache, _proxy_cache_ts  # noqa: PLW0603
 
     while True:
-        await asyncio.sleep(_PROXY_WATCHDOG_INTERVAL)
-        changed = False
-        for proxy_url in _FREE_SOCKS5_PROXIES:
-            was_online = _proxy_health.get(proxy_url, True)
-            now_online = await _probe_proxy(proxy_url, timeout=8.0)
-            if was_online != now_online:
-                _proxy_health[proxy_url] = now_online
-                changed = True
-                status = "ONLINE  ✓" if now_online else "OFFLINE ✗"
-                print("", flush=True)
-                print("=" * 72, flush=True)
-                print(f"  PROXY STATUS CHANGE", flush=True)
-                print("=" * 72, flush=True)
-                print(f"  Proxy  : {proxy_url}", flush=True)
-                print(f"  Status : {status}", flush=True)
-                print("=" * 72, flush=True)
-                print("", flush=True)
-            else:
-                _proxy_health[proxy_url] = now_online
+        try:
+            await asyncio.sleep(_PROXY_WATCHDOG_INTERVAL)
+            changed = False
+            for proxy_url in _FREE_SOCKS5_PROXIES:
+                was_online = _proxy_health.get(proxy_url, True)
+                now_online = await _probe_proxy(proxy_url, timeout=8.0)
+                if was_online != now_online:
+                    _proxy_health[proxy_url] = now_online
+                    changed = True
+                    status = "ONLINE  ✓" if now_online else "OFFLINE ✗"
+                    print("", flush=True)
+                    print("=" * 72, flush=True)
+                    print(f"  PROXY STATUS CHANGE", flush=True)
+                    print("=" * 72, flush=True)
+                    print(f"  Proxy  : {proxy_url}", flush=True)
+                    print(f"  Status : {status}", flush=True)
+                    print("=" * 72, flush=True)
+                    print("", flush=True)
+                else:
+                    _proxy_health[proxy_url] = now_online
 
-        # If any proxy went offline, invalidate the cache so the next request
-        # re-selects the best currently-online proxy.
-        if changed:
-            _proxy_cache = ""
-            _proxy_cache_ts = 0.0
+            # If any proxy went offline, invalidate the cache so the next request
+            # re-selects the best currently-online proxy.
+            if changed:
+                _proxy_cache = ""
+                _proxy_cache_ts = 0.0
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("proxy watchdog error: %s", exc)
 
 
 async def _make_proxied_session(timeout: float = 15.0):
@@ -2018,43 +2028,48 @@ async def _mailtm_provision(inbox_token_bytes: int) -> dict | None:
 async def _mailtm_poll_all_inboxes() -> None:
     """Background task: poll mail.tm for new messages every 30 seconds."""
     while True:
-        await asyncio.sleep(30)
-        if _inbox_db_path is None:
-            continue
-        db = _inbox_db_path
-        slots = await asyncio.to_thread(_inbox_get_mailtm_slots_sync, db)
-        for slot_row in slots:
-            bearer = slot_row["mailtm_bearer"]
-            read_token = slot_row["read_token"]
-            try:
-                seen: set = set(json.loads(slot_row.get("mailtm_seen") or "[]"))
-            except Exception:  # noqa: BLE001
-                seen = set()
-            new_msgs = await _mailtm_fetch_messages(bearer, seen)
-            for msg in new_msgs:
-                await asyncio.to_thread(
-                    _inbox_add_message_sync,
-                    db,
-                    read_token,
-                    msg.get("body", ""),
-                    msg.get("email_from"),
-                    msg.get("subject"),
-                    msg.get("content_type", "text/plain"),
-                    msg.get("received_at", time.time()),
-                )
-                _stats["inbox_msgs_received_total"] += 1
-                logger.info(
-                    "mail.tm message received  from=%.40s  subject=%r",
-                    msg.get("email_from") or "",
-                    (msg.get("subject") or "")[:60],
-                )
-            if new_msgs:
-                await asyncio.to_thread(
-                    _inbox_update_mailtm_seen_sync,
-                    db,
-                    read_token,
-                    json.dumps(list(seen)),
-                )
+        try:
+            await asyncio.sleep(30)
+            if _inbox_db_path is None:
+                continue
+            db = _inbox_db_path
+            slots = await asyncio.to_thread(_inbox_get_mailtm_slots_sync, db)
+            for slot_row in slots:
+                bearer = slot_row["mailtm_bearer"]
+                read_token = slot_row["read_token"]
+                try:
+                    seen: set = set(json.loads(slot_row.get("mailtm_seen") or "[]"))
+                except Exception:  # noqa: BLE001
+                    seen = set()
+                new_msgs = await _mailtm_fetch_messages(bearer, seen)
+                for msg in new_msgs:
+                    await asyncio.to_thread(
+                        _inbox_add_message_sync,
+                        db,
+                        read_token,
+                        msg.get("body", ""),
+                        msg.get("email_from"),
+                        msg.get("subject"),
+                        msg.get("content_type", "text/plain"),
+                        msg.get("received_at", time.time()),
+                    )
+                    _stats["inbox_msgs_received_total"] += 1
+                    logger.info(
+                        "mail.tm message received  from=%.40s  subject=%r",
+                        msg.get("email_from") or "",
+                        (msg.get("subject") or "")[:60],
+                    )
+                if new_msgs:
+                    await asyncio.to_thread(
+                        _inbox_update_mailtm_seen_sync,
+                        db,
+                        read_token,
+                        json.dumps(list(seen)),
+                    )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("mail.tm poll error: %s", exc)
 
 
 class InboxSmtpHandler:
@@ -2508,12 +2523,17 @@ async def inbox_relay_handler(request: web.Request) -> web.Response:
 async def _cleanup_expired_inbox_slots() -> None:
     """Background task: sweep expired inbox slots from the DB every 5 minutes."""
     while True:
-        await asyncio.sleep(300)
-        if _inbox_db_path is None:
-            continue
-        expired = await asyncio.to_thread(_inbox_cleanup_expired_sync, _inbox_db_path)
-        if expired:
-            logger.info("cleaned up %d expired inbox slot(s)", len(expired))
+        try:
+            await asyncio.sleep(300)
+            if _inbox_db_path is None:
+                continue
+            expired = await asyncio.to_thread(_inbox_cleanup_expired_sync, _inbox_db_path)
+            if expired:
+                logger.info("cleaned up %d expired inbox slot(s)", len(expired))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("inbox-slot cleanup error: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -2675,29 +2695,34 @@ async def qrcode_handler(request: web.Request) -> web.Response:
 async def _cleanup_expired_rooms(db_path: Path) -> None:
     """Background task: self-destruct expired rooms every 30 seconds."""
     while True:
-        await asyncio.sleep(30)
-        now = time.time()
-        expired = [
-            r for r, m in list(_room_meta.items())
-            if m.get("expires_at") and now > m["expires_at"]
-        ]
-        for room_id in expired:
-            _room_meta.pop(room_id, None)
-            if room_id in rooms:
-                await _broadcast_to_room(room_id, json.dumps({"type": "destruct"}))
-                for peer in list(rooms.get(room_id, set())):
-                    try:
-                        await peer.close()
-                    except Exception:  # noqa: BLE001
-                        pass
-                rooms.pop(room_id, None)
-            try:
-                await asyncio.to_thread(_delete_room_history_sync, db_path, room_id)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "failed to delete room history  room=%s  error=%s", room_id, exc
-                )
-            logger.info("room self-destructed  room=%s", room_id)
+        try:
+            await asyncio.sleep(30)
+            now = time.time()
+            expired = [
+                r for r, m in list(_room_meta.items())
+                if m.get("expires_at") and now > m["expires_at"]
+            ]
+            for room_id in expired:
+                _room_meta.pop(room_id, None)
+                if room_id in rooms:
+                    await _broadcast_to_room(room_id, json.dumps({"type": "destruct"}))
+                    for peer in list(rooms.get(room_id, set())):
+                        try:
+                            await peer.close()
+                        except Exception:  # noqa: BLE001
+                            pass
+                    rooms.pop(room_id, None)
+                try:
+                    await asyncio.to_thread(_delete_room_history_sync, db_path, room_id)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "failed to delete room history  room=%s  error=%s", room_id, exc
+                    )
+                logger.info("room self-destructed  room=%s", room_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("room cleanup error: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -3609,9 +3634,14 @@ def _print_lockdown_console_banner() -> None:
 async def _lockdown_broadcast_task() -> None:
     """Background task: while lockdown is active, emit a warning log every 5 seconds."""
     while True:
-        await asyncio.sleep(5)
-        if _lockdown_active:
-            logger.warning("🔴 LOCKDOWN ACTIVE — server is in lockdown mode")
+        try:
+            await asyncio.sleep(5)
+            if _lockdown_active:
+                logger.warning("🔴 LOCKDOWN ACTIVE — server is in lockdown mode")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("lockdown broadcast error: %s", exc)
 
 
 # ---------------------------------------------------------------------------
