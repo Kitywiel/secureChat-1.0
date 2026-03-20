@@ -476,6 +476,23 @@ let currentRoomId = '';
 /** Delete code for the current room (only available if this client created the room). */
 let roomDeleteCode = '';
 
+/** True when the WebSocket was closed on purpose (leave, delete, destruct, fatal error). */
+let _wsIntentionalClose = false;
+
+/** Reconnect back-off delay in ms; doubles on each failure, capped at 30 s. */
+let _wsReconnectDelay = 1000;
+
+/** Handle returned by setTimeout for a pending reconnect attempt, or null. */
+let _wsReconnectTimeout = null;
+
+/** Cancel any pending auto-reconnect attempt. */
+function _clearReconnectTimeout() {
+  if (_wsReconnectTimeout !== null) {
+    clearTimeout(_wsReconnectTimeout);
+    _wsReconnectTimeout = null;
+  }
+}
+
 // ─── Random generation helpers ────────────────────────────────────────────────
 
 /** Generate a cryptographically random passphrase (URL-safe base64, 22 chars). */
@@ -599,10 +616,15 @@ function connectWs(roomId) {
   ws = new WebSocket(`${proto}//${location.host}/ws`);
 
   ws.addEventListener('open', () => {
+    _wsReconnectDelay = 1000;
     /** @type {Record<string, string>} */
     const joinMsg = { type: 'join', room: roomId };
     if (roomPasscode) joinMsg.passcode = roomPasscode;
     ws.send(JSON.stringify(joinMsg));
+    // Re-enable UI in case this is a reconnect (close handler disables it).
+    document.getElementById('message-input').disabled = false;
+    document.getElementById('send-btn').disabled = false;
+    document.getElementById('attach-btn').disabled = false;
   });
 
   ws.addEventListener('message', async (event) => {
@@ -681,6 +703,7 @@ function connectWs(roomId) {
 
     } else if (data.type === 'destruct') {
       // The room has been destroyed — stop the timer and lock the UI
+      _wsIntentionalClose = true;
       stopDestructTimer();
       appendMessage('', '💣 Room has self-destructed. All messages have been deleted.', 'system');
       document.getElementById('message-input').disabled = true;
@@ -689,6 +712,10 @@ function connectWs(roomId) {
 
     } else if (data.type === 'error') {
       const reason = data.reason || 'unknown';
+      // Permanent errors — don't attempt to reconnect.
+      if (reason === 'wrong_passcode' || reason === 'room_expired' || reason === 'invalid_room_id') {
+        _wsIntentionalClose = true;
+      }
       const msgs = {
         wrong_passcode: '🔒 Wrong room passcode — access denied.',
         room_expired:   '💣 This room has already self-destructed.',
@@ -703,6 +730,17 @@ function connectWs(roomId) {
     document.getElementById('message-input').disabled = true;
     document.getElementById('send-btn').disabled = true;
     document.getElementById('attach-btn').disabled = true;
+    if (!_wsIntentionalClose && currentRoomId === roomId) {
+      const delaySec = Math.round(_wsReconnectDelay / 1000);
+      appendMessage('', `Reconnecting in ${delaySec}s…`, 'system');
+      _wsReconnectTimeout = setTimeout(() => {
+        _wsReconnectTimeout = null;
+        if (!_wsIntentionalClose && currentRoomId === roomId) {
+          connectWs(roomId);
+        }
+      }, _wsReconnectDelay);
+      _wsReconnectDelay = Math.min(_wsReconnectDelay * 2, 30000);
+    }
   });
 
   ws.addEventListener('error', () => {
@@ -727,6 +765,9 @@ function enterRoom(roomId, key, name, passcode, deleteCode = '') {
   roomPasscode = passcode;
   currentRoomId = roomId;
   roomDeleteCode = deleteCode;
+  _wsIntentionalClose = false;
+  _wsReconnectDelay = 1000;
+  _clearReconnectTimeout();
   stopDestructTimer();
   document.getElementById('room-label').textContent = `🔒 ${roomId}`;
   document.getElementById('message-input').disabled = false;
@@ -832,6 +873,8 @@ document.getElementById('message-input').addEventListener('input', (e) => {
 });
 
 document.getElementById('leave-btn').addEventListener('click', () => {
+  _wsIntentionalClose = true;
+  _clearReconnectTimeout();
   if (ws) {
     ws.close();
     ws = null;
@@ -1004,6 +1047,8 @@ document.getElementById('delete-room-btn').addEventListener('click', async () =>
 
   // The server will broadcast a "destruct" event that clears the UI;
   // also clean up locally in case the WS event doesn't arrive in time.
+  _wsIntentionalClose = true;
+  _clearReconnectTimeout();
   if (ws) {
     ws.close();
     ws = null;
